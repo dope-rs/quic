@@ -10,7 +10,7 @@ fn handshake_pair() -> (Conn, Conn) {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let cfg = || ConnConfig {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
@@ -64,7 +64,11 @@ fn server_emits_session_ticket_after_handshake() {
     let t = &tickets[0];
     assert_eq!(t.ticket_lifetime, 7200);
     assert_eq!(t.ticket_nonce.len(), 8);
-    assert_eq!(t.ticket.len(), 12 + 32 + 4 + 16, "nonce|psk|age_add|tag");
+    assert_eq!(
+        t.ticket.len(),
+        12 + 32 + 4 + 8 + 1 + 16,
+        "nonce|psk|age_add|issued_at|alpn_len|tag"
+    );
     assert!(
         !t.psk.iter().all(|&b| b == 0),
         "client must derive PSK from rms+nonce"

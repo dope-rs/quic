@@ -27,7 +27,7 @@ fn conn_handshake_and_datagram_round_trip() {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
 
     let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp());
     let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp());
@@ -69,7 +69,7 @@ fn conn_buffers_multiple_outgoing_datagrams() {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
 
     let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp());
     let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp());

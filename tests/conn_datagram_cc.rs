@@ -17,7 +17,7 @@ fn handshake_pair(client_cfg: ConnConfig, server_cfg: ConnConfig) -> (Conn, Conn
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
 
     let mut server = Conn::new_server(
         CID.to_vec(),
@@ -63,6 +63,7 @@ fn standard_mode_throttles_datagrams_under_zero_cwnd() {
         resumption_peer_tp: None,
         alpn_protocols: Vec::new(),
         server_cert_chain: None,
+        early_data_store: None,
     };
     let (mut client, _server) = handshake_pair(cfg.clone(), cfg);
 
@@ -97,6 +98,7 @@ fn uncongested_mode_emits_datagrams_under_zero_cwnd() {
         resumption_peer_tp: None,
         alpn_protocols: Vec::new(),
         server_cert_chain: None,
+        early_data_store: None,
     };
     let (mut client, _server) = handshake_pair(cfg.clone(), cfg);
 
@@ -131,6 +133,7 @@ fn queue_cap_returns_err_full() {
         resumption_peer_tp: None,
         alpn_protocols: Vec::new(),
         server_cert_chain: None,
+        early_data_store: None,
     };
     let (mut client, _server) = handshake_pair(cfg.clone(), cfg);
     client.cc_mut().bytes_in_flight = client.cc_mut().cwnd;
@@ -157,6 +160,7 @@ fn cfg_with(mode: DatagramCcMode, cap: usize) -> ConnConfig {
         resumption_peer_tp: None,
         alpn_protocols: Vec::new(),
         server_cert_chain: None,
+        early_data_store: None,
     }
 }
 

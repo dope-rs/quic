@@ -278,6 +278,7 @@ pub struct ConnConfig {
     pub resumption_peer_tp: Option<transport_params::Params>,
     pub alpn_protocols: Vec<Vec<u8>>,
     pub server_cert_chain: Option<Vec<Vec<u8>>>,
+    pub early_data_store: Option<crate::early_data::SharedReplayStore>,
 }
 
 impl Default for ConnConfig {
@@ -297,6 +298,7 @@ impl Default for ConnConfig {
             resumption_peer_tp: None,
             alpn_protocols: Vec::new(),
             server_cert_chain: None,
+            early_data_store: None,
         }
     }
 }
@@ -440,6 +442,7 @@ impl Conn {
             resumption_peer_tp,
             alpn_protocols,
             server_cert_chain,
+            early_data_store,
         } = config;
         let secrets = InitialSecrets::from_dcid(&initial_dcid);
         let local_idle = Duration::from_millis(user_tp.max_idle_timeout_ms);
@@ -514,8 +517,16 @@ impl Conn {
                     ticket_secret,
                     accept_early_data,
                 };
+                let mut server = shin::server::Server::new(cfg);
+                if accept_early_data {
+                    let store = early_data_store
+                        .unwrap_or_else(crate::early_data::shared_replay_store);
+                    server.set_early_data_guard(Box::new(crate::early_data::ReplayGuard::new(
+                        store,
+                    )));
+                }
                 (
-                    SideKind::Server(shin::server::Server::new(cfg)),
+                    SideKind::Server(server),
                     false,
                     peer_cid.clone(),
                     Some(peer_cid),
@@ -1090,11 +1101,11 @@ impl Conn {
                             .push_back(StreamEvent::Finished { stream_id });
                     }
                 }
-                Frame::MaxData { maximum_data } if epoch == Epoch::Application => {
-                    if maximum_data > self.peer_max_data {
-                        self.peer_max_data = maximum_data;
-                        self.blocked_data_emitted = false;
-                    }
+                Frame::MaxData { maximum_data }
+                    if epoch == Epoch::Application && maximum_data > self.peer_max_data =>
+                {
+                    self.peer_max_data = maximum_data;
+                    self.blocked_data_emitted = false;
                 }
                 Frame::MaxStreamData {
                     stream_id,

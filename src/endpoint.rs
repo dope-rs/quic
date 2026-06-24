@@ -34,11 +34,14 @@ impl<const ID: u8, H: mux::Handler> Endpoint<ID, H> {
     pub fn build_server_with_config(
         bind: SocketAddr,
         signing_key: SigningKey,
-        server_config: ConnConfig,
+        mut server_config: ConnConfig,
         handler: H,
         driver: &mut Driver,
     ) -> io::Result<Self> {
         let udp = Socket::bind(bind, driver)?;
+        if server_config.accept_early_data && server_config.early_data_store.is_none() {
+            server_config.early_data_store = Some(crate::early_data::shared_replay_store());
+        }
         let mux = Mux::server(handler, signing_key, server_config);
         Ok(Self { udp, mux })
     }

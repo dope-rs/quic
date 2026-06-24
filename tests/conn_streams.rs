@@ -12,7 +12,7 @@ fn handshake_pair() -> (Conn, Conn) {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let cfg = || ConnConfig {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
@@ -434,7 +434,7 @@ fn handshake_pair_with_credit(stream_credit: u64, conn_credit: u64) -> (Conn, Co
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let cfg = || ConnConfig {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
@@ -561,7 +561,7 @@ fn local_stream_allocator_respects_peer_limit() {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let cfg = || ConnConfig {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,

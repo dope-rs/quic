@@ -57,7 +57,7 @@ fn quic_datagram_handshake_completes_on_loopback() {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
 
     let user_tp = transport_params::Params {
         max_idle_timeout_ms: 30_000,

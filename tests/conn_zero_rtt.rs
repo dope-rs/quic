@@ -28,6 +28,7 @@ fn first_session_ticket() -> SessionTicket {
     let server_cfg = ConnConfig {
         transport_params: user_tp(),
         ticket_secret: Some(TICKET_SECRET),
+        accept_early_data: true,
         ..Default::default()
     };
     let client_cfg = ConnConfig {
@@ -44,7 +45,7 @@ fn first_session_ticket() -> SessionTicket {
     let mut client = Conn::new_client(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
-        *signing().pubkey(),
+        *signing().pubkey().unwrap(),
         client_cfg,
     );
     let now = Instant::now();
@@ -101,7 +102,7 @@ fn zero_rtt_followed_by_one_rtt_full_round_trip() {
     let mut client = Conn::new_client(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
-        *signing().pubkey(),
+        *signing().pubkey().unwrap(),
         client_cfg,
     );
 
@@ -159,7 +160,7 @@ fn server_rejects_early_data_drops_zero_rtt_but_handshake_completes() {
     let mut client = Conn::new_client(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
-        *signing().pubkey(),
+        *signing().pubkey().unwrap(),
         client_cfg,
     );
 
@@ -217,7 +218,7 @@ fn cached_peer_tp_caps_zero_rtt_stream_emission() {
     let mut client = Conn::new_client(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
-        *signing().pubkey(),
+        *signing().pubkey().unwrap(),
         client_cfg,
     );
 
@@ -266,7 +267,7 @@ fn zero_rtt_stream_data_arrives_before_handshake_completes() {
     let mut client = Conn::new_client(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
-        *signing().pubkey(),
+        *signing().pubkey().unwrap(),
         client_cfg,
     );
 

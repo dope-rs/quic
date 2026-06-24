@@ -73,7 +73,7 @@ fn handshake_pair() -> (Conn, Conn) {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let cfg = || ConnConfig {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
@@ -113,7 +113,7 @@ fn conn_path_mtu_pre_handshake_is_base() {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let client = Conn::new_client(
         HS_CID.to_vec(),
         HS_CID.to_vec(),

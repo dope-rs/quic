@@ -20,7 +20,7 @@ fn rack_finishes_handshake_when_first_initial_drops_quickly() {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
 
     let t0 = Instant::now();
     let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp());
@@ -43,7 +43,7 @@ fn loss_timer_shrinks_after_rtt_samples() {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
 
     let t0 = Instant::now();
     let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp());

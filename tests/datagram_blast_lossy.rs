@@ -37,6 +37,7 @@ fn cfg(mode: DatagramCcMode) -> ConnConfig {
         resumption_peer_tp: None,
         alpn_protocols: Vec::new(),
         server_cert_chain: None,
+        early_data_store: None,
     }
 }
 
@@ -44,7 +45,7 @@ fn handshake_pair(client_cfg: ConnConfig, server_cfg: ConnConfig) -> (Conn, Conn
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let mut server = Conn::new_server(
         CID.to_vec(),
         CID.to_vec(),

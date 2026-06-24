@@ -27,7 +27,7 @@ fn handshake_acks_drain_initial_and_handshake_spaces() {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
 
     let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp());
     let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp());

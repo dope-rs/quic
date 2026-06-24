@@ -1,5 +1,6 @@
 pub mod client;
 pub mod conn;
+pub mod early_data;
 pub mod endpoint;
 pub mod frame;
 pub mod hp;

@@ -19,7 +19,7 @@ fn signed_keys() -> ([u8; 32], SigningKey) {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let pubkey = *signing.pubkey();
+    let pubkey = *signing.pubkey().unwrap();
     (pubkey, signing)
 }
 

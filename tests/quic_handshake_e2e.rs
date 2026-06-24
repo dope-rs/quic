@@ -178,7 +178,7 @@ fn quic_handshake_completes_over_packet_stack() {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let server_signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *server_signing.pubkey();
+    let server_pubkey = *server_signing.pubkey().unwrap();
 
     let mut server = server::Server::new(server::Config {
         source: shin::server::CertSource::RawPublicKey {
