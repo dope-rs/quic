@@ -26,9 +26,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "dope"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dac60a84b25b25e6f60188191f1300827560150c8ed78fc021cea2a2e2a8401e"
+checksum = "b1f2af5f0b2507932706f970ded9a6c4de89431a9f855a7d61a0c7e698857781"
 dependencies = [
  "io-uring",
  "libc",
@@ -38,9 +38,9 @@ dependencies = [
 
 [[package]]
 name = "dope-gen"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32384c1aa343c4dcfcb884cc37cd88456b6c2c99869085425464c0110836e92f"
+checksum = "8352e7b40f75f8af0e895b272048761eb16809c91f387d5d3cdac28c0b05a029"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -49,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "dope-quic"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dope",
  "dope-gen",
@@ -62,9 +62,9 @@ dependencies = [
 
 [[package]]
 name = "dope-tls"
-version = "0.4.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6ce39e8af2bd5cbcf41ca3dec55d85b8f5076b7df9eed691fa2da31e2bba355"
+checksum = "6c9396db331682a3e5ef84809f1b86bf40599ba4326c47d81b2e15ff7d7fc1c7"
 dependencies = [
  "dope",
  "libc",
@@ -110,9 +110,9 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "o3"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c88b3f162754d64cb7402cc8a57d8cc1d1298961cacaf892885572961f72f7b"
+checksum = "369ef165ff65d97941107ca797faa68e43fa7cef2323512db9c0b3434922c3a5"
 dependencies = [
  "libc",
 ]
@@ -180,9 +180,9 @@ dependencies = [
 
 [[package]]
 name = "shin"
-version = "0.3.0"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0b21d2e2065583b7ce4bd647cf610ef2b3c372180736128c0d8485997a5d297"
+checksum = "5a10cddc4d4991f721e480d80f9825b5e1113b02750f8eaa612a23b42266ff88"
 dependencies = [
  "ring",
  "subtle",
