@@ -56,6 +56,10 @@ impl<const ID: u8, H: mux::Handler> Endpoint<ID, H> {
         self.udp.local_addr()
     }
 
+    pub fn set_gso(self: Pin<&mut Self>, on: bool) {
+        self.project().mux.set_gso(on);
+    }
+
     pub fn handler(&self) -> &H {
         self.mux.handler()
     }
@@ -143,9 +147,8 @@ impl<const ID: u8, H: mux::Handler> Manifold for Endpoint<ID, H> {
         let mut this = self.project();
         let now = Instant::now();
         this.mux.reap_closed(now);
-        for (addr, payload) in this.mux.pull_outgoing() {
-            this.udp.as_mut().queue_to(payload, addr);
-        }
+        let gso = this.mux.gso();
+        flush_coalesced(this.udp.as_mut(), this.mux.pull_outgoing(), gso);
         this.udp.tick(driver);
     }
 
@@ -162,8 +165,53 @@ impl<H: mux::Handler> Handler<0> for Mux<H> {
     fn on_packet(&mut self, addr: SocketAddr, data: &[u8], mut sock: Pin<&mut Socket<0>>) {
         let now = Instant::now();
         let _ = self.on_udp_packet(addr, data, now);
-        for (dst, payload) in self.pull_outgoing() {
-            sock.as_mut().queue_to(payload, dst);
+        let gso = self.gso();
+        flush_coalesced(sock.as_mut(), self.pull_outgoing(), gso);
+    }
+}
+
+const MAX_GSO_BYTES: usize = 65535;
+const MAX_GSO_SEGMENTS: usize = 64;
+
+/// Coalesces same-dst runs (equal segments, ≤1 short tail) into one GSO send.
+fn flush_coalesced(
+    mut sock: Pin<&mut Socket<0>>,
+    mut items: Vec<(SocketAddr, Vec<u8>)>,
+    gso: bool,
+) {
+    if !gso {
+        for (addr, payload) in items {
+            sock.as_mut().queue_to(payload, addr);
         }
+        return;
+    }
+    let mut i = 0;
+    while i < items.len() {
+        let addr = items[i].0;
+        let seg = items[i].1.len();
+        let mut j = i + 1;
+        let mut total = seg;
+        while j < items.len()
+            && items[j].0 == addr
+            && items[j - 1].1.len() == seg
+            && items[j].1.len() <= seg
+            && total + items[j].1.len() <= MAX_GSO_BYTES
+            && j - i < MAX_GSO_SEGMENTS
+        {
+            total += items[j].1.len();
+            j += 1;
+        }
+        if j - i == 1 {
+            sock.as_mut()
+                .queue_to(std::mem::take(&mut items[i].1), addr);
+        } else {
+            let mut buf = Vec::with_capacity(total);
+            for slot in &mut items[i..j] {
+                buf.append(&mut slot.1);
+            }
+            debug_assert!(seg <= u16::MAX as usize);
+            sock.as_mut().queue_segmented(buf, addr, seg as u16);
+        }
+        i = j;
     }
 }

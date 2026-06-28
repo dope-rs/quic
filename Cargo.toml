@@ -12,7 +12,7 @@ bench = []
 
 [dependencies]
 shin = "0.6"
-dope = "0.5.2"
+dope = "0.5.3"
 dope-gen = "0.5.2"
 dope-tls = "0.7"
 ring = "0.17"

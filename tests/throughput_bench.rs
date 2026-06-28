@@ -274,14 +274,7 @@ fn send_path_socket() {
     let tiny = Duration::from_micros(20);
     while start.elapsed() < dur {
         if let Some(conn) = server.as_mut().conn_mut(server_handle) {
-            conn.bench_prepare_blast();
-            for _ in 0..batch {
-                let Ok(sid) = conn.open_uni_stream() else {
-                    break;
-                };
-                conn.stream_send(sid, &body);
-                conn.stream_send_fin(sid);
-            }
+            blast(conn, batch, &body);
         }
         server.as_mut().drive(&mut server_drv);
         let _ = server_drv.park(tiny);
@@ -398,5 +391,180 @@ fn quic_request_response_throughput() {
     eprintln!(
         "\nthroughput: body={}B conc={} secs={:.2} -> {:.0} resp/s, {:.1} MiB/s ({} done)",
         body_len, conc, elapsed, rps, mbps, done
+    );
+}
+
+const SERVER_SEED: [u8; 32] = [0x37; 32];
+
+fn pin_core(core: usize) {
+    let _ = dope::launcher::Launcher::pin_to_cpu(core as u16);
+}
+
+fn tp_2proc() -> transport_params::Params {
+    bench_tp(1_000, 8_000_000)
+}
+
+fn blast(conn: &mut Conn, batch: usize, body: &[u8]) {
+    conn.bench_prepare_blast();
+    for _ in 0..batch {
+        let Ok(sid) = conn.open_uni_stream() else {
+            break;
+        };
+        conn.stream_send(sid, body);
+        conn.stream_send_fin(sid);
+    }
+}
+
+struct ServerProc(std::process::Child);
+
+impl Drop for ServerProc {
+    fn drop(&mut self) {
+        self.0.kill().ok();
+        self.0.wait().ok();
+    }
+}
+
+#[test]
+#[ignore]
+fn send_path_2proc() {
+    if std::env::var("TP_ROLE").as_deref() == Ok("server") {
+        run_2proc_server();
+    } else {
+        run_2proc_client();
+    }
+}
+
+fn run_2proc_server() {
+    pin_core(env_usize("TP_SERVER_CORE", 1));
+    let gso = env_usize("TP_GSO", 0) != 0;
+    let body_len = env_usize("TP_BODY", 16384);
+    let batch = env_usize("TP_BATCH", 64);
+    let secs = env_usize("TP_SECS", 3) as u64;
+    let body = vec![0x61u8; body_len];
+
+    let signing = SigningKey::from_seed(&SERVER_SEED).unwrap();
+    let mut drv = Driver::new(DriverCfg::for_quic_udp(8192, 2048)).unwrap();
+    let handler = DrainHandler::default();
+    let est = handler.est.clone();
+    let mut server = std::pin::pin!(
+        Endpoint::<0, _>::build_server(
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            signing,
+            tp_2proc(),
+            handler,
+            &mut drv,
+        )
+        .unwrap()
+    );
+    server.as_mut().set_gso(gso);
+    let port_file = std::env::var("TP_PORT_FILE").unwrap();
+    let tmp = format!("{port_file}.tmp");
+    std::fs::write(&tmp, server.local_addr().port().to_string()).unwrap();
+    std::fs::rename(&tmp, &port_file).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(secs + 3);
+    let tiny = Duration::from_micros(20);
+    while Instant::now() < deadline {
+        if let Some(h) = est.borrow().first().copied()
+            && let Some(conn) = server.as_mut().conn_mut(h)
+        {
+            blast(conn, batch, &body);
+        }
+        server.as_mut().drive(&mut drv);
+        let _ = drv.park(tiny);
+    }
+}
+
+fn run_2proc_client() {
+    use std::process::Command;
+
+    pin_core(env_usize("TP_CLIENT_CORE", 0));
+    let gso = env_usize("TP_GSO", 0) != 0;
+    let body_len = env_usize("TP_BODY", 16384);
+    let secs = env_usize("TP_SECS", 3) as u64;
+
+    let port_file = format!(
+        "{}/tp_2proc_port_{}",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&port_file);
+    let exe = std::env::current_exe().unwrap();
+    let _child = ServerProc(
+        Command::new(exe)
+            .args(["send_path_2proc", "--exact", "--ignored"])
+            .env("TP_ROLE", "server")
+            .env("TP_PORT_FILE", &port_file)
+            .spawn()
+            .expect("spawn server process"),
+    );
+
+    let mut port = 0u16;
+    for _ in 0..2000 {
+        if let Ok(s) = std::fs::read_to_string(&port_file)
+            && let Ok(p) = s.trim().parse::<u16>()
+        {
+            port = p;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(port != 0, "server did not report a port");
+    let _ = std::fs::remove_file(&port_file);
+    let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let server_pubkey = *SigningKey::from_seed(&SERVER_SEED)
+        .unwrap()
+        .pubkey()
+        .unwrap();
+
+    let mut drv = Driver::new(DriverCfg::for_quic_udp(8192, 2048)).unwrap();
+    let handler = DrainHandler::default();
+    let rx = handler.rx.clone();
+    let mut client = std::pin::pin!(
+        Endpoint::<0, _>::build_client(
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            handler,
+            &mut drv,
+        )
+        .unwrap()
+    );
+    client.as_mut().set_gso(gso);
+    let h = client
+        .as_mut()
+        .connect(server_addr, server_pubkey, tp_2proc(), CID.to_vec());
+
+    let tiny = Duration::from_micros(20);
+    let mut ready = false;
+    for _ in 0..2000 {
+        client.as_mut().drive(&mut drv);
+        let _ = drv.park(tiny);
+        if client
+            .as_mut()
+            .conn_mut(h)
+            .map(|c| c.is_established())
+            .unwrap_or(false)
+        {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "handshake did not complete");
+
+    *rx.borrow_mut() = 0;
+    let start = Instant::now();
+    let dur = Duration::from_secs(secs);
+    while start.elapsed() < dur {
+        client.as_mut().drive(&mut drv);
+        let _ = drv.park(tiny);
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let got = *rx.borrow();
+
+    eprintln!(
+        "\nsend_path_2proc: gso={} body={}B -> {:.1} MiB/s recv ({:.0} resp/s eq)",
+        gso as u8,
+        body_len,
+        got as f64 / elapsed / (1024.0 * 1024.0),
+        got as f64 / body_len as f64 / elapsed
     );
 }

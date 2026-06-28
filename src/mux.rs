@@ -32,6 +32,7 @@ pub struct Mux<H: Handler> {
     cid_counter: u64,
     active_conns: usize,
     max_conns: usize,
+    gso: bool,
 }
 
 impl<H: Handler> Mux<H> {
@@ -80,6 +81,7 @@ impl<H: Handler> Mux<H> {
             cid_counter: 0,
             active_conns: 0,
             max_conns: DEFAULT_MAX_CONNS,
+            gso: false,
         }
     }
 
@@ -94,7 +96,18 @@ impl<H: Handler> Mux<H> {
             cid_counter: 0,
             active_conns: 0,
             max_conns: DEFAULT_MAX_CONNS,
+            gso: false,
         }
+    }
+
+    /// Enables UDP GSO coalescing on egress. Off by default: pays off only with
+    /// NIC segmentation offload, regresses software paths (loopback, veth).
+    pub fn set_gso(&mut self, on: bool) {
+        self.gso = on;
+    }
+
+    pub fn gso(&self) -> bool {
+        self.gso
     }
 
     pub fn set_max_conns(&mut self, max: usize) {

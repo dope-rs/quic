@@ -107,9 +107,9 @@ dependencies = [
 
 [[package]]
 name = "dope"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e99b299e88af89ad6b5cd727bda218da2b496b6ecc66b2608e6b5711f6f5fd23"
+checksum = "7a2a10c1f9f1d8a54952b3db5140d27a0812ed52411bde912aa0ad3208f1513a"
 dependencies = [
  "io-uring",
  "libc",
