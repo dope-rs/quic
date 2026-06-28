@@ -41,8 +41,8 @@ fn relay_once(
 ) -> usize {
     let pkts = src.pull_outgoing();
     let n = pkts.len();
-    for (_to, payload) in pkts {
-        dst.on_udp_packet(src_addr, &payload, now).expect("recv");
+    for out in pkts {
+        dst.on_udp_packet(src_addr, out.payload(), now).expect("recv");
     }
     n
 }

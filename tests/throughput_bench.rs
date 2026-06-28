@@ -187,6 +187,33 @@ fn send_path_cpu() {
         mibps,
         responses
     );
+
+    let mut batch = dope_quic::conn::PacketBatch::default();
+    let mut b_responses: u64 = 0;
+    let mut b_packets: u64 = 0;
+    let mut b_bytes: u64 = 0;
+    let bstart = Instant::now();
+    while bstart.elapsed() < dur {
+        for _ in 0..256 {
+            conn.bench_prepare_blast();
+            let sid = conn.open_uni_stream().expect("uni stream");
+            conn.stream_send(sid, &body);
+            conn.stream_send_fin(sid);
+            conn.send_batch(&mut batch, Instant::now());
+            b_packets += batch.packets() as u64;
+            b_bytes += batch.byte_len() as u64;
+            b_responses += 1;
+        }
+    }
+    let b_elapsed = bstart.elapsed().as_secs_f64();
+    eprintln!(
+        "send_path_build_cpu: body={}B -> {:.0} resp/s, {:.0} pkt/s, {:.1} MiB/s wire ({} resp)",
+        body_len,
+        b_responses as f64 / b_elapsed,
+        b_packets as f64 / b_elapsed,
+        b_bytes as f64 / b_elapsed / (1024.0 * 1024.0),
+        b_responses
+    );
 }
 
 // Real-socket one-way blast through the io_uring UDP path: send throughput

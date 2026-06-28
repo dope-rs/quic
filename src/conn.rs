@@ -20,6 +20,71 @@ const TAG_LEN: usize = 16;
 const PN_LEN: u8 = 4;
 const STREAM_FRAME_OVERHEAD: usize = 25;
 
+/// A destination each packet is sealed into. `PacketBatch` packs the burst
+/// contiguously for UDP GSO; `Vec<Vec<u8>>` keeps one owned datagram per packet.
+/// Either way packets are built in place — never copied after sealing.
+trait PacketSink {
+    /// Seals one packet via `build`, which appends its wire bytes and returns
+    /// the byte length, or `None` to emit nothing.
+    fn emit(&mut self, build: impl FnOnce(&mut Vec<u8>) -> Option<usize>);
+    fn is_empty(&self) -> bool;
+}
+
+/// Egress burst in one contiguous buffer with per-packet lengths (`segs`) in
+/// emission order: no `Vec` per packet, and equal-size runs hand to UDP GSO
+/// uncopied.
+#[derive(Default)]
+pub struct PacketBatch {
+    pub(crate) buf: Vec<u8>,
+    pub(crate) segs: Vec<u32>,
+}
+
+impl PacketBatch {
+    pub(crate) fn clear(&mut self) {
+        self.buf.clear();
+        self.segs.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.segs.is_empty()
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn packets(&self) -> usize {
+        self.segs.len()
+    }
+}
+
+impl PacketSink for PacketBatch {
+    fn emit(&mut self, build: impl FnOnce(&mut Vec<u8>) -> Option<usize>) {
+        let start = self.buf.len();
+        match build(&mut self.buf) {
+            Some(n) => self.segs.push(n as u32),
+            None => self.buf.truncate(start),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.segs.is_empty()
+    }
+}
+
+impl PacketSink for Vec<Vec<u8>> {
+    fn emit(&mut self, build: impl FnOnce(&mut Vec<u8>) -> Option<usize>) {
+        let mut pkt = Vec::new();
+        if build(&mut pkt).is_some() {
+            self.push(pkt);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnHandle(pub u32);
 
@@ -62,8 +127,8 @@ enum Epoch {
 type TlsClock = fn() -> u64;
 
 enum SideKind {
-    Client(shin::client::Client<TlsClock>),
-    Server(shin::server::Server<TlsClock, crate::early_data::ReplayGuard>),
+    Client(Box<shin::client::Client<TlsClock>>),
+    Server(Box<shin::server::Server<TlsClock, crate::early_data::ReplayGuard>>),
 }
 
 const MAX_CRYPTO_BUFFERED: usize = 64 * 1024;
@@ -490,10 +555,10 @@ impl Conn {
                     enable_early_data,
                 };
                 (
-                    SideKind::Client(shin::client::Client::new(
+                    SideKind::Client(Box::new(shin::client::Client::new(
                         cfg,
                         crate::time::now_ms as TlsClock,
-                    )),
+                    ))),
                     true,
                     initial_dcid.clone(),
                     None,
@@ -539,7 +604,7 @@ impl Conn {
                     crate::early_data::ReplayGuard::new(store),
                 );
                 (
-                    SideKind::Server(server),
+                    SideKind::Server(Box::new(server)),
                     false,
                     peer_cid.clone(),
                     Some(peer_cid),
@@ -1565,10 +1630,25 @@ impl Conn {
     }
 
     pub fn send_packets(&mut self, now: Instant) -> Vec<Vec<u8>> {
-        if self.state == State::Closed {
-            return Vec::new();
-        }
         let mut out = Vec::new();
+        self.fill_batch(&mut out, now);
+        out
+    }
+
+    pub fn send_batch(&mut self, batch: &mut PacketBatch, now: Instant) {
+        batch.clear();
+        self.fill_batch(batch, now);
+    }
+
+    pub(crate) fn send_split(&mut self, out: &mut Vec<Vec<u8>>, now: Instant) {
+        out.clear();
+        self.fill_batch(out, now);
+    }
+
+    fn fill_batch<S: PacketSink>(&mut self, sink: &mut S, now: Instant) {
+        if self.state == State::Closed {
+            return;
+        }
         let mut sent_handshake_packet = false;
         let mut sent_handshake_done = false;
 
@@ -1582,19 +1662,13 @@ impl Conn {
                 if crypto.is_none() && !has_ack {
                     break;
                 }
-                let wire = self.build_initial(crypto, now);
-                self.amplification_sent = self.amplification_sent.saturating_add(wire.len() as u64);
-                out.push(wire);
+                sink.emit(|dst| Some(self.build_initial(dst, crypto, now)));
                 self.sent_initial = true;
             }
         }
 
-        if self.zero_rtt_w.is_some()
-            && self.app_w.is_none()
-            && let Some(wire) = self.build_zero_rtt(now)
-        {
-            self.amplification_sent = self.amplification_sent.saturating_add(wire.len() as u64);
-            out.push(wire);
+        if self.zero_rtt_w.is_some() && self.app_w.is_none() {
+            sink.emit(|dst| self.build_zero_rtt(dst, now));
         }
 
         if self.handshake_w.is_some() {
@@ -1607,21 +1681,17 @@ impl Conn {
                 if crypto.is_none() && !has_ack {
                     break;
                 }
-                let wire = self.build_handshake(crypto, now);
-                self.amplification_sent = self.amplification_sent.saturating_add(wire.len() as u64);
-                out.push(wire);
+                sink.emit(|dst| Some(self.build_handshake(dst, crypto, now)));
                 sent_handshake_packet = true;
             }
         }
 
         if self.app_w.is_some() {
             if let Some(close) = self.pending_close.take() {
-                let wire = self.build_one_rtt_close(close, now);
-                self.amplification_sent = self.amplification_sent.saturating_add(wire.len() as u64);
-                out.push(wire);
+                sink.emit(|dst| Some(self.build_one_rtt_close(dst, close, now)));
                 self.state = State::Closed;
                 self.last_activity = now;
-                return out;
+                return;
             }
 
             // Snapshot sendable streams once; build_one_rtt drains it per packet,
@@ -1666,9 +1736,7 @@ impl Conn {
                     break;
                 }
                 let before = self.cc.bytes_in_flight;
-                let wire = self.build_one_rtt(None, want_handshake_done, now);
-                self.amplification_sent = self.amplification_sent.saturating_add(wire.len() as u64);
-                out.push(wire);
+                sink.emit(|dst| Some(self.build_one_rtt(dst, None, want_handshake_done, now)));
                 if want_handshake_done {
                     self.handshake_done_pending = false;
                     sent_handshake_done = true;
@@ -1682,16 +1750,12 @@ impl Conn {
                     self.pending_datagrams.push_front(dg);
                     break;
                 }
-                let wire = self.build_one_rtt(Some(dg), false, now);
-                self.amplification_sent = self.amplification_sent.saturating_add(wire.len() as u64);
-                out.push(wire);
+                sink.emit(|dst| Some(self.build_one_rtt(dst, Some(dg), false, now)));
             }
             if let Some(probe_size) = self.pmtud.next_probe()
                 && self.allows_emit_for(PacketCargo::CryptoOrAck, now)
             {
-                let wire = self.build_one_rtt_probe(probe_size, now);
-                self.amplification_sent = self.amplification_sent.saturating_add(wire.len() as u64);
-                out.push(wire);
+                sink.emit(|dst| Some(self.build_one_rtt_probe(dst, probe_size, now)));
             }
         }
 
@@ -1702,11 +1766,10 @@ impl Conn {
             self.discard_handshake_keys();
         }
 
-        if !out.is_empty() {
+        if !sink.is_empty() {
             self.last_activity = now;
             self.update_loss_timer();
         }
-        out
     }
 
     /// Resets application send state (lifts cc/flow limits, clears bookkeeping)
@@ -1818,7 +1881,12 @@ impl Conn {
         &self.local_cids
     }
 
-    fn build_initial(&mut self, crypto: Option<(u64, Vec<u8>)>, now: Instant) -> Vec<u8> {
+    fn build_initial(
+        &mut self,
+        dst: &mut Vec<u8>,
+        crypto: Option<(u64, Vec<u8>)>,
+        now: Instant,
+    ) -> usize {
         let pn = self.spaces[Epoch::Initial as usize].next_pn;
         self.spaces[Epoch::Initial as usize].next_pn += 1;
 
@@ -1864,14 +1932,15 @@ impl Conn {
             pn_len: PN_LEN,
         };
         let (hdr, pn_off) = h.encode_with_pn(body_len_after_pn);
-        let wire = self
+        let n = self
             .initial_w
             .as_ref()
             .expect("Initial keys present at build_initial")
-            .encrypt_long(&hdr, &payload, pn, pn_off, PN_LEN as usize);
+            .encrypt_long_into(dst, &hdr, &payload, pn, pn_off, PN_LEN as usize);
 
         let ack_eliciting = crypto_record.is_some();
-        self.on_wire_sent(wire.len() as u64, ack_eliciting, now);
+        self.amplification_sent = self.amplification_sent.saturating_add(n as u64);
+        self.on_wire_sent(n as u64, ack_eliciting, now);
         self.spaces[Epoch::Initial as usize].record_sent(SentPacket {
             pn,
             sent_time: now,
@@ -1881,12 +1950,17 @@ impl Conn {
                 crypto: crypto_record,
                 stream: Vec::new(),
             },
-            bytes_sent: wire.len(),
+            bytes_sent: n,
         });
-        wire
+        n
     }
 
-    fn build_handshake(&mut self, crypto: Option<(u64, Vec<u8>)>, now: Instant) -> Vec<u8> {
+    fn build_handshake(
+        &mut self,
+        dst: &mut Vec<u8>,
+        crypto: Option<(u64, Vec<u8>)>,
+        now: Instant,
+    ) -> usize {
         let pn = self.spaces[Epoch::Handshake as usize].next_pn;
         self.spaces[Epoch::Handshake as usize].next_pn += 1;
 
@@ -1912,14 +1986,15 @@ impl Conn {
             pn_len: PN_LEN,
         };
         let (hdr, pn_off) = h.encode_with_pn(body_len_after_pn);
-        let wire = self
+        let n = self
             .handshake_w
             .as_ref()
             .expect("handshake keys present")
-            .encrypt_long(&hdr, &frames, pn, pn_off, PN_LEN as usize);
+            .encrypt_long_into(dst, &hdr, &frames, pn, pn_off, PN_LEN as usize);
 
         let ack_eliciting = crypto_record.is_some();
-        self.on_wire_sent(wire.len() as u64, ack_eliciting, now);
+        self.amplification_sent = self.amplification_sent.saturating_add(n as u64);
+        self.on_wire_sent(n as u64, ack_eliciting, now);
         self.spaces[Epoch::Handshake as usize].record_sent(SentPacket {
             pn,
             sent_time: now,
@@ -1929,17 +2004,18 @@ impl Conn {
                 crypto: crypto_record,
                 stream: Vec::new(),
             },
-            bytes_sent: wire.len(),
+            bytes_sent: n,
         });
-        wire
+        n
     }
 
     fn build_one_rtt(
         &mut self,
+        dst: &mut Vec<u8>,
         dgram: Option<Vec<u8>>,
         emit_handshake_done: bool,
         now: Instant,
-    ) -> Vec<u8> {
+    ) -> usize {
         let pn = self.spaces[Epoch::Application as usize].next_pn;
         self.spaces[Epoch::Application as usize].next_pn += 1;
 
@@ -2159,15 +2235,16 @@ impl Conn {
             pn_len: PN_LEN,
         };
         let (hdr, pn_off) = h.encode_with_pn();
-        let wire = self
+        let seg = self
             .app_w
             .as_ref()
             .expect("app keys present")
-            .encrypt_short(&hdr, &frames, pn, pn_off, PN_LEN as usize);
+            .encrypt_short_into(dst, &hdr, &frames, pn, pn_off, PN_LEN as usize);
 
         frames.clear();
         self.scratch_frames = frames;
-        self.on_wire_sent(wire.len() as u64, ack_eliciting, now);
+        self.amplification_sent = self.amplification_sent.saturating_add(seg as u64);
+        self.on_wire_sent(seg as u64, ack_eliciting, now);
         self.spaces[Epoch::Application as usize].record_sent(SentPacket {
             pn,
             sent_time: now,
@@ -2177,12 +2254,12 @@ impl Conn {
                 crypto: None,
                 stream: stream_frames,
             },
-            bytes_sent: wire.len(),
+            bytes_sent: seg,
         });
-        wire
+        seg
     }
 
-    fn build_zero_rtt(&mut self, now: Instant) -> Option<Vec<u8>> {
+    fn build_zero_rtt(&mut self, dst: &mut Vec<u8>, now: Instant) -> Option<usize> {
         self.zero_rtt_w.as_ref()?;
         let stream_ids: Vec<u64> = self
             .streams_send
@@ -2232,12 +2309,13 @@ impl Conn {
             pn_len: PN_LEN,
         };
         let (hdr, pn_off) = h.encode_with_pn(body_len_after_pn);
-        let wire = self
+        let n = self
             .zero_rtt_w
             .as_ref()
             .expect("checked above")
-            .encrypt_long(&hdr, &frames, pn, pn_off, PN_LEN as usize);
-        self.on_wire_sent(wire.len() as u64, ack_eliciting, now);
+            .encrypt_long_into(dst, &hdr, &frames, pn, pn_off, PN_LEN as usize);
+        self.amplification_sent = self.amplification_sent.saturating_add(n as u64);
+        self.on_wire_sent(n as u64, ack_eliciting, now);
         self.spaces[Epoch::Application as usize].record_sent(SentPacket {
             pn,
             sent_time: now,
@@ -2247,12 +2325,12 @@ impl Conn {
                 crypto: None,
                 stream: Vec::new(),
             },
-            bytes_sent: wire.len(),
+            bytes_sent: n,
         });
-        Some(wire)
+        Some(n)
     }
 
-    fn build_one_rtt_probe(&mut self, target_size: u64, now: Instant) -> Vec<u8> {
+    fn build_one_rtt_probe(&mut self, dst: &mut Vec<u8>, target_size: u64, now: Instant) -> usize {
         let pn = self.spaces[Epoch::Application as usize].next_pn;
         self.spaces[Epoch::Application as usize].next_pn += 1;
 
@@ -2270,13 +2348,14 @@ impl Conn {
             pn_len: PN_LEN,
         };
         let (hdr, pn_off) = h.encode_with_pn();
-        let wire = self
+        let n = self
             .app_w
             .as_ref()
             .expect("app keys present")
-            .encrypt_short(&hdr, &frames, pn, pn_off, PN_LEN as usize);
+            .encrypt_short_into(dst, &hdr, &frames, pn, pn_off, PN_LEN as usize);
 
-        self.on_wire_sent(wire.len() as u64, true, now);
+        self.amplification_sent = self.amplification_sent.saturating_add(n as u64);
+        self.on_wire_sent(n as u64, true, now);
         self.spaces[Epoch::Application as usize].record_sent(SentPacket {
             pn,
             sent_time: now,
@@ -2286,14 +2365,14 @@ impl Conn {
                 crypto: None,
                 stream: Vec::new(),
             },
-            bytes_sent: wire.len(),
+            bytes_sent: n,
         });
         self.pmtud.arm_probe(target_size);
         self.pmtud_probe_pn = Some(pn);
-        wire
+        n
     }
 
-    fn build_one_rtt_close(&mut self, close: PendingClose, now: Instant) -> Vec<u8> {
+    fn build_one_rtt_close(&mut self, dst: &mut Vec<u8>, close: PendingClose, now: Instant) -> usize {
         let pn = self.spaces[Epoch::Application as usize].next_pn;
         self.spaces[Epoch::Application as usize].next_pn += 1;
 
@@ -2312,12 +2391,13 @@ impl Conn {
             pn_len: PN_LEN,
         };
         let (hdr, pn_off) = h.encode_with_pn();
-        let wire = self
+        let n = self
             .app_w
             .as_ref()
             .expect("app keys present")
-            .encrypt_short(&hdr, &frames, pn, pn_off, PN_LEN as usize);
+            .encrypt_short_into(dst, &hdr, &frames, pn, pn_off, PN_LEN as usize);
 
+        self.amplification_sent = self.amplification_sent.saturating_add(n as u64);
         self.spaces[Epoch::Application as usize].record_sent(SentPacket {
             pn,
             sent_time: now,
@@ -2327,9 +2407,9 @@ impl Conn {
                 crypto: None,
                 stream: Vec::new(),
             },
-            bytes_sent: wire.len(),
+            bytes_sent: n,
         });
-        wire
+        n
     }
 
     #[doc(hidden)]

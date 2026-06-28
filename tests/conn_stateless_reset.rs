@@ -213,8 +213,8 @@ fn server_emits_reset_for_unknown_dcid() {
 
     let outgoing = mux.pull_outgoing();
     assert_eq!(outgoing.len(), 1, "exactly one reset should be emitted");
-    let (dst, reset) = &outgoing[0];
-    assert_eq!(*dst, from, "reset goes back to triggering address");
+    let (dst, reset) = (outgoing[0].addr(), outgoing[0].payload());
+    assert_eq!(dst, from, "reset goes back to triggering address");
     assert!(
         reset.len() >= 22 && reset.len() < wire.len(),
         "reset must be 22..{} bytes, got {}",
@@ -251,7 +251,8 @@ fn server_emits_reset_for_unknown_dcid() {
     mux.on_udp_packet(from, &wire2, Instant::now()).unwrap();
     let outgoing2 = mux.pull_outgoing();
     let mut tail2 = [0u8; 16];
-    tail2.copy_from_slice(&outgoing2[0].1[outgoing2[0].1.len() - 16..]);
+    let p2 = outgoing2[0].payload();
+    tail2.copy_from_slice(&p2[p2.len() - 16..]);
     assert_eq!(tail, tail2, "SRT must be deterministic per (secret, dcid)");
 }
 
@@ -304,7 +305,7 @@ fn end_to_end_server_restart_recovery() {
     server_b.on_udp_packet(from, &wire, Instant::now()).unwrap();
     let outgoing = server_b.pull_outgoing();
     assert_eq!(outgoing.len(), 1);
-    let reset = &outgoing[0].1;
+    let reset = outgoing[0].payload();
 
     client.recv_packet(reset, Instant::now()).unwrap();
     assert!(

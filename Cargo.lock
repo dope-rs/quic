@@ -107,9 +107,9 @@ dependencies = [
 
 [[package]]
 name = "dope"
-version = "0.5.3"
+version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a2a10c1f9f1d8a54952b3db5140d27a0812ed52411bde912aa0ad3208f1513a"
+checksum = "99b1fe82bd8665f9b2d78a47b2c28834c9d3dbd6497575d7ebdad07de6acc35e"
 dependencies = [
  "io-uring",
  "libc",
@@ -119,9 +119,9 @@ dependencies = [
 
 [[package]]
 name = "dope-gen"
-version = "0.5.2"
+version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd962b20728d72a4fed80a6733d8e8eb7d8a7402b78a13de9ce3eaa83bf7d356"
+checksum = "172c8823fb0399a240959a6707648cb73153b102cfdd3d565b6eb49dc9a777ee"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -143,9 +143,9 @@ dependencies = [
 
 [[package]]
 name = "dope-tls"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3e755e12cbce89571da21bf5aa1a3ca3233b4e9b429d3cf579f27e21a71822e"
+checksum = "46cfc0e9cac6cc1975deab97fa718cdacc9fc0a5c0f14528cd6b2cfa26859cc3"
 dependencies = [
  "dope",
  "libc",
@@ -185,9 +185,9 @@ dependencies = [
 
 [[package]]
 name = "io-uring"
-version = "0.7.12"
+version = "0.7.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
+checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -354,9 +354,9 @@ dependencies = [
 
 [[package]]
 name = "shin"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d6fdd92c2c117aa84bc81b56cc6e4d3ce66032ed04773242d53dca277492b9c"
+checksum = "05cab1b518ee86d87f298dc380d376159b46b0dcf5e02ab5c698410819efa9bb"
 dependencies = [
  "ml-kem",
  "rand_core",

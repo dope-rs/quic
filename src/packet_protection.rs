@@ -35,7 +35,22 @@ impl PacketProtection {
         pn_offset: usize,
         pn_len: usize,
     ) -> Vec<u8> {
-        self.encrypt(
+        let mut buf = Vec::new();
+        self.encrypt_long_into(&mut buf, header_with_pn, payload, packet_number, pn_offset, pn_len);
+        buf
+    }
+
+    pub fn encrypt_long_into(
+        &self,
+        dst: &mut Vec<u8>,
+        header_with_pn: &[u8],
+        payload: &[u8],
+        packet_number: u64,
+        pn_offset: usize,
+        pn_len: usize,
+    ) -> usize {
+        self.encrypt_into(
+            dst,
             header_with_pn,
             payload,
             packet_number,
@@ -61,7 +76,22 @@ impl PacketProtection {
         pn_offset: usize,
         pn_len: usize,
     ) -> Vec<u8> {
-        self.encrypt(
+        let mut buf = Vec::new();
+        self.encrypt_short_into(&mut buf, header_with_pn, payload, packet_number, pn_offset, pn_len);
+        buf
+    }
+
+    pub fn encrypt_short_into(
+        &self,
+        dst: &mut Vec<u8>,
+        header_with_pn: &[u8],
+        payload: &[u8],
+        packet_number: u64,
+        pn_offset: usize,
+        pn_len: usize,
+    ) -> usize {
+        self.encrypt_into(
+            dst,
             header_with_pn,
             payload,
             packet_number,
@@ -72,35 +102,39 @@ impl PacketProtection {
     }
 
     /// Seals the payload in place (AAD = header) and applies header protection,
-    /// building the wire in one allocation.
-    fn encrypt(
+    /// appending one wire packet to `dst`. Returns the packet's byte length, so
+    /// callers can coalesce a burst into one buffer and recover segment bounds.
+    #[allow(clippy::too_many_arguments)]
+    fn encrypt_into(
         &self,
+        dst: &mut Vec<u8>,
         header_with_pn: &[u8],
         payload: &[u8],
         packet_number: u64,
         pn_offset: usize,
         pn_len: usize,
         first_byte_mask: u8,
-    ) -> Vec<u8> {
+    ) -> usize {
+        let start = dst.len();
         let hdr_len = header_with_pn.len();
-        let mut buf = Vec::with_capacity(hdr_len + payload.len() + 16);
-        buf.extend_from_slice(header_with_pn);
-        buf.extend_from_slice(payload);
+        dst.reserve(hdr_len + payload.len() + 16);
+        dst.extend_from_slice(header_with_pn);
+        dst.extend_from_slice(payload);
         let tag = self
             .aead
-            .seal_detached(packet_number, header_with_pn, &mut buf[hdr_len..]);
-        buf.extend_from_slice(&tag);
+            .seal_detached(packet_number, header_with_pn, &mut dst[start + hdr_len..]);
+        dst.extend_from_slice(&tag);
 
-        let sample_start = pn_offset + 4;
+        let sample_start = start + pn_offset + 4;
         let mut sample = [0u8; 16];
-        sample.copy_from_slice(&buf[sample_start..sample_start + 16]);
+        sample.copy_from_slice(&dst[sample_start..sample_start + 16]);
         let mask = self.hp.mask(&sample).expect("16-byte sample");
 
-        buf[0] ^= mask[0] & first_byte_mask;
+        dst[start] ^= mask[0] & first_byte_mask;
         for i in 0..pn_len {
-            buf[pn_offset + i] ^= mask[1 + i];
+            dst[start + pn_offset + i] ^= mask[1 + i];
         }
-        buf
+        dst.len() - start
     }
 
     pub fn decrypt_short(

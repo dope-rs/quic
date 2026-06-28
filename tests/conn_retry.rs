@@ -140,8 +140,8 @@ fn first_initial_without_token_triggers_retry() {
 
     let outgoing = mux.pull_outgoing();
     assert_eq!(outgoing.len(), 1, "exactly one Retry should be emitted");
-    let (dst, retry_wire) = &outgoing[0];
-    assert_eq!(*dst, from);
+    let (dst, retry_wire) = (outgoing[0].addr(), outgoing[0].payload());
+    assert_eq!(dst, from);
     let retry = RetryPacket::decode(retry_wire).expect("decode Retry");
     assert_eq!(retry.dcid, client_scid, "retry DCID echoes client's SCID");
     assert!(
@@ -167,7 +167,7 @@ fn second_initial_with_valid_token_does_not_re_retry() {
     )
     .unwrap();
     let first_out = mux.pull_outgoing();
-    let retry = RetryPacket::decode(&first_out[0].1).unwrap();
+    let retry = RetryPacket::decode(first_out[0].payload()).unwrap();
     let token = retry.token.clone();
     let new_dcid = retry.scid;
 
@@ -177,7 +177,8 @@ fn second_initial_with_valid_token_does_not_re_retry() {
         Instant::now(),
     );
     let second_out = mux.pull_outgoing();
-    for (_addr, wire) in &second_out {
+    for out in &second_out {
+        let wire = out.payload();
         let is_retry = matches!(wire.first(), Some(b) if b & 0xF0 == 0xF0);
         assert!(
             !is_retry,
@@ -202,7 +203,7 @@ fn second_initial_with_wrong_addr_is_rejected() {
         Instant::now(),
     )
     .unwrap();
-    let retry = RetryPacket::decode(&mux.pull_outgoing()[0].1).unwrap();
+    let retry = RetryPacket::decode(mux.pull_outgoing()[0].payload()).unwrap();
     let token = retry.token;
     let new_dcid = retry.scid;
 
@@ -229,7 +230,8 @@ fn retry_off_by_default_lets_initials_through() {
     let from: SocketAddr = "127.0.0.1:55005".parse().unwrap();
     let _ = mux.on_udp_packet(from, &initial, Instant::now());
     let out = mux.pull_outgoing();
-    for (_addr, wire) in &out {
+    for o in &out {
+        let wire = o.payload();
         let is_retry = matches!(wire.first(), Some(b) if b & 0xF0 == 0xF0);
         assert!(!is_retry, "off-by-default: no Retry should be emitted");
     }

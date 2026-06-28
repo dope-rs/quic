@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use shin::sig::SigningKey;
 
-use crate::conn::{Conn, ConnConfig, ConnError, ConnHandle, DatagramError, StreamEvent};
+use crate::conn::{Conn, ConnConfig, ConnError, ConnHandle, DatagramError, PacketBatch, StreamEvent};
 use crate::packet::InitialHeader;
 
 pub trait Handler: 'static {
@@ -22,13 +22,37 @@ struct Slot {
 
 const DEFAULT_MAX_CONNS: usize = 1 << 18;
 
+/// A queued egress send. `Gso` carries a uniform-segment burst (last may be
+/// shorter) for `UDP_SEGMENT`; the socket layer chunks it to kernel limits.
+/// `Plain` is a lone datagram.
+pub enum Outgoing {
+    Plain(SocketAddr, Vec<u8>),
+    Gso(SocketAddr, Vec<u8>, u16),
+}
+
+impl Outgoing {
+    pub fn addr(&self) -> SocketAddr {
+        match *self {
+            Self::Plain(a, _) | Self::Gso(a, _, _) => a,
+        }
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        match self {
+            Self::Plain(_, p) | Self::Gso(_, p, _) => p,
+        }
+    }
+}
+
 pub struct Mux<H: Handler> {
     slots: Vec<Option<Slot>>,
     free: Vec<u32>,
     cid_to_handle: HashMap<Vec<u8>, ConnHandle>,
     handler: H,
     server_creds: Option<(SigningKey, ConnConfig)>,
-    pending_outgoing: Vec<(SocketAddr, Vec<u8>)>,
+    pending_outgoing: Vec<Outgoing>,
+    out_batch: PacketBatch,
+    out_split: Vec<Vec<u8>>,
     cid_counter: u64,
     active_conns: usize,
     max_conns: usize,
@@ -78,6 +102,8 @@ impl<H: Handler> Mux<H> {
             handler,
             server_creds: Some((signing_key, server_config)),
             pending_outgoing: Vec::new(),
+            out_batch: PacketBatch::default(),
+            out_split: Vec::new(),
             cid_counter: 0,
             active_conns: 0,
             max_conns: DEFAULT_MAX_CONNS,
@@ -93,6 +119,8 @@ impl<H: Handler> Mux<H> {
             handler,
             server_creds: None,
             pending_outgoing: Vec::new(),
+            out_batch: PacketBatch::default(),
+            out_split: Vec::new(),
             cid_counter: 0,
             active_conns: 0,
             max_conns: DEFAULT_MAX_CONNS,
@@ -104,10 +132,6 @@ impl<H: Handler> Mux<H> {
     /// NIC segmentation offload, regresses software paths (loopback, veth).
     pub fn set_gso(&mut self, on: bool) {
         self.gso = on;
-    }
-
-    pub fn gso(&self) -> bool {
-        self.gso
     }
 
     pub fn set_max_conns(&mut self, max: usize) {
@@ -174,7 +198,7 @@ impl<H: Handler> Mux<H> {
             }
             None => {
                 if let Some(reset) = self.maybe_emit_stateless_reset(data) {
-                    self.pending_outgoing.push((from, reset));
+                    self.pending_outgoing.push(Outgoing::Plain(from, reset));
                 }
                 return Ok(());
             }
@@ -194,7 +218,7 @@ impl<H: Handler> Mux<H> {
         Ok(())
     }
 
-    pub fn pull_outgoing(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
+    pub fn pull_outgoing(&mut self) -> Vec<Outgoing> {
         std::mem::take(&mut self.pending_outgoing)
     }
 
@@ -298,17 +322,78 @@ impl<H: Handler> Mux<H> {
     }
 
     fn flush_conn(&mut self, handle: ConnHandle, now: Instant) {
-        let slot = match self
-            .slots
-            .get_mut(handle.0 as usize)
-            .and_then(|s| s.as_mut())
-        {
-            Some(s) => s,
-            None => return,
-        };
-        let addr = slot.peer_addr;
-        for pkt in slot.conn.send_packets(now) {
-            self.pending_outgoing.push((addr, pkt));
+        let idx = handle.0 as usize;
+        if self.gso {
+            let mut batch = std::mem::take(&mut self.out_batch);
+            let addr = match self.slots.get_mut(idx).and_then(|s| s.as_mut()) {
+                Some(s) => {
+                    s.conn.send_batch(&mut batch, now);
+                    s.peer_addr
+                }
+                None => {
+                    self.out_batch = batch;
+                    return;
+                }
+            };
+            self.coalesce_gso(addr, &mut batch);
+            self.out_batch = batch;
+        } else {
+            let mut split = std::mem::take(&mut self.out_split);
+            let addr = match self.slots.get_mut(idx).and_then(|s| s.as_mut()) {
+                Some(s) => {
+                    s.conn.send_split(&mut split, now);
+                    s.peer_addr
+                }
+                None => {
+                    self.out_split = split;
+                    return;
+                }
+            };
+            self.pending_outgoing
+                .extend(split.drain(..).map(|pkt| Outgoing::Plain(addr, pkt)));
+            self.out_split = split;
+        }
+    }
+
+    /// Coalesces a connection's contiguous burst into UDP GSO sends. Each
+    /// maximal run of equal-size packets (one shorter tail allowed) ships as one
+    /// `Gso` — the socket layer chunks it to the kernel's segment/byte cap; a
+    /// lone packet ships as `Plain`. A run spanning the whole buffer is moved
+    /// out uncopied.
+    fn coalesce_gso(&mut self, addr: SocketAddr, batch: &mut PacketBatch) {
+        let n = batch.segs.len();
+        if n == 0 {
+            return;
+        }
+        if n == 1 {
+            self.pending_outgoing
+                .push(Outgoing::Plain(addr, std::mem::take(&mut batch.buf)));
+            return;
+        }
+        let mut i = 0;
+        let mut off = 0usize;
+        while i < n {
+            let seg0 = batch.segs[i];
+            let mut j = i + 1;
+            let mut total = seg0 as usize;
+            while j < n && batch.segs[j - 1] == seg0 && batch.segs[j] <= seg0 {
+                total += batch.segs[j] as usize;
+                j += 1;
+            }
+            let end = off + total;
+            if j - i == 1 {
+                self.pending_outgoing
+                    .push(Outgoing::Plain(addr, batch.buf[off..end].to_vec()));
+            } else if off == 0 && end == batch.buf.len() {
+                let buf = std::mem::take(&mut batch.buf);
+                self.pending_outgoing
+                    .push(Outgoing::Gso(addr, buf, seg0 as u16));
+            } else {
+                self.pending_outgoing
+                    .push(Outgoing::Gso(addr, batch.buf[off..end].to_vec(), seg0 as u16));
+            }
+            off = end;
+            i = j;
         }
     }
 
@@ -387,7 +472,8 @@ impl<H: Handler> Mux<H> {
                 integrity_tag: [0u8; 16],
             };
             retry.integrity_tag = retry.compute_integrity_tag(&prefix.dcid);
-            self.pending_outgoing.push((from, retry.encode()));
+            self.pending_outgoing
+                .push(Outgoing::Plain(from, retry.encode()));
             return Ok(RetryGate::IssuedRetry);
         }
         let now_secs = crate::time::now_unix_secs();
