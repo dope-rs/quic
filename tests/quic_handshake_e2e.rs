@@ -29,7 +29,10 @@ fn extract_keys(events: &[Event], epoch: Epoch) -> Option<([u8; 32], [u8; 32])> 
             epoch: ep,
             read_secret,
             write_secret,
-        } if *ep == epoch => Some((*read_secret, *write_secret)),
+        } if *ep == epoch => Some((
+            read_secret.as_slice().try_into().unwrap(),
+            write_secret.as_slice().try_into().unwrap(),
+        )),
         _ => None,
     })
 }
@@ -180,24 +183,31 @@ fn quic_handshake_completes_over_packet_stack() {
     let server_signing = SigningKey::from_seed(&seed).unwrap();
     let server_pubkey = *server_signing.pubkey().unwrap();
 
-    let mut server = server::Server::new(server::Config {
-        source: shin::server::CertSource::RawPublicKey {
-            signing_key: server_signing,
+    let clock = || 0u64;
+    let mut server = server::Server::new(
+        server::Config {
+            source: shin::server::CertSource::RawPublicKey {
+                signing_key: server_signing,
+            },
+            transport_params: b"server-tp".to_vec(),
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+            accept_early_data: false,
         },
-        transport_params: b"server-tp".to_vec(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    });
-    let mut client = client::Client::new(client::Config {
-        verifier: shin::client::Verifier::RawPublicKey {
-            expected_pubkey: server_pubkey,
+        clock,
+    );
+    let mut client = client::Client::new(
+        client::Config {
+            verifier: shin::client::Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: b"client-tp".to_vec(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: b"client-tp".to_vec(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    });
+        clock,
+    );
 
     let init = InitialSecrets::from_dcid(&INITIAL_DCID);
     let client_initial_w = keys_from_secret(&init.client);

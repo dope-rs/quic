@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use shin::server::EarlyDataGuard;
 
@@ -49,15 +48,9 @@ impl ReplayGuard {
 }
 
 impl EarlyDataGuard for ReplayGuard {
-    fn now_ms(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
-
     fn register(&mut self, token: &[u8]) -> bool {
-        let now = self.now_ms();
-        self.store.borrow_mut().register(token, now)
+        self.store
+            .borrow_mut()
+            .register(token, crate::time::now_ms())
     }
 }

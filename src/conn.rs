@@ -58,9 +58,12 @@ enum Epoch {
     Application = 2,
 }
 
+/// A nameable [`shin::Clock`] for [`SideKind`] (a closure has no nameable type).
+type TlsClock = fn() -> u64;
+
 enum SideKind {
-    Client(shin::client::Client),
-    Server(shin::server::Server),
+    Client(shin::client::Client<TlsClock>),
+    Server(shin::server::Server<TlsClock, crate::early_data::ReplayGuard>),
 }
 
 const MAX_CRYPTO_BUFFERED: usize = 64 * 1024;
@@ -135,11 +138,18 @@ pub struct Conn {
     app_r: Option<PacketProtection>,
     zero_rtt_w: Option<PacketProtection>,
     zero_rtt_r: Option<PacketProtection>,
+    /// Server-only: 0-RTT was accepted, so shin's transcript expects an
+    /// `EndOfEarlyData` that QUIC never sends on the wire (RFC 9001 §8.3). When
+    /// set, we synthesize one before the client's Handshake flight.
+    pending_synth_eod: bool,
 
     spaces: [PnSpace; 3],
     rtt: RttTracker,
     pto_count: u32,
     loss_timer: Option<Instant>,
+
+    scratch_frames: Vec<u8>,
+    scratch_pending: Vec<u64>,
 
     pending_crypto_initial: Vec<u8>,
     pending_crypto_handshake: Vec<u8>,
@@ -480,7 +490,10 @@ impl Conn {
                     enable_early_data,
                 };
                 (
-                    SideKind::Client(shin::client::Client::new(cfg)),
+                    SideKind::Client(shin::client::Client::new(
+                        cfg,
+                        crate::time::now_ms as TlsClock,
+                    )),
                     true,
                     initial_dcid.clone(),
                     None,
@@ -514,17 +527,17 @@ impl Conn {
                     },
                     transport_params: tp_bytes,
                     alpn_protocols,
-                    ticket_secret,
+                    ticket_keys: ticket_secret.map(shin::ticket::TicketKeys::single),
                     accept_early_data,
                 };
-                let mut server = shin::server::Server::new(cfg);
-                if accept_early_data {
-                    let store = early_data_store
-                        .unwrap_or_else(crate::early_data::shared_replay_store);
-                    server.set_early_data_guard(Box::new(crate::early_data::ReplayGuard::new(
-                        store,
-                    )));
-                }
+                // Attached unconditionally to keep `Server`'s type uniform; it is
+                // only consulted once `accept_early_data` is set.
+                let store = early_data_store.unwrap_or_else(crate::early_data::shared_replay_store);
+                let server = shin::server::Server::with_early_data_guard(
+                    cfg,
+                    crate::time::now_ms as TlsClock,
+                    crate::early_data::ReplayGuard::new(store),
+                );
                 (
                     SideKind::Server(server),
                     false,
@@ -545,6 +558,8 @@ impl Conn {
         let mut conn = Self {
             side,
             is_client,
+            scratch_frames: Vec::with_capacity(K_MAX_DATAGRAM_SIZE as usize),
+            scratch_pending: Vec::new(),
             peer_cid,
             local_cid,
             original_dcid: initial_dcid,
@@ -557,6 +572,7 @@ impl Conn {
             app_r: None,
             zero_rtt_w: None,
             zero_rtt_r: None,
+            pending_synth_eod: false,
             spaces: Default::default(),
             rtt: RttTracker::default(),
             pto_count: 0,
@@ -1015,6 +1031,13 @@ impl Conn {
                 Frame::Crypto { offset, data } => {
                     let msgs = self.recv_crypto[epoch as usize].accept(offset, data)?;
                     for msg in msgs {
+                        if self.pending_synth_eod && epoch == Epoch::Handshake {
+                            self.pending_synth_eod = false;
+                            // EndOfEarlyData: handshake type 5, empty body.
+                            let evs =
+                                self.feed_shin(shin::Epoch::EarlyData, &[0x05, 0x00, 0x00, 0x00])?;
+                            self.absorb_shin_events(evs);
+                        }
                         let evs = self.feed_shin(shin_epoch, &msg)?;
                         self.absorb_shin_events(evs);
                     }
@@ -1391,14 +1414,17 @@ impl Conn {
                         self.pending_crypto_handshake.extend_from_slice(&data)
                     }
                     shin::Epoch::Application => self.pending_crypto_app.extend_from_slice(&data),
+                    // QUIC carries no CRYPTO at the 0-RTT epoch.
+                    shin::Epoch::EarlyData => {}
                 },
                 Event::KeysReady {
                     epoch,
                     read_secret,
                     write_secret,
                 } => {
-                    let r = PacketProtection::aes_128(&PacketKeys::aes_128(&read_secret));
-                    let w = PacketProtection::aes_128(&PacketKeys::aes_128(&write_secret));
+                    let r = PacketProtection::aes_128(&PacketKeys::aes_128(read_secret.as_slice()));
+                    let w =
+                        PacketProtection::aes_128(&PacketKeys::aes_128(write_secret.as_slice()));
                     match epoch {
                         shin::Epoch::Handshake => {
                             self.handshake_r = Some(r);
@@ -1409,6 +1435,8 @@ impl Conn {
                             self.app_w = Some(w);
                         }
                         shin::Epoch::Plaintext => {}
+                        // 0-RTT keys arrive via `ZeroRttKeysReady`, never here.
+                        shin::Epoch::EarlyData => {}
                     }
                 }
                 Event::PeerExtension { ty: _, data } => {
@@ -1427,18 +1455,26 @@ impl Conn {
                 }
                 Event::KeyUpdate { .. } => {}
                 Event::ZeroRttKeysReady { secret } => {
-                    let keys = PacketProtection::aes_128(&PacketKeys::aes_128(&secret));
+                    let keys = PacketProtection::aes_128(&PacketKeys::aes_128(secret.as_slice()));
                     if self.is_client {
                         self.zero_rtt_w = Some(keys);
                     } else {
                         self.zero_rtt_r = Some(keys);
+                        self.pending_synth_eod = true;
                     }
+                }
+                Event::EarlyDataAccepted => {}
+                // Rejected: drop write keys; the data is resent at 1-RTT.
+                Event::EarlyDataRejected => {
+                    self.zero_rtt_w = None;
                 }
                 Event::NewSessionTicket {
                     ticket_lifetime,
                     ticket_age_add,
                     ticket_nonce,
                     ticket,
+                    // Per-ticket 0-RTT cap not yet enforced.
+                    max_early_data: _,
                 } => {
                     let psk = self.pending_resumption_psk.take().unwrap_or([0u8; 32]);
                     self.received_tickets.push(SessionTicket {
@@ -1588,6 +1624,19 @@ impl Conn {
                 return out;
             }
 
+            // Snapshot sendable streams once; build_one_rtt drains it per packet,
+            // avoiding an O(streams) rescan for every packet built.
+            {
+                let mut pend = std::mem::take(&mut self.scratch_pending);
+                pend.clear();
+                for (&id, s) in &self.streams_send {
+                    if s.has_pending() {
+                        pend.push(id);
+                    }
+                }
+                self.scratch_pending = pend;
+            }
+
             for _ in 0..4096u32 {
                 let want_handshake_done = self.handshake_done_pending;
                 let has_app_ack = self.spaces[Epoch::Application as usize].ack_pending;
@@ -1596,7 +1645,7 @@ impl Conn {
                     !self.new_cid_pending.is_empty() || !self.retire_pending.is_empty();
                 let has_path_response = !self.pending_path_responses.is_empty();
                 let has_path_challenge = !self.pending_path_challenges.is_empty();
-                let has_streams = self.streams_send.values().any(|s| s.has_pending());
+                let has_streams = !self.scratch_pending.is_empty();
                 let has_flow_control = self.local_max_data_pending
                     || !self.local_max_stream_data_pending.is_empty()
                     || self.max_streams_bidi_pending;
@@ -1658,6 +1707,23 @@ impl Conn {
             self.update_loss_timer();
         }
         out
+    }
+
+    /// Resets application send state (lifts cc/flow limits, clears bookkeeping)
+    /// so `send_packets` can be driven in a tight loop with no acking peer.
+    #[cfg(feature = "bench")]
+    pub fn bench_prepare_blast(&mut self) {
+        self.cc.cwnd = u64::MAX / 4;
+        self.cc.bytes_in_flight = 0;
+        self.peer_max_data = u64::MAX / 4;
+        self.peer_total_sent = 0;
+        self.pacer = crate::pacer::Pacer::new(Instant::now());
+        let sp = &mut self.spaces[Epoch::Application as usize];
+        sp.sent.clear();
+        sp.stream_inflight.clear();
+        sp.stream_retransmit.clear();
+        sp.ack_pending = false;
+        self.streams_send.clear();
     }
 
     fn pop_initial_crypto(&mut self) -> Option<(u64, Vec<u8>)> {
@@ -1877,7 +1943,8 @@ impl Conn {
         let pn = self.spaces[Epoch::Application as usize].next_pn;
         self.spaces[Epoch::Application as usize].next_pn += 1;
 
-        let mut frames = Vec::with_capacity(64);
+        let mut frames = std::mem::take(&mut self.scratch_frames);
+        frames.clear();
         if let Some(ack) = self.drain_ack_frame(Epoch::Application) {
             ack.encode(&mut frames);
         }
@@ -2000,20 +2067,23 @@ impl Conn {
             });
             ack_eliciting = true;
         }
-        let stream_ids: Vec<u64> = self
-            .streams_send
-            .iter()
-            .filter(|(_, s)| s.has_pending())
-            .map(|(id, _)| *id)
-            .collect();
-        for id in stream_ids {
+        // Drain the snapshot: drained streams are removed, a full packet breaks.
+        let mut pending = std::mem::take(&mut self.scratch_pending);
+        let header_overhead = 1 + self.peer_cid.len() + PN_LEN as usize;
+        let mut idx = 0;
+        while idx < pending.len() {
+            let id = pending[idx];
             self.ensure_peer_stream_credit(id);
             let stream_limit = *self.peer_max_stream_data.get(&id).unwrap_or(&0);
-            let s = self.streams_send.get_mut(&id).expect("just iterated");
+            let Some(s) = self.streams_send.get_mut(&id) else {
+                pending.swap_remove(idx);
+                continue;
+            };
             let stream_budget = stream_limit.saturating_sub(s.next_offset());
             let conn_budget = self.peer_max_data.saturating_sub(self.peer_total_sent);
             let flow_take = stream_budget.min(conn_budget);
             if flow_take == 0 {
+                let has_pending = s.has_pending();
                 if conn_budget == 0 && !self.blocked_data_emitted {
                     Frame::DataBlocked {
                         maximum_data: self.peer_max_data,
@@ -2024,7 +2094,7 @@ impl Conn {
                 }
                 if stream_budget == 0
                     && !self.blocked_stream_emitted.contains_key(&id)
-                    && s.has_pending()
+                    && has_pending
                 {
                     Frame::StreamDataBlocked {
                         stream_id: id,
@@ -2034,26 +2104,29 @@ impl Conn {
                     ack_eliciting = true;
                     self.blocked_stream_emitted.insert(id, ());
                 }
+                idx += 1;
                 continue;
             }
-            let header_overhead = 1 + self.peer_cid.len() + PN_LEN as usize;
             let packet_room = (K_MAX_DATAGRAM_SIZE as usize)
                 .saturating_sub(header_overhead + TAG_LEN + frames.len() + STREAM_FRAME_OVERHEAD);
             let take = flow_take.min(packet_room as u64) as usize;
             if take == 0 {
-                continue;
+                break;
             }
             if s.blocked() {
+                pending.swap_remove(idx);
                 continue;
             }
             let (offset, slice) = s.unsent();
             let n = take.min(slice.len());
             if n == 0 && !s.would_fin(0) {
+                pending.swap_remove(idx);
                 continue;
             }
             let fin_now = s.would_fin(n);
             Frame::encode_stream(&mut frames, id, offset, fin_now, true, &slice[..n]);
             s.advance_sent(n, fin_now);
+            let drained = !s.has_pending();
             self.spaces[Epoch::Application as usize]
                 .stream_inflight
                 .insert((id, offset), (n as u64, fin_now, pn));
@@ -2065,7 +2138,12 @@ impl Conn {
             });
             ack_eliciting = true;
             self.peer_total_sent = self.peer_total_sent.saturating_add(n as u64);
+            if drained {
+                pending.swap_remove(idx);
+            }
+            // else: kept at idx; next iteration sees take==0 and breaks.
         }
+        self.scratch_pending = pending;
         if let Some(d) = dgram {
             Frame::Datagram {
                 length_prefixed: false,
@@ -2087,6 +2165,8 @@ impl Conn {
             .expect("app keys present")
             .encrypt_short(&hdr, &frames, pn, pn_off, PN_LEN as usize);
 
+        frames.clear();
+        self.scratch_frames = frames;
         self.on_wire_sent(wire.len() as u64, ack_eliciting, now);
         self.spaces[Epoch::Application as usize].record_sent(SentPacket {
             pn,

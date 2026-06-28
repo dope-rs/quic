@@ -1,5 +1,6 @@
 use dope_quic::hp::HpKey;
 use dope_quic::qkdf::{InitialSecrets, PacketKeys};
+use shin::hash::HashAlg;
 use shin::kdf::Hkdf;
 
 const DCID: [u8; 8] = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
@@ -41,8 +42,8 @@ const SERVER_HP: [u8; 16] = [
 
 #[test]
 fn initial_secrets_match_rfc9001() {
-    let init = Hkdf::extract(&dope_quic::qkdf::INITIAL_SALT_V1, &DCID);
-    assert_eq!(init, INITIAL_SECRET);
+    let init = Hkdf::extract(HashAlg::Sha256, &dope_quic::qkdf::INITIAL_SALT_V1, &DCID);
+    assert_eq!(init.as_slice(), &INITIAL_SECRET[..]);
     let s = InitialSecrets::from_dcid(&DCID);
     assert_eq!(s.client, CLIENT_SECRET);
     assert_eq!(s.server, SERVER_SECRET);
@@ -59,10 +60,10 @@ fn rfc5869_a1_hkdf_extract_test_vector() {
         0x63, 0x90, 0xb6, 0xc7, 0x3b, 0xb5, 0x0f, 0x9c, 0x31, 0x22, 0xec, 0x84, 0x4a, 0xd7, 0xc2,
         0xb3, 0xe5,
     ];
-    let prk = Hkdf::extract(&salt, &ikm);
-    eprintln!("computed = {:02x?}", prk);
+    let prk = Hkdf::extract(HashAlg::Sha256, &salt, &ikm);
+    eprintln!("computed = {:02x?}", prk.as_slice());
     eprintln!("expected = {:02x?}", expected);
-    assert_eq!(prk, expected);
+    assert_eq!(prk.as_slice(), &expected[..]);
 }
 
 #[test]

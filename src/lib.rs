@@ -15,6 +15,7 @@ pub mod qkdf;
 pub mod rtt;
 pub mod secrets;
 pub mod stream;
+mod time;
 pub mod transport_params;
 pub mod varint;
 

@@ -35,14 +35,6 @@ pub struct Mux<H: Handler> {
 }
 
 impl<H: Handler> Mux<H> {
-    fn now_unix_secs() -> u64 {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    }
-
     fn is_initial_packet(wire: &[u8]) -> bool {
         matches!(wire.first(), Some(&b) if (b & 0xb0) == 0x80)
     }
@@ -370,7 +362,7 @@ impl<H: Handler> Mux<H> {
         let prefix = crate::packet::InitialHeader::decode_pre_hp(data)
             .map_err(|_| ConnError::HeaderDecode)?;
         if prefix.token.is_empty() {
-            let now_secs = Self::now_unix_secs();
+            let now_secs = crate::time::now_unix_secs();
             let expiry = now_secs.saturating_add(10);
             let token = secret.issue(&from, &prefix.dcid, expiry);
             let new_scid = self.gen_cid(prefix.dcid.len(), server_config.cid_prefix);
@@ -385,7 +377,7 @@ impl<H: Handler> Mux<H> {
             self.pending_outgoing.push((from, retry.encode()));
             return Ok(RetryGate::IssuedRetry);
         }
-        let now_secs = Self::now_unix_secs();
+        let now_secs = crate::time::now_unix_secs();
         match secret.validate(&from, &prefix.token, now_secs) {
             None => Ok(RetryGate::Drop),
             Some(odcid) => Ok(RetryGate::Accept(Some(odcid))),
