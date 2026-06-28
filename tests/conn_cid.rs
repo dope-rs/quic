@@ -42,7 +42,8 @@ fn signed_keys() -> ([u8; 32], SigningKey) {
 fn relay(src: &mut Mux<CountHandler>, dst: &mut Mux<CountHandler>, src_addr: SocketAddr) {
     let now = Instant::now();
     for out in src.pull_outgoing() {
-        dst.on_udp_packet(src_addr, out.payload(), now).expect("recv");
+        dst.on_udp_packet(src_addr, out.payload(), now)
+            .expect("recv");
     }
 }
 

@@ -43,9 +43,13 @@ fn deliver(dst: &mut Mux<CapturingHandler>, src_addr: SocketAddr, burst: Vec<Out
             }
             Outgoing::Gso(_, payload, seg) => {
                 let seg = seg as usize;
-                assert!(seg > 0 && payload.len() > seg, "a GSO run holds ≥2 segments");
                 assert!(
-                    payload.len() % seg == 0 || payload.chunks(seg).next_back().unwrap().len() < seg,
+                    seg > 0 && payload.len() > seg,
+                    "a GSO run holds ≥2 segments"
+                );
+                assert!(
+                    payload.len() % seg == 0
+                        || payload.chunks(seg).next_back().unwrap().len() < seg,
                     "only the trailing segment may be shorter than seg"
                 );
                 gso_runs += 1;

@@ -36,7 +36,14 @@ impl PacketProtection {
         pn_len: usize,
     ) -> Vec<u8> {
         let mut buf = Vec::new();
-        self.encrypt_long_into(&mut buf, header_with_pn, payload, packet_number, pn_offset, pn_len);
+        self.encrypt_long_into(
+            &mut buf,
+            header_with_pn,
+            payload,
+            packet_number,
+            pn_offset,
+            pn_len,
+        );
         buf
     }
 
@@ -77,7 +84,14 @@ impl PacketProtection {
         pn_len: usize,
     ) -> Vec<u8> {
         let mut buf = Vec::new();
-        self.encrypt_short_into(&mut buf, header_with_pn, payload, packet_number, pn_offset, pn_len);
+        self.encrypt_short_into(
+            &mut buf,
+            header_with_pn,
+            payload,
+            packet_number,
+            pn_offset,
+            pn_len,
+        );
         buf
     }
 
@@ -120,9 +134,9 @@ impl PacketProtection {
         dst.reserve(hdr_len + payload.len() + 16);
         dst.extend_from_slice(header_with_pn);
         dst.extend_from_slice(payload);
-        let tag = self
-            .aead
-            .seal_detached(packet_number, header_with_pn, &mut dst[start + hdr_len..]);
+        let tag =
+            self.aead
+                .seal_detached(packet_number, header_with_pn, &mut dst[start + hdr_len..]);
         dst.extend_from_slice(&tag);
 
         let sample_start = start + pn_offset + 4;

@@ -126,9 +126,54 @@ enum Epoch {
 /// A nameable [`shin::Clock`] for [`SideKind`] (a closure has no nameable type).
 type TlsClock = fn() -> u64;
 
+struct DynVerifier(std::rc::Rc<dyn shin::server::ClientCertVerifier>);
+
+impl shin::server::ClientCertVerifier for DynVerifier {
+    fn verify(&self, identity: &shin::server::ClientIdentity<'_>) -> bool {
+        self.0.verify(identity)
+    }
+}
+
+enum ServerSide {
+    Plain(shin::server::Server<TlsClock, crate::early_data::ReplayGuard>),
+    Mtls(shin::server::Server<TlsClock, crate::early_data::ReplayGuard, DynVerifier>),
+}
+
+impl ServerSide {
+    fn read(&mut self, epoch: shin::Epoch, data: &[u8]) -> Result<Vec<Event>, shin::Error> {
+        match self {
+            Self::Plain(s) => s.read(epoch, data),
+            Self::Mtls(s) => s.read(epoch, data),
+        }
+    }
+
+    fn negotiated_cipher_suite(&self) -> Option<shin::record::CipherSuite> {
+        match self {
+            Self::Plain(s) => s.negotiated_cipher_suite(),
+            Self::Mtls(s) => s.negotiated_cipher_suite(),
+        }
+    }
+}
+
 enum SideKind {
     Client(Box<shin::client::Client<TlsClock>>),
-    Server(Box<shin::server::Server<TlsClock, crate::early_data::ReplayGuard>>),
+    Server(Box<ServerSide>),
+}
+
+impl SideKind {
+    fn read(&mut self, epoch: shin::Epoch, data: &[u8]) -> Result<Vec<Event>, shin::Error> {
+        match self {
+            Self::Client(c) => c.read(epoch, data),
+            Self::Server(s) => s.read(epoch, data),
+        }
+    }
+
+    fn negotiated_cipher_suite(&self) -> Option<shin::record::CipherSuite> {
+        match self {
+            Self::Client(c) => c.negotiated_cipher_suite(),
+            Self::Server(s) => s.negotiated_cipher_suite(),
+        }
+    }
 }
 
 const MAX_CRYPTO_BUFFERED: usize = 64 * 1024;
@@ -337,7 +382,14 @@ pub enum DatagramCcMode {
     Uncongested,
 }
 
-#[derive(Debug, Clone)]
+/// Server-side mutual-TLS: client-cert `mode` plus the embedder's pinning `verifier`.
+#[derive(Clone)]
+pub struct ConnClientAuth {
+    pub mode: shin::server::ClientAuth,
+    pub verifier: std::rc::Rc<dyn shin::server::ClientCertVerifier>,
+}
+
+#[derive(Clone)]
 pub struct ConnConfig {
     pub transport_params: transport_params::Params,
     pub datagram_cc_mode: DatagramCcMode,
@@ -354,6 +406,33 @@ pub struct ConnConfig {
     pub alpn_protocols: Vec<Vec<u8>>,
     pub server_cert_chain: Option<Vec<Vec<u8>>>,
     pub early_data_store: Option<crate::early_data::SharedReplayStore>,
+    /// Server: require/request + pin a client certificate (mutual TLS). `None` =
+    /// server does not authenticate clients.
+    pub client_auth: Option<ConnClientAuth>,
+    /// Client: identity to present when the server requests client auth.
+    pub client_cert: Option<shin::client::ClientCertSource>,
+}
+
+impl std::fmt::Debug for ConnConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnConfig")
+            .field("transport_params", &self.transport_params)
+            .field("datagram_cc_mode", &self.datagram_cc_mode)
+            .field("pending_datagrams_cap", &self.pending_datagrams_cap)
+            .field("cid_prefix", &self.cid_prefix)
+            .field(
+                "require_address_validation",
+                &self.require_address_validation,
+            )
+            .field("enable_early_data", &self.enable_early_data)
+            .field("accept_early_data", &self.accept_early_data)
+            .field("resumption_peer_tp", &self.resumption_peer_tp)
+            .field("alpn_protocols", &self.alpn_protocols)
+            .field("server_cert_chain", &self.server_cert_chain.is_some())
+            .field("client_auth", &self.client_auth.is_some())
+            .field("client_cert", &self.client_cert.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for ConnConfig {
@@ -374,6 +453,8 @@ impl Default for ConnConfig {
             alpn_protocols: Vec::new(),
             server_cert_chain: None,
             early_data_store: None,
+            client_auth: None,
+            client_cert: None,
         }
     }
 }
@@ -518,6 +599,8 @@ impl Conn {
             alpn_protocols,
             server_cert_chain,
             early_data_store,
+            client_auth,
+            client_cert,
         } = config;
         let secrets = InitialSecrets::from_dcid(&initial_dcid);
         let local_idle = Duration::from_millis(user_tp.max_idle_timeout_ms);
@@ -554,11 +637,12 @@ impl Conn {
                     resumption,
                     enable_early_data,
                 };
+                let mut client = shin::client::Client::new(cfg, crate::time::now_ms as TlsClock);
+                if let Some(source) = client_cert {
+                    client.set_client_cert(source);
+                }
                 (
-                    SideKind::Client(Box::new(shin::client::Client::new(
-                        cfg,
-                        crate::time::now_ms as TlsClock,
-                    ))),
+                    SideKind::Client(Box::new(client)),
                     true,
                     initial_dcid.clone(),
                     None,
@@ -598,11 +682,22 @@ impl Conn {
                 // Attached unconditionally to keep `Server`'s type uniform; it is
                 // only consulted once `accept_early_data` is set.
                 let store = early_data_store.unwrap_or_else(crate::early_data::shared_replay_store);
-                let server = shin::server::Server::with_early_data_guard(
-                    cfg,
-                    crate::time::now_ms as TlsClock,
-                    crate::early_data::ReplayGuard::new(store),
-                );
+                let guard = crate::early_data::ReplayGuard::new(store);
+                let clock = crate::time::now_ms as TlsClock;
+                let server = match client_auth {
+                    Some(ca) => ServerSide::Mtls(
+                        shin::server::Server::with_early_data_guard_and_client_auth(
+                            cfg,
+                            clock,
+                            guard,
+                            ca.mode,
+                            DynVerifier(ca.verifier),
+                        ),
+                    ),
+                    None => ServerSide::Plain(shin::server::Server::with_early_data_guard(
+                        cfg, clock, guard,
+                    )),
+                };
                 (
                     SideKind::Server(Box::new(server)),
                     false,
@@ -1464,10 +1559,15 @@ impl Conn {
     }
 
     fn feed_shin(&mut self, epoch: shin::Epoch, data: &[u8]) -> Result<Vec<Event>, ConnError> {
-        match &mut self.side {
-            SideKind::Client(c) => c.read(epoch, data).map_err(|_| ConnError::Tls),
-            SideKind::Server(s) => s.read(epoch, data).map_err(|_| ConnError::Tls),
+        let events = self.side.read(epoch, data).map_err(|_| ConnError::Tls)?;
+        // Packet keys are hardcoded AES-128-GCM; refuse any other negotiated suite (RFC 9001 §5.3 MTI).
+        if self.state != State::Established
+            && let Some(suite) = self.side.negotiated_cipher_suite()
+            && suite != shin::record::CipherSuite::Aes128GcmSha256
+        {
+            return Err(ConnError::Tls);
         }
+        Ok(events)
     }
 
     fn absorb_shin_events(&mut self, events: Vec<Event>) {
@@ -2372,7 +2472,12 @@ impl Conn {
         n
     }
 
-    fn build_one_rtt_close(&mut self, dst: &mut Vec<u8>, close: PendingClose, now: Instant) -> usize {
+    fn build_one_rtt_close(
+        &mut self,
+        dst: &mut Vec<u8>,
+        close: PendingClose,
+        now: Instant,
+    ) -> usize {
         let pn = self.spaces[Epoch::Application as usize].next_pn;
         self.spaces[Epoch::Application as usize].next_pn += 1;
 

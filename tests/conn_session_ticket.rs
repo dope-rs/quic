@@ -64,9 +64,10 @@ fn server_emits_session_ticket_after_handshake() {
     let t = &tickets[0];
     assert_eq!(t.ticket_lifetime, 7200);
     assert_eq!(t.ticket_nonce.len(), 8);
-    assert!(
-        t.ticket.len() > 16,
-        "ticket is a real sealed blob (shin-owned opaque plaintext + 16B tag)"
+    assert_eq!(
+        t.ticket.len(),
+        12 + 32 + 4 + 8 + 2 + 1 + 16,
+        "nonce|psk|age_add|issued_at|suite|alpn_len|tag, empty ALPN (shin 0.7 ticket layout)"
     );
     assert!(
         !t.psk.iter().all(|&b| b == 0),

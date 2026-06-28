@@ -21,9 +21,15 @@ pub mod varint;
 
 pub use client::{BackoffPolicy, Client, EndpointSpec, Protocol, SendError, SlotId};
 pub use conn::{
-    Conn, ConnConfig, ConnError, ConnHandle, DatagramCcMode, DatagramError, SessionTicket,
-    State as ConnState, StreamError, StreamEvent,
+    Conn, ConnClientAuth, ConnConfig, ConnError, ConnHandle, DatagramCcMode, DatagramError,
+    SessionTicket, State as ConnState, StreamError, StreamEvent,
 };
 pub use endpoint::Endpoint;
 pub use mux::{Handler, Mux};
 pub use transport_params::TpError;
+
+/// Mutual-TLS types for [`ConnConfig::client_auth`]/[`ConnConfig::client_cert`], re-exported from `shin`.
+pub mod client_auth {
+    pub use shin::client::ClientCertSource;
+    pub use shin::server::{ClientAuth, ClientCertVerifier, ClientIdentity};
+}

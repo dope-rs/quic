@@ -26,18 +26,7 @@ fn cfg(mode: DatagramCcMode) -> ConnConfig {
         },
         datagram_cc_mode: mode,
         pending_datagrams_cap: 4096,
-        cid_prefix: None,
-        stateless_reset_secret: None,
-        require_address_validation: false,
-        retry_token_secret: None,
-        ticket_secret: None,
-        resumption: None,
-        enable_early_data: false,
-        accept_early_data: false,
-        resumption_peer_tp: None,
-        alpn_protocols: Vec::new(),
-        server_cert_chain: None,
-        early_data_store: None,
+        ..ConnConfig::default()
     }
 }
 

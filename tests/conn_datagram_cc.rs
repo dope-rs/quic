@@ -48,23 +48,7 @@ fn tp() -> transport_params::Params {
 
 #[test]
 fn standard_mode_throttles_datagrams_under_zero_cwnd() {
-    let cfg = ConnConfig {
-        transport_params: tp(),
-        datagram_cc_mode: DatagramCcMode::Standard,
-        pending_datagrams_cap: 1024,
-        cid_prefix: None,
-        stateless_reset_secret: None,
-        require_address_validation: false,
-        retry_token_secret: None,
-        ticket_secret: None,
-        resumption: None,
-        enable_early_data: false,
-        accept_early_data: false,
-        resumption_peer_tp: None,
-        alpn_protocols: Vec::new(),
-        server_cert_chain: None,
-        early_data_store: None,
-    };
+    let cfg = cfg_with(DatagramCcMode::Standard, 1024);
     let (mut client, _server) = handshake_pair(cfg.clone(), cfg);
 
     client.cc_mut().bytes_in_flight = client.cc_mut().cwnd;
@@ -83,23 +67,7 @@ fn standard_mode_throttles_datagrams_under_zero_cwnd() {
 
 #[test]
 fn uncongested_mode_emits_datagrams_under_zero_cwnd() {
-    let cfg = ConnConfig {
-        transport_params: tp(),
-        datagram_cc_mode: DatagramCcMode::Uncongested,
-        pending_datagrams_cap: 1024,
-        cid_prefix: None,
-        stateless_reset_secret: None,
-        require_address_validation: false,
-        retry_token_secret: None,
-        ticket_secret: None,
-        resumption: None,
-        enable_early_data: false,
-        accept_early_data: false,
-        resumption_peer_tp: None,
-        alpn_protocols: Vec::new(),
-        server_cert_chain: None,
-        early_data_store: None,
-    };
+    let cfg = cfg_with(DatagramCcMode::Uncongested, 1024);
     let (mut client, _server) = handshake_pair(cfg.clone(), cfg);
 
     client.cc_mut().bytes_in_flight = client.cc_mut().cwnd;
@@ -118,23 +86,7 @@ fn uncongested_mode_emits_datagrams_under_zero_cwnd() {
 
 #[test]
 fn queue_cap_returns_err_full() {
-    let cfg = ConnConfig {
-        transport_params: tp(),
-        datagram_cc_mode: DatagramCcMode::Uncongested,
-        pending_datagrams_cap: 4,
-        cid_prefix: None,
-        stateless_reset_secret: None,
-        require_address_validation: false,
-        retry_token_secret: None,
-        ticket_secret: None,
-        resumption: None,
-        enable_early_data: false,
-        accept_early_data: false,
-        resumption_peer_tp: None,
-        alpn_protocols: Vec::new(),
-        server_cert_chain: None,
-        early_data_store: None,
-    };
+    let cfg = cfg_with(DatagramCcMode::Uncongested, 4);
     let (mut client, _server) = handshake_pair(cfg.clone(), cfg);
     client.cc_mut().bytes_in_flight = client.cc_mut().cwnd;
     for _ in 0..4 {
@@ -149,18 +101,7 @@ fn cfg_with(mode: DatagramCcMode, cap: usize) -> ConnConfig {
         transport_params: tp(),
         datagram_cc_mode: mode,
         pending_datagrams_cap: cap,
-        cid_prefix: None,
-        stateless_reset_secret: None,
-        require_address_validation: false,
-        retry_token_secret: None,
-        ticket_secret: None,
-        resumption: None,
-        enable_early_data: false,
-        accept_early_data: false,
-        resumption_peer_tp: None,
-        alpn_protocols: Vec::new(),
-        server_cert_chain: None,
-        early_data_store: None,
+        ..ConnConfig::default()
     }
 }
 

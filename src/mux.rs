@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use shin::sig::SigningKey;
 
-use crate::conn::{Conn, ConnConfig, ConnError, ConnHandle, DatagramError, PacketBatch, StreamEvent};
+use crate::conn::{
+    Conn, ConnConfig, ConnError, ConnHandle, DatagramError, PacketBatch, StreamEvent,
+};
 use crate::packet::InitialHeader;
 
 pub trait Handler: 'static {
@@ -294,6 +296,7 @@ impl<H: Handler> Mux<H> {
         let initial_dcid = prefix.dcid;
         let peer_cid = prefix.scid;
         let local_cid = self.gen_cid(initial_dcid.len(), cid_prefix);
+        let client_initial_dcid = initial_dcid.clone();
         let conn = match retry_odcid {
             Some(odcid) => Conn::new_server_retry(
                 initial_dcid.clone(),
@@ -318,6 +321,9 @@ impl<H: Handler> Mux<H> {
             notified_established: false,
         });
         self.cid_to_handle.insert(local_cid, handle);
+        self.cid_to_handle
+            .entry(client_initial_dcid)
+            .or_insert(handle);
         Ok(handle)
     }
 
@@ -389,8 +395,11 @@ impl<H: Handler> Mux<H> {
                 self.pending_outgoing
                     .push(Outgoing::Gso(addr, buf, seg0 as u16));
             } else {
-                self.pending_outgoing
-                    .push(Outgoing::Gso(addr, batch.buf[off..end].to_vec(), seg0 as u16));
+                self.pending_outgoing.push(Outgoing::Gso(
+                    addr,
+                    batch.buf[off..end].to_vec(),
+                    seg0 as u16,
+                ));
             }
             off = end;
             i = j;
