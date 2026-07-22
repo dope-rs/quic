@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use dope::runtime::{Dispatcher, Executor};
-use dope::{Completion as _, Cqe, DriverContext, Event, driver};
+use dope::{Completion as _, DriverContext, driver};
 use dope_quic::{
     BackoffPolicy, Client, Conn, ConnHandle, Endpoint, EndpointSpec, Handler, Protocol, SlotId,
     client, conn, endpoint, transport_params,
@@ -128,14 +128,15 @@ fn immediate_reconnect_reuses_one_generation_checked_slot() {
         )
         .unwrap();
         let runtime = pin!(Branded::new(Runtime { server, client }));
-        let mut completions = [Cqe::ZERO; 64];
+        let mut completions = [const { None }; 64];
         let mut ready = Vec::with_capacity(64);
         for _ in 0..2_000 {
             let count = driver.drain(&mut completions);
-            for completion in &completions[..count] {
-                if let Ok(event) = Event::decode(*completion) {
-                    Runtime::dispatch(runtime.as_ref().borrow_pin_mut(token), event, &mut driver);
-                }
+            for completion in &mut completions[..count] {
+                let Some(event) = completion.take() else {
+                    continue;
+                };
+                Runtime::dispatch(runtime.as_ref().borrow_pin_mut(token), event, &mut driver);
             }
             ready.clear();
             reference.drain_ready(|target| ready.push(target));

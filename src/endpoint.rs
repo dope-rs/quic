@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use dope::manifold::Manifold;
 use dope::manifold::datagram::Socket;
-use dope::{Completion as _, Cqe, DriverContext};
+use dope::{Completion as _, DriverContext, Event, EventKind};
 use pin_project::pin_project;
 use shin::sig::SigningKey;
 
@@ -16,7 +16,6 @@ use crate::early_data::SharedEarlyDataReplayCache;
 use crate::mux::{self, Mux};
 use crate::mux::{MAX_CONNECTIONS, MAX_OUTGOING_BYTES, MAX_OUTGOING_CAPACITY, Outgoing};
 use crate::transport_params;
-use dope::Event;
 use dope::runtime::Idle;
 use std::io::Error;
 use std::io::ErrorKind;
@@ -40,15 +39,6 @@ pub struct Config {
     pub packet_buffer_bytes: u32,
     pub completion_budget: usize,
     pub flush_budget: usize,
-}
-
-struct DriverCompletion(Cqe);
-
-impl DriverCompletion {
-    /// Decodes one completion yielded by its paired driver.
-    fn decode(self) -> Option<Event> {
-        unsafe { Event::from_cqe(self.0) }.ok()
-    }
 }
 
 impl Config {
@@ -211,7 +201,7 @@ impl<'d, const ID: u8, H: mux::Handler> Endpoint<'d, ID, H> {
     }
 
     pub fn drive(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
-        let mut buf = [Cqe::ZERO; 64];
+        let mut buf = [const { None }; 64];
         let mut remaining = self.completion_budget;
         while remaining != 0 {
             let limit = remaining.min(buf.len());
@@ -220,11 +210,11 @@ impl<'d, const ID: u8, H: mux::Handler> Endpoint<'d, ID, H> {
                 break;
             }
             remaining -= n;
-            for cqe in &buf[..n] {
-                let Some(ev) = DriverCompletion(*cqe).decode() else {
+            for event in &mut buf[..n] {
+                let Some(event) = event.take() else {
                     continue;
                 };
-                self.as_mut().dispatch(ev, driver);
+                self.as_mut().dispatch(event, driver);
             }
         }
         self.flush_pending(driver);
@@ -232,17 +222,16 @@ impl<'d, const ID: u8, H: mux::Handler> Endpoint<'d, ID, H> {
 
     pub(crate) fn dispatch(
         self: Pin<&mut Self>,
-        ev: dope::Event,
+        event: Event<'d>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
-        use dope::EventRef;
         let this = self.project();
-        match ev.as_ref() {
-            EventRef::Recv(token, more, e) => {
-                this.udp.dispatch_recv(token, more, *e, this.mux, driver);
+        match event.into_kind() {
+            EventKind::Recv(token, more, event) => {
+                this.udp.dispatch_recv(token, more, event, this.mux, driver);
             }
-            EventRef::Send(token, e) => {
-                this.udp.dispatch_send(token, *e, this.mux, driver);
+            EventKind::Send(token, event) => {
+                this.udp.dispatch_send(token, event, this.mux, driver);
             }
             _ => {}
         }
@@ -273,8 +262,8 @@ impl<'d, const ID: u8, H: mux::Handler> Endpoint<'d, ID, H> {
 impl<'d, const ID: u8, H: mux::Handler> Manifold<'d> for Endpoint<'d, ID, H> {
     const ID: u8 = ID;
 
-    fn dispatch(mut self: Pin<&mut Self>, ev: dope::Event, driver: &mut DriverContext<'_, 'd>) {
-        self.as_mut().dispatch(ev, driver);
+    fn dispatch(mut self: Pin<&mut Self>, event: Event<'d>, driver: &mut DriverContext<'_, 'd>) {
+        self.as_mut().dispatch(event, driver);
     }
 
     fn pre_park(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {

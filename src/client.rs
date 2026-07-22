@@ -311,7 +311,7 @@ impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Client<'d, ID, P, B> {
 impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Manifold<'d> for Client<'d, ID, P, B> {
     const ID: u8 = ID;
 
-    fn dispatch(mut self: Pin<&mut Self>, ev: dope::Event, driver: &mut DriverContext<'_, 'd>) {
+    fn dispatch(mut self: Pin<&mut Self>, ev: dope::Event<'d>, driver: &mut DriverContext<'_, 'd>) {
         self.as_mut().project().inner.dispatch(ev, driver);
     }
 
