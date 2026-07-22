@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 
 use ring::hmac;
+use ring::hmac::Context;
+use ring::hmac::Key;
 use subtle::ConstantTimeEq;
 
 #[derive(Clone, Copy)]
@@ -14,8 +16,8 @@ impl From<[u8; 32]> for StatelessResetSecret {
 
 impl StatelessResetSecret {
     pub fn token_for(&self, cid: &[u8]) -> [u8; 16] {
-        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.0);
-        let mut ctx = hmac::Context::with_key(&key);
+        let key = Key::new(hmac::HMAC_SHA256, &self.0);
+        let mut ctx = Context::with_key(&key);
         ctx.update(b"qsrt");
         ctx.update(cid);
         let tag = ctx.sign();
@@ -88,8 +90,8 @@ impl RetryTokenSecret {
     }
 
     fn tag(&self, addr_bytes: &[u8], odcid: &[u8], expiry: u64) -> [u8; 16] {
-        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.0);
-        let mut ctx = hmac::Context::with_key(&key);
+        let key = Key::new(hmac::HMAC_SHA256, &self.0);
+        let mut ctx = Context::with_key(&key);
         ctx.update(b"qretrytok");
         ctx.update(addr_bytes);
         ctx.update(&expiry.to_be_bytes());

@@ -1,34 +1,50 @@
+macro_rules! impl_error {
+    ($type:ty { $($pattern:pat => $message:literal),+ $(,)? }) => {
+        impl std::fmt::Display for $type {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(match self {
+                    $($pattern => $message),+
+                })
+            }
+        }
+
+        impl std::error::Error for $type {}
+    };
+}
+
 pub mod client;
+mod clock;
 pub mod conn;
 pub mod early_data;
 pub mod endpoint;
+mod errors;
 pub mod frame;
-pub mod hp;
+mod hp;
 pub mod mux;
-pub mod new_reno;
-pub mod pacer;
+mod new_reno;
+mod pacer;
 pub mod packet;
 pub mod packet_protection;
-pub mod pmtud;
-pub mod pn_space;
+mod pmtud;
+mod pn_space;
 pub mod qkdf;
-pub mod rtt;
-pub mod secrets;
-pub mod stream;
-mod time;
+mod range_buffer;
+mod rtt;
+mod secrets;
+mod stream;
 pub mod transport_params;
 pub mod varint;
 
-pub use client::{BackoffPolicy, Client, EndpointSpec, Protocol, SendError, SlotId};
+pub use client::{BackoffPolicy, Client, EndpointSpec, Protocol, SlotId};
 pub use conn::{
-    Conn, ConnClientAuth, ConnConfig, ConnError, ConnHandle, DatagramCcMode, DatagramError,
-    SessionTicket, State as ConnState, StreamError, StreamEvent,
+    ClientAuthentication, Conn, ConnError, ConnHandle, DatagramCongestionControl, SessionTicket,
+    State as ConnState, StreamError, StreamEvent,
 };
 pub use endpoint::Endpoint;
+pub use errors::{ConnectError, TrySendError};
 pub use mux::{Handler, Mux};
-pub use transport_params::TpError;
+pub use transport_params::TransportParameterError;
 
-/// Mutual-TLS types for [`ConnConfig::client_auth`]/[`ConnConfig::client_cert`], re-exported from `shin`.
 pub mod client_auth {
     pub use shin::client::ClientCertSource;
     pub use shin::server::{ClientAuth, ClientCertVerifier, ClientIdentity};

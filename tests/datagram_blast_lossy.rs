@@ -1,8 +1,8 @@
+pub mod support;
+
 use std::time::{Duration, Instant};
 
-use dope_quic::{Conn, ConnConfig, DatagramCcMode, transport_params};
-use ring::rand::{SecureRandom, SystemRandom};
-use shin::sig::SigningKey;
+use dope_quic::{Conn, DatagramCongestionControl, conn, transport_params};
 
 const CID: [u8; 8] = [0x88; 8];
 
@@ -17,23 +17,21 @@ impl Lcg {
     }
 }
 
-fn cfg(mode: DatagramCcMode) -> ConnConfig {
-    ConnConfig {
+fn cfg(mode: DatagramCongestionControl) -> conn::Config {
+    conn::Config {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 60_000,
             max_datagram_frame_size: Some(65535),
             ..transport_params::Params::default()
         },
-        datagram_cc_mode: mode,
-        pending_datagrams_cap: 4096,
-        ..ConnConfig::default()
+        datagram_congestion_control: mode,
+        pending_datagrams_capacity: 4096,
+        ..conn::Config::default()
     }
 }
 
-fn handshake_pair(client_cfg: ConnConfig, server_cfg: ConnConfig) -> (Conn, Conn) {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
+fn handshake_pair(client_cfg: conn::Config, server_cfg: conn::Config) -> (Conn, Conn) {
+    let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
     let mut server = Conn::new_server(
         CID.to_vec(),
@@ -41,8 +39,10 @@ fn handshake_pair(client_cfg: ConnConfig, server_cfg: ConnConfig) -> (Conn, Conn
         CID.to_vec(),
         signing,
         server_cfg,
-    );
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, client_cfg);
+    )
+    .unwrap();
+    let mut client =
+        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, client_cfg).unwrap();
     let now = Instant::now();
     for _ in 0..6 {
         for pkt in client.send_packets(now) {
@@ -60,13 +60,17 @@ fn handshake_pair(client_cfg: ConnConfig, server_cfg: ConnConfig) -> (Conn, Conn
     (client, server)
 }
 
-fn blast_drain(mode: DatagramCcMode, drop_per_million: u32, n: usize) -> (usize, usize, Duration) {
+fn blast_drain(
+    mode: DatagramCongestionControl,
+    drop_per_million: u32,
+    n: usize,
+) -> (usize, usize, Duration) {
     let (mut client, mut server) = handshake_pair(cfg(mode), cfg(mode));
     let mut rng = Lcg(0xDEAD_BEEF_CAFE_BABE);
 
     for i in 0..n {
         client
-            .send_datagram(format!("dg-{i:06}").into_bytes())
+            .try_send_datagram(format!("dg-{i:06}").into_bytes())
             .expect("queue");
     }
 
@@ -113,7 +117,7 @@ fn blast_drain(mode: DatagramCcMode, drop_per_million: u32, n: usize) -> (usize,
 
 #[test]
 fn baseline_uncongested_drains_all() {
-    let (recv, iters, sim) = blast_drain(DatagramCcMode::Uncongested, 0, 1000);
+    let (recv, iters, sim) = blast_drain(DatagramCongestionControl::Uncongested, 0, 1000);
     eprintln!(
         "uncongested 0% loss: recv={} iters={} sim={:?}",
         recv, iters, sim
@@ -126,7 +130,7 @@ fn baseline_uncongested_drains_all() {
 
 #[test]
 fn uncongested_under_30pct_loss() {
-    let (recv, iters, sim) = blast_drain(DatagramCcMode::Uncongested, 300_000, 1000);
+    let (recv, iters, sim) = blast_drain(DatagramCongestionControl::Uncongested, 300_000, 1000);
     eprintln!(
         "uncongested 30% loss: recv={} iters={} sim={:?}",
         recv, iters, sim
@@ -141,7 +145,7 @@ fn uncongested_under_30pct_loss() {
 
 #[test]
 fn standard_under_30pct_loss() {
-    let (recv, iters, sim) = blast_drain(DatagramCcMode::Standard, 300_000, 1000);
+    let (recv, iters, sim) = blast_drain(DatagramCongestionControl::Standard, 300_000, 1000);
     eprintln!(
         "standard 30% loss: recv={} iters={} sim={:?}",
         recv, iters, sim
@@ -149,22 +153,18 @@ fn standard_under_30pct_loss() {
 }
 
 #[test]
-fn uncongested_first_burst_drains_full_queue() {
-    let (mut client, server) = handshake_pair(
-        cfg(DatagramCcMode::Uncongested),
-        cfg(DatagramCcMode::Uncongested),
+fn uncongested_bursts_are_bounded_without_dropping_the_queue() {
+    let (mut client, _server) = handshake_pair(
+        cfg(DatagramCongestionControl::Uncongested),
+        cfg(DatagramCongestionControl::Uncongested),
     );
     for i in 0..1000usize {
         client
-            .send_datagram(format!("dg-{i:06}").into_bytes())
+            .try_send_datagram(format!("dg-{i:06}").into_bytes())
             .expect("queue");
     }
-    let pkts = client.send_packets(Instant::now());
-    eprintln!("first-burst pkt count: {}", pkts.len());
-    assert!(
-        pkts.len() >= 1000,
-        "Uncongested must emit all 1000 in first burst, got {}",
-        pkts.len()
-    );
-    let _ = server;
+    let first = client.send_packets(Instant::now());
+    assert_eq!(first.len(), 64);
+    let second = client.send_packets(Instant::now());
+    assert_eq!(second.len(), 64);
 }

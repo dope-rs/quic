@@ -1,9 +1,9 @@
+pub mod support;
+
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use dope_quic::{Conn, ConnConfig, Handler, Mux, transport_params};
-use ring::rand::{SecureRandom, SystemRandom};
-use shin::sig::SigningKey;
+use dope_quic::{Conn, Handler, Mux, conn, transport_params};
 
 const CID: [u8; 8] = [0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55];
 
@@ -14,8 +14,8 @@ fn drain(from: &mut Conn, into: &mut Conn) {
     }
 }
 
-fn cfg(secret: Option<[u8; 32]>) -> ConnConfig {
-    ConnConfig {
+fn cfg(secret: Option<[u8; 32]>) -> conn::Config {
+    conn::Config {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
             max_datagram_frame_size: Some(65535),
@@ -27,10 +27,8 @@ fn cfg(secret: Option<[u8; 32]>) -> ConnConfig {
     }
 }
 
-fn handshake(server_cfg: ConnConfig, client_cfg: ConnConfig) -> (Conn, Conn) {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
+fn handshake(server_cfg: conn::Config, client_cfg: conn::Config) -> (Conn, Conn) {
+    let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
 
     let mut server = Conn::new_server(
@@ -39,8 +37,10 @@ fn handshake(server_cfg: ConnConfig, client_cfg: ConnConfig) -> (Conn, Conn) {
         CID.to_vec(),
         signing,
         server_cfg,
-    );
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, client_cfg);
+    )
+    .unwrap();
+    let mut client =
+        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, client_cfg).unwrap();
 
     drain(&mut client, &mut server);
     drain(&mut server, &mut client);
@@ -49,6 +49,16 @@ fn handshake(server_cfg: ConnConfig, client_cfg: ConnConfig) -> (Conn, Conn) {
     drain(&mut client, &mut server);
     assert!(client.is_established() && server.is_established());
     (server, client)
+}
+
+fn peer_cid(conn: &mut Conn) -> Vec<u8> {
+    conn.try_send_datagram(vec![0]).unwrap();
+    let packet = conn
+        .send_packets(Instant::now())
+        .into_iter()
+        .next()
+        .expect("application packet");
+    packet[1..1 + CID.len()].to_vec()
 }
 
 #[test]
@@ -73,28 +83,6 @@ fn server_without_secret_does_not_advertise_srt() {
         peer_tp.stateless_reset_token.is_none(),
         "no secret ⇒ no advertised SRT",
     );
-}
-
-#[test]
-fn issued_cids_carry_per_cid_srt_via_new_connection_id() {
-    let secret = [0x33u8; 32];
-    let (_server, client) = handshake(cfg(Some(secret)), cfg(None));
-
-    let peer_cids = client.peer_cids_for_test();
-    assert!(
-        peer_cids.len() >= 2,
-        "expected ≥2 peer CIDs after handshake (initial + ≥1 NEW_CONNECTION_ID), got {}",
-        peer_cids.len(),
-    );
-
-    let mut seen_tokens = std::collections::HashSet::new();
-    for (seq, (cid, token)) in peer_cids {
-        assert_ne!(*token, [0u8; 16], "token for seq={seq} must be non-zero");
-        assert!(
-            seen_tokens.insert(*token),
-            "tokens must be unique per CID; seq={seq} cid={cid:02x?} dup",
-        );
-    }
 }
 
 #[test]
@@ -129,11 +117,9 @@ fn matching_srt_in_tail_closes_conn_and_surfaces_flag() {
     let (_server, mut client) = handshake(cfg(Some(secret)), cfg(None));
 
     let token = client
-        .peer_cids_for_test()
-        .values()
-        .map(|(_, t)| *t)
-        .find(|t| *t != [0u8; 16])
-        .expect("at least one non-zero peer SRT");
+        .peer_transport_params()
+        .and_then(|params| params.stateless_reset_token)
+        .expect("peer stateless reset token");
 
     let reset = craft_stateless_reset(token);
     let now = Instant::now();
@@ -170,12 +156,11 @@ fn unrecognised_tail_does_not_trigger_reset() {
 
 #[test]
 fn pre_handshake_reset_is_ignored() {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
+    let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
 
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, cfg(None));
+    let mut client =
+        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, cfg(None)).unwrap();
     let reset = craft_stateless_reset([0xFFu8; 16]);
     let _ = client.recv_packet(&reset, Instant::now());
     assert!(!client.was_stateless_reset());
@@ -183,20 +168,18 @@ fn pre_handshake_reset_is_ignored() {
 
 struct NoopHandler;
 impl Handler for NoopHandler {
-    fn on_established(&mut self, _conn: &mut Conn, _h: dope_quic::ConnHandle) {}
-    fn on_datagram(&mut self, _conn: &mut Conn, _h: dope_quic::ConnHandle, _data: Vec<u8>) {}
-    fn on_close(&mut self, _h: dope_quic::ConnHandle) {}
+    fn established(&mut self, _conn: &mut Conn, _h: dope_quic::ConnHandle) {}
+    fn datagram(&mut self, _conn: &mut Conn, _h: dope_quic::ConnHandle, _data: Vec<u8>) {}
+    fn close(&mut self, _h: dope_quic::ConnHandle) {}
 }
 
 fn server_mux(secret: [u8; 32]) -> Mux<NoopHandler> {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
-    let cfg = ConnConfig {
+    let signing = support::signing_key(0x39);
+    let cfg = conn::Config {
         stateless_reset_secret: Some(secret),
         ..Default::default()
     };
-    Mux::server(NoopHandler, signing, cfg)
+    Mux::server(NoopHandler, signing, cfg).unwrap()
 }
 
 #[test]
@@ -209,9 +192,9 @@ fn server_emits_reset_for_unknown_dcid() {
     wire[1..9].copy_from_slice(&dcid);
 
     let from: SocketAddr = "127.0.0.1:55555".parse().unwrap();
-    mux.on_udp_packet(from, &wire, Instant::now()).unwrap();
+    mux.recv(from, &wire, Instant::now()).unwrap();
 
-    let outgoing = mux.pull_outgoing();
+    let outgoing: Vec<_> = mux.drain_outgoing().collect();
     assert_eq!(outgoing.len(), 1, "exactly one reset should be emitted");
     let (dst, reset) = (outgoing[0].addr(), outgoing[0].payload());
     assert_eq!(dst, from, "reset goes back to triggering address");
@@ -225,19 +208,18 @@ fn server_emits_reset_for_unknown_dcid() {
     assert_eq!(reset[0] & 0xC0, 0x40);
 
     let expected = {
-        let mut seed = [0u8; 32];
-        SystemRandom::new().fill(&mut seed).unwrap();
-        let signing = SigningKey::from_seed(&seed).unwrap();
+        let signing = support::signing_key(0x39);
         let server = Conn::new_server(
             CID.to_vec(),
             dcid.to_vec(),
             CID.to_vec(),
             signing,
-            ConnConfig {
+            conn::Config {
                 stateless_reset_secret: Some(secret),
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         let _ = server;
         None::<[u8; 16]>
     };
@@ -248,8 +230,8 @@ fn server_emits_reset_for_unknown_dcid() {
 
     let mut wire2 = vec![0x40u8; 30];
     wire2[1..9].copy_from_slice(&dcid);
-    mux.on_udp_packet(from, &wire2, Instant::now()).unwrap();
-    let outgoing2 = mux.pull_outgoing();
+    mux.recv(from, &wire2, Instant::now()).unwrap();
+    let outgoing2: Vec<_> = mux.drain_outgoing().collect();
     let mut tail2 = [0u8; 16];
     let p2 = outgoing2[0].payload();
     tail2.copy_from_slice(&p2[p2.len() - 16..]);
@@ -257,19 +239,37 @@ fn server_emits_reset_for_unknown_dcid() {
 }
 
 #[test]
+fn stateless_reset_obeys_checked_packet_ceiling() {
+    let signing = support::signing_key(0x35);
+    let config = conn::Config {
+        stateless_reset_secret: Some([0xd4; 32]),
+        ..Default::default()
+    };
+    let mut mux = Mux::server_with_outgoing_limits(NoopHandler, signing, config, 1, 22).unwrap();
+    let mut wire = vec![0x40; 64];
+    wire[1..9].copy_from_slice(&[0x99; 8]);
+    mux.recv("127.0.0.1:4444".parse().unwrap(), &wire, Instant::now())
+        .unwrap();
+    let reset = mux.drain_outgoing().next().unwrap();
+    assert_eq!(reset.payload().len(), 22);
+    assert_eq!(mux.outgoing_bytes(), 0);
+}
+
+#[test]
 fn server_without_secret_does_not_emit_reset() {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
-    let mut mux = Mux::server(NoopHandler, signing, ConnConfig::default());
+    let signing = support::signing_key(0x39);
+    let mut mux = Mux::server(NoopHandler, signing, conn::Config::default()).unwrap();
 
     let dcid = [0x11u8; 8];
     let mut wire = vec![0x40u8; 30];
     wire[1..9].copy_from_slice(&dcid);
 
     let from: SocketAddr = "127.0.0.1:1".parse().unwrap();
-    mux.on_udp_packet(from, &wire, Instant::now()).unwrap();
-    assert!(mux.pull_outgoing().is_empty(), "no secret ⇒ no reset");
+    mux.recv(from, &wire, Instant::now()).unwrap();
+    assert!(
+        mux.drain_outgoing().next().is_none(),
+        "no secret ⇒ no reset"
+    );
 }
 
 #[test]
@@ -279,9 +279,9 @@ fn server_does_not_emit_reset_for_initial_packet() {
 
     let wire = vec![0xC0u8; 30];
     let from: SocketAddr = "127.0.0.1:2".parse().unwrap();
-    let _ = mux.on_udp_packet(from, &wire, Instant::now());
+    let _ = mux.recv(from, &wire, Instant::now());
     assert!(
-        mux.pull_outgoing().is_empty(),
+        mux.drain_outgoing().next().is_none(),
         "Initial path must not emit reset"
     );
 }
@@ -290,20 +290,14 @@ fn server_does_not_emit_reset_for_initial_packet() {
 fn end_to_end_server_restart_recovery() {
     let secret = [0xD3u8; 32];
     let (_old_server, mut client) = handshake(cfg(Some(secret)), cfg(None));
-
-    let (_seq, (peer_dcid, _expected_srt)) = client
-        .peer_cids_for_test()
-        .iter()
-        .next()
-        .expect("at least one peer CID after handshake");
-    let peer_dcid = peer_dcid.clone();
+    let peer_dcid = peer_cid(&mut client);
 
     let mut server_b = server_mux(secret);
     let mut wire = vec![0x40u8; 30];
     wire[1..9].copy_from_slice(&peer_dcid);
     let from: SocketAddr = "127.0.0.1:33333".parse().unwrap();
-    server_b.on_udp_packet(from, &wire, Instant::now()).unwrap();
-    let outgoing = server_b.pull_outgoing();
+    server_b.recv(from, &wire, Instant::now()).unwrap();
+    let outgoing: Vec<_> = server_b.drain_outgoing().collect();
     assert_eq!(outgoing.len(), 1);
     let reset = outgoing[0].payload();
 

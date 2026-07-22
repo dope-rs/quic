@@ -26,7 +26,7 @@ impl Pacer {
         self.next_release
     }
 
-    pub fn on_packet_sent(&mut self, bytes: u64, now: Instant, cwnd: u64, srtt: Duration) {
+    pub fn packet_sent(&mut self, bytes: u64, now: Instant, cwnd: u64, srtt: Duration) {
         if self.burst_left > 0 {
             self.burst_left -= 1;
             self.next_release = now;

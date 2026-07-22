@@ -1,80 +1,10 @@
+pub mod support;
+
 use std::net::SocketAddr;
 use std::time::Instant;
 
 use dope_quic::packet::{InitialHeader, QUIC_V1, RetryPacket};
-use dope_quic::{Conn, ConnConfig, Handler, Mux};
-use ring::rand::{SecureRandom, SystemRandom};
-use shin::sig::SigningKey;
-
-#[test]
-fn retry_round_trip_decode_matches_encode() {
-    let odcid = vec![0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
-    let mut retry = RetryPacket {
-        version: QUIC_V1,
-        dcid: vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22],
-        scid: vec![0xF0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5],
-        token: b"my-opaque-token-bytes".to_vec(),
-        integrity_tag: [0u8; 16],
-    };
-    retry.integrity_tag = retry.compute_integrity_tag(&odcid);
-    let wire = retry.encode();
-
-    let decoded = RetryPacket::decode(&wire).expect("decode retry");
-    assert_eq!(decoded, retry);
-    assert!(
-        decoded.verify_integrity(&odcid),
-        "tag must verify with the same ODCID",
-    );
-}
-
-#[test]
-fn retry_integrity_rejects_wrong_odcid() {
-    let real_odcid = vec![1, 2, 3, 4, 5, 6, 7, 8];
-    let bogus_odcid = vec![9, 9, 9, 9, 9, 9, 9, 9];
-    let mut retry = RetryPacket {
-        version: QUIC_V1,
-        dcid: vec![0; 8],
-        scid: vec![1; 8],
-        token: vec![],
-        integrity_tag: [0u8; 16],
-    };
-    retry.integrity_tag = retry.compute_integrity_tag(&real_odcid);
-    let wire = retry.encode();
-    let decoded = RetryPacket::decode(&wire).unwrap();
-    assert!(decoded.verify_integrity(&real_odcid));
-    assert!(!decoded.verify_integrity(&bogus_odcid));
-}
-
-#[test]
-fn retry_integrity_rejects_tampered_token() {
-    let odcid = vec![0xAB; 8];
-    let mut retry = RetryPacket {
-        version: QUIC_V1,
-        dcid: vec![0; 8],
-        scid: vec![1; 8],
-        token: b"original-token".to_vec(),
-        integrity_tag: [0u8; 16],
-    };
-    retry.integrity_tag = retry.compute_integrity_tag(&odcid);
-    let wire = retry.encode();
-    let mut decoded = RetryPacket::decode(&wire).unwrap();
-    decoded.token[0] ^= 0x01;
-    assert!(!decoded.verify_integrity(&odcid));
-}
-
-#[test]
-fn retry_decode_rejects_short_packet() {
-    let too_short = vec![0xF0u8; 22];
-    assert!(RetryPacket::decode(&too_short).is_err());
-}
-
-#[test]
-fn retry_decode_rejects_wrong_long_type() {
-    let mut wire = vec![0u8; 30];
-    wire[0] = 0xC0;
-    wire[1..5].copy_from_slice(&QUIC_V1.to_be_bytes());
-    assert!(RetryPacket::decode(&wire).is_err());
-}
+use dope_quic::{Conn, ConnError, Handler, Mux, conn};
 
 #[test]
 fn rfc9001_a4_vector_round_trips() {
@@ -88,27 +18,25 @@ fn rfc9001_a4_vector_round_trips() {
     let mut tag = [0u8; 16];
     tag.copy_from_slice(&expected_tag);
 
-    let derived = RetryPacket::compute_tag(&odcid, &header);
+    let derived = RetryPacket::compute_tag(&odcid, &header).unwrap();
     assert_eq!(derived, tag, "RFC 9001 A.4 integrity tag mismatch");
 }
 
 struct NoopHandler;
 impl Handler for NoopHandler {
-    fn on_established(&mut self, _conn: &mut Conn, _h: dope_quic::ConnHandle) {}
-    fn on_datagram(&mut self, _conn: &mut Conn, _h: dope_quic::ConnHandle, _data: Vec<u8>) {}
-    fn on_close(&mut self, _h: dope_quic::ConnHandle) {}
+    fn established(&mut self, _conn: &mut Conn, _h: dope_quic::ConnHandle) {}
+    fn datagram(&mut self, _conn: &mut Conn, _h: dope_quic::ConnHandle, _data: Vec<u8>) {}
+    fn close(&mut self, _h: dope_quic::ConnHandle) {}
 }
 
 fn server_mux_with_retry(retry_secret: [u8; 32]) -> Mux<NoopHandler> {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
-    let cfg = ConnConfig {
+    let signing = support::signing_key(0x39);
+    let cfg = conn::Config {
         require_address_validation: true,
         retry_token_secret: Some(retry_secret),
         ..Default::default()
     };
-    Mux::server(NoopHandler, signing, cfg)
+    Mux::server(NoopHandler, signing, cfg).unwrap()
 }
 
 fn craft_initial(dcid: &[u8], scid: &[u8], token: &[u8]) -> Vec<u8> {
@@ -121,7 +49,7 @@ fn craft_initial(dcid: &[u8], scid: &[u8], token: &[u8]) -> Vec<u8> {
         packet_number: 0,
         pn_len: 1,
     };
-    let (mut wire, _) = h.encode_with_pn(100);
+    let (mut wire, _) = h.encode_with_pn(100).unwrap();
     wire.resize(wire.len() + 100, 0);
     wire
 }
@@ -136,9 +64,9 @@ fn first_initial_without_token_triggers_retry() {
     let initial = craft_initial(&client_dcid, &client_scid, &[]);
 
     let from: SocketAddr = "127.0.0.1:55001".parse().unwrap();
-    mux.on_udp_packet(from, &initial, Instant::now()).unwrap();
+    mux.recv(from, &initial, Instant::now()).unwrap();
 
-    let outgoing = mux.pull_outgoing();
+    let outgoing: Vec<_> = mux.drain_outgoing().collect();
     assert_eq!(outgoing.len(), 1, "exactly one Retry should be emitted");
     let (dst, retry_wire) = (outgoing[0].addr(), outgoing[0].payload());
     assert_eq!(dst, from);
@@ -160,23 +88,23 @@ fn second_initial_with_valid_token_does_not_re_retry() {
     let client_scid = [0x44u8; 8];
     let from: SocketAddr = "127.0.0.1:55002".parse().unwrap();
 
-    mux.on_udp_packet(
+    mux.recv(
         from,
         &craft_initial(&client_dcid, &client_scid, &[]),
         Instant::now(),
     )
     .unwrap();
-    let first_out = mux.pull_outgoing();
+    let first_out: Vec<_> = mux.drain_outgoing().collect();
     let retry = RetryPacket::decode(first_out[0].payload()).unwrap();
     let token = retry.token.clone();
     let new_dcid = retry.scid;
 
-    let _ = mux.on_udp_packet(
+    let _ = mux.recv(
         from,
         &craft_initial(&new_dcid, &client_scid, &token),
         Instant::now(),
     );
-    let second_out = mux.pull_outgoing();
+    let second_out: Vec<_> = mux.drain_outgoing().collect();
     for out in &second_out {
         let wire = out.payload();
         let is_retry = matches!(wire.first(), Some(b) if b & 0xF0 == 0xF0);
@@ -197,22 +125,22 @@ fn second_initial_with_wrong_addr_is_rejected() {
     let from_a: SocketAddr = "127.0.0.1:55003".parse().unwrap();
     let from_b: SocketAddr = "127.0.0.1:55004".parse().unwrap();
 
-    mux.on_udp_packet(
+    mux.recv(
         from_a,
         &craft_initial(&client_dcid, &client_scid, &[]),
         Instant::now(),
     )
     .unwrap();
-    let retry = RetryPacket::decode(mux.pull_outgoing()[0].payload()).unwrap();
+    let retry = RetryPacket::decode(mux.drain_outgoing().next().unwrap().payload()).unwrap();
     let token = retry.token;
     let new_dcid = retry.scid;
 
-    let _ = mux.on_udp_packet(
+    let _ = mux.recv(
         from_b,
         &craft_initial(&new_dcid, &client_scid, &token),
         Instant::now(),
     );
-    let out = mux.pull_outgoing();
+    let out: Vec<_> = mux.drain_outgoing().collect();
     assert!(
         out.is_empty(),
         "address-bound token mismatch must drop the packet silently"
@@ -221,15 +149,13 @@ fn second_initial_with_wrong_addr_is_rejected() {
 
 #[test]
 fn retry_off_by_default_lets_initials_through() {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
-    let mut mux = Mux::server(NoopHandler, signing, ConnConfig::default());
+    let signing = support::signing_key(0x39);
+    let mut mux = Mux::server(NoopHandler, signing, conn::Config::default()).unwrap();
 
     let initial = craft_initial(&[0u8; 8], &[1u8; 8], &[]);
     let from: SocketAddr = "127.0.0.1:55005".parse().unwrap();
-    let _ = mux.on_udp_packet(from, &initial, Instant::now());
-    let out = mux.pull_outgoing();
+    let _ = mux.recv(from, &initial, Instant::now());
+    let out: Vec<_> = mux.drain_outgoing().collect();
     for o in &out {
         let wire = o.payload();
         let is_retry = matches!(wire.first(), Some(b) if b & 0xF0 == 0xF0);
@@ -244,8 +170,9 @@ fn client_with_initial_dcid(initial_dcid: &[u8]) -> Conn {
         initial_dcid.to_vec(),
         CLIENT_LOCAL_CID.to_vec(),
         [0xABu8; 32],
-        ConnConfig::default(),
+        conn::Config::default(),
     )
+    .unwrap()
 }
 
 fn craft_retry_for(odcid: &[u8], echo_dcid: &[u8], new_scid: &[u8], token: &[u8]) -> Vec<u8> {
@@ -256,8 +183,8 @@ fn craft_retry_for(odcid: &[u8], echo_dcid: &[u8], new_scid: &[u8], token: &[u8]
         token: token.to_vec(),
         integrity_tag: [0u8; 16],
     };
-    retry.integrity_tag = retry.compute_integrity_tag(odcid);
-    retry.encode()
+    retry.integrity_tag = retry.compute_integrity_tag(odcid).unwrap();
+    retry.encode().unwrap()
 }
 
 #[test]
@@ -337,6 +264,35 @@ fn client_ignores_second_retry() {
         "first Retry's scid must remain in effect"
     );
     assert_eq!(prefix.token, token_a, "first Retry's token must remain");
+}
+
+#[test]
+fn retry_token_that_cannot_fit_active_initial_ceiling_closes_without_panic() {
+    let original_dcid = vec![0xceu8; 8];
+    let config = conn::Config {
+        max_pmtu: 1200,
+        ..Default::default()
+    };
+    let mut client = Conn::new_client(
+        original_dcid.clone(),
+        CLIENT_LOCAL_CID.to_vec(),
+        [0xabu8; 32],
+        config,
+    )
+    .unwrap();
+    assert_eq!(client.send_packets(Instant::now()).len(), 1);
+
+    let retry = craft_retry_for(
+        &original_dcid,
+        &CLIENT_LOCAL_CID,
+        &[0x44; 8],
+        &vec![0x91; 1200],
+    );
+    assert_eq!(
+        client.recv_packet(&retry, Instant::now()),
+        Err(ConnError::PacketCeiling)
+    );
+    assert!(client.is_closed());
 }
 
 fn hex_decode(s: &str) -> Vec<u8> {

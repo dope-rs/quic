@@ -1,20 +1,91 @@
-use std::collections::BTreeMap;
+use std::borrow::Borrow;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::rtt::K_PACKET_THRESHOLD;
+use crate::frame::MAX_ACK_RANGES;
+use crate::rtt::PACKET_THRESHOLD;
 
-#[derive(Debug, Clone)]
-pub struct StreamFrameInfo {
-    pub stream_id: u64,
-    pub offset: u64,
-    pub len: u64,
-    pub fin: bool,
+#[derive(Debug, Default)]
+struct ReceivedPackets {
+    ranges: BTreeMap<u64, u64>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct AckedFrames {
-    pub crypto: Option<(u64, usize)>,
-    pub stream: Vec<StreamFrameInfo>,
+pub(crate) struct AckRangeSet {
+    pub(crate) largest: u64,
+    pub(crate) first_range: u64,
+    pub(crate) additional: Vec<(u64, u64)>,
+}
+
+impl ReceivedPackets {
+    fn contains(&self, pn: u64) -> bool {
+        self.ranges
+            .range(..=pn)
+            .next_back()
+            .is_some_and(|(_, &largest)| pn <= largest)
+    }
+
+    fn insert(&mut self, pn: u64) -> bool {
+        if self.contains(pn) {
+            return false;
+        }
+
+        let previous = self
+            .ranges
+            .range(..pn)
+            .next_back()
+            .map(|(&smallest, &largest)| (smallest, largest));
+        let next = self
+            .ranges
+            .range(pn..)
+            .next()
+            .map(|(&smallest, &largest)| (smallest, largest));
+        let joins_previous =
+            previous.is_some_and(|(_, largest)| largest.checked_add(1) == Some(pn));
+        let joins_next = next.is_some_and(|(smallest, _)| pn.checked_add(1) == Some(smallest));
+
+        match (previous, next, joins_previous, joins_next) {
+            (Some((previous_smallest, _)), Some((next_smallest, next_largest)), true, true) => {
+                self.ranges.insert(previous_smallest, next_largest);
+                self.ranges.remove(&next_smallest);
+            }
+            (Some((previous_smallest, _)), _, true, false) => {
+                self.ranges.insert(previous_smallest, pn);
+            }
+            (_, Some((next_smallest, next_largest)), false, true) => {
+                self.ranges.remove(&next_smallest);
+                self.ranges.insert(pn, next_largest);
+            }
+            _ => {
+                self.ranges.insert(pn, pn);
+            }
+        }
+
+        while self.ranges.len() > MAX_ACK_RANGES {
+            let Some(oldest) = self.ranges.first_key_value().map(|(&smallest, _)| smallest) else {
+                break;
+            };
+            self.ranges.remove(&oldest);
+        }
+        true
+    }
+
+    fn ack_ranges(&self) -> Option<AckRangeSet> {
+        let mut ranges = self.ranges.iter().rev();
+        let (&first_smallest, &largest) = ranges.next()?;
+        let first_range = largest - first_smallest;
+        let mut previous_smallest = first_smallest;
+        let mut additional = Vec::with_capacity(self.ranges.len().saturating_sub(1));
+        for (&smallest, &range_largest) in ranges {
+            let gap = previous_smallest - range_largest - 2;
+            additional.push((gap, range_largest - smallest));
+            previous_smallest = smallest;
+        }
+        Some(AckRangeSet {
+            largest,
+            first_range,
+            additional,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -23,7 +94,6 @@ pub struct SentPacket {
     pub sent_time: Instant,
     pub ack_eliciting: bool,
     pub in_flight: bool,
-    pub frames: AckedFrames,
     pub bytes_sent: usize,
 }
 
@@ -31,7 +101,7 @@ pub struct SentPacket {
 pub struct PnSpace {
     pub next_pn: u64,
     pub sent: BTreeMap<u64, SentPacket>,
-    pub received: BTreeMap<u64, ()>,
+    received: ReceivedPackets,
     pub largest_received: Option<u64>,
     pub largest_received_time: Option<Instant>,
     pub ack_eliciting_received: bool,
@@ -55,8 +125,20 @@ impl PnSpace {
             .sum()
     }
 
-    pub fn record_received(&mut self, pn: u64, ack_eliciting: bool, now: Instant) {
-        self.received.insert(pn, ());
+    pub fn expected_pn(&self) -> u64 {
+        self.largest_received
+            .and_then(|pn| pn.checked_add(1))
+            .unwrap_or(0)
+    }
+
+    pub fn has_received(&self, pn: u64) -> bool {
+        self.received.contains(pn)
+    }
+
+    pub fn record_received(&mut self, pn: u64, ack_eliciting: bool, now: Instant) -> bool {
+        if !self.received.insert(pn) {
+            return false;
+        }
         match self.largest_received {
             Some(prev) if prev >= pn => {}
             _ => {
@@ -68,6 +150,7 @@ impl PnSpace {
             self.ack_eliciting_received = true;
             self.ack_pending = true;
         }
+        true
     }
 
     pub fn record_sent(&mut self, packet: SentPacket) {
@@ -81,56 +164,8 @@ impl PnSpace {
         self.sent.insert(packet.pn, packet);
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn build_ack_ranges(&self) -> Option<(u64, u64, Vec<(u64, u64)>)> {
-        let largest = self.largest_received?;
-
-        let pns: Vec<u64> = self.received.keys().rev().copied().collect();
-        if pns.is_empty() {
-            return None;
-        }
-
-        let mut ranges: Vec<(u64, u64)> = Vec::new();
-        let mut iter = pns.iter().copied();
-        let first = iter.next().expect("non-empty");
-        let mut cur_largest = first;
-        let mut cur_smallest = first;
-        for pn in iter {
-            if pn + 1 == cur_smallest {
-                cur_smallest = pn;
-            } else {
-                ranges.push((cur_largest, cur_smallest));
-                cur_largest = pn;
-                cur_smallest = pn;
-            }
-        }
-        ranges.push((cur_largest, cur_smallest));
-
-        let (top_lg, top_sm) = ranges[0];
-        debug_assert_eq!(top_lg, largest);
-        let first_range = top_lg - top_sm;
-
-        let mut additional = Vec::with_capacity(ranges.len().saturating_sub(1));
-        let mut prev_smallest = top_sm;
-        for &(lg, sm) in ranges.iter().skip(1) {
-            let gap = prev_smallest - lg - 2;
-            let range_len = lg - sm;
-            additional.push((gap, range_len));
-            prev_smallest = sm;
-        }
-        Some((largest, first_range, additional))
-    }
-
-    pub fn requeue_inflight_crypto(&mut self) {
-        for (offset, (data, _pn)) in std::mem::take(&mut self.crypto_inflight) {
-            self.crypto_retransmit.push((offset, data));
-        }
-    }
-
-    pub fn requeue_inflight_stream(&mut self) {
-        for ((stream_id, offset), (len, fin, _pn)) in std::mem::take(&mut self.stream_inflight) {
-            self.stream_retransmit.push((stream_id, offset, len, fin));
-        }
+    pub(crate) fn build_ack_ranges(&self) -> Option<AckRangeSet> {
+        self.received.ack_ranges()
     }
 
     pub fn detect_lost(
@@ -149,7 +184,7 @@ impl PnSpace {
             if pn > largest_acked {
                 continue;
             }
-            let by_pn = largest_acked.saturating_sub(pn) >= K_PACKET_THRESHOLD;
+            let by_pn = largest_acked.saturating_sub(pn) >= PACKET_THRESHOLD;
             let by_time = p.sent_time <= lost_send_time;
             if by_pn || by_time {
                 lost_pns.push(pn);
@@ -165,19 +200,6 @@ impl PnSpace {
         let mut lost = Vec::with_capacity(lost_pns.len());
         for pn in lost_pns {
             if let Some(p) = self.sent.remove(&pn) {
-                if let Some((offset, _len)) = p.frames.crypto
-                    && let Some((data, _carrier_pn)) = self.crypto_inflight.remove(&offset)
-                {
-                    self.crypto_retransmit.push((offset, data));
-                }
-                for sf in &p.frames.stream {
-                    if let Some((len, fin, _carrier_pn)) =
-                        self.stream_inflight.remove(&(sf.stream_id, sf.offset))
-                    {
-                        self.stream_retransmit
-                            .push((sf.stream_id, sf.offset, len, fin));
-                    }
-                }
                 if p.ack_eliciting && p.in_flight {
                     self.ack_eliciting_in_flight = self.ack_eliciting_in_flight.saturating_sub(1);
                 }
@@ -187,30 +209,27 @@ impl PnSpace {
         (lost, earliest_loss_time)
     }
 
-    pub fn process_ack(
+    pub fn process_ack<I>(
         &mut self,
         largest: u64,
         first_range: u64,
-        additional: &[(u64, u64)],
-    ) -> Vec<SentPacket> {
+        additional: I,
+    ) -> Vec<SentPacket>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<(u64, u64)>,
+    {
         let mut acked = Vec::new();
 
         let first_smallest = largest.saturating_sub(first_range);
-        for pn in first_smallest..=largest {
-            if let Some(p) = self.sent.remove(&pn) {
-                acked.push(p);
-            }
-        }
+        self.remove_sent_range(first_smallest, largest, &mut acked);
 
         let mut prev_smallest = first_smallest;
-        for &(gap, range_len) in additional {
+        for range in additional {
+            let &(gap, range_len) = range.borrow();
             let next_largest = prev_smallest.saturating_sub(gap + 2);
             let next_smallest = next_largest.saturating_sub(range_len);
-            for pn in next_smallest..=next_largest {
-                if let Some(p) = self.sent.remove(&pn) {
-                    acked.push(p);
-                }
-            }
+            self.remove_sent_range(next_smallest, next_largest, &mut acked);
             prev_smallest = next_smallest;
         }
 
@@ -226,12 +245,28 @@ impl PnSpace {
             }
         }
 
-        let acked_pns: Vec<u64> = acked.iter().map(|p| p.pn).collect();
+        let acked_pns: HashSet<u64> = acked.iter().map(|p| p.pn).collect();
         self.crypto_inflight
             .retain(|_, (_, pn)| !acked_pns.contains(pn));
         self.stream_inflight
             .retain(|_, (_, _, pn)| !acked_pns.contains(pn));
 
         acked
+    }
+
+    fn remove_sent_range(&mut self, smallest: u64, largest: u64, removed: &mut Vec<SentPacket>) {
+        loop {
+            let next = self
+                .sent
+                .range(smallest..=largest)
+                .next()
+                .map(|(&pn, _)| pn);
+            let Some(pn) = next else {
+                break;
+            };
+            if let Some(packet) = self.sent.remove(&pn) {
+                removed.push(packet);
+            }
+        }
     }
 }

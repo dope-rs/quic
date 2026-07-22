@@ -1,17 +1,15 @@
+pub mod support;
+
 use std::time::Instant;
 
-use dope_quic::{Conn, ConnConfig, transport_params};
-use ring::rand::{SecureRandom, SystemRandom};
-use shin::sig::SigningKey;
+use dope_quic::{Conn, conn, transport_params};
 
 const HS_CID: [u8; 8] = [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8];
 
 fn handshake_pair() -> (Conn, Conn) {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
+    let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
-    let cfg = || ConnConfig {
+    let cfg = || conn::Config {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
             max_datagram_frame_size: Some(65535),
@@ -31,8 +29,10 @@ fn handshake_pair() -> (Conn, Conn) {
         HS_CID.to_vec(),
         signing,
         cfg(),
-    );
-    let mut client = Conn::new_client(HS_CID.to_vec(), HS_CID.to_vec(), server_pubkey, cfg());
+    )
+    .unwrap();
+    let mut client =
+        Conn::new_client(HS_CID.to_vec(), HS_CID.to_vec(), server_pubkey, cfg()).unwrap();
     let now = Instant::now();
     for _ in 0..3 {
         for pkt in client.send_packets(now) {

@@ -1,8 +1,8 @@
+pub mod support;
+
 use std::time::Instant;
 
-use dope_quic::{Conn, ConnConfig, transport_params};
-use ring::rand::{SecureRandom, SystemRandom};
-use shin::sig::SigningKey;
+use dope_quic::{Conn, conn, transport_params};
 
 const CID: [u8; 8] = [0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44];
 
@@ -13,8 +13,8 @@ fn drain(from: &mut Conn, into: &mut Conn) {
     }
 }
 
-fn cfg() -> ConnConfig {
-    ConnConfig {
+fn cfg() -> conn::Config {
+    conn::Config {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
             max_datagram_frame_size: Some(65535),
@@ -26,13 +26,12 @@ fn cfg() -> ConnConfig {
 }
 
 fn handshake() -> (Conn, Conn) {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
+    let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
 
-    let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, cfg());
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, cfg());
+    let mut server =
+        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, cfg()).unwrap();
+    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, cfg()).unwrap();
 
     drain(&mut client, &mut server);
     drain(&mut server, &mut client);
@@ -50,7 +49,7 @@ fn path_challenge_round_trip() {
         data: [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF],
     };
     let mut buf = Vec::new();
-    f.encode(&mut buf);
+    f.encode(&mut buf).unwrap();
     assert_eq!(buf[0], 0x1a, "type byte = TYPE_PATH_CHALLENGE");
     assert_eq!(buf.len(), 1 + 8);
     let (decoded, n) = Frame::decode(&buf).unwrap();
@@ -65,7 +64,7 @@ fn path_response_round_trip() {
         data: [0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10],
     };
     let mut buf = Vec::new();
-    f.encode(&mut buf);
+    f.encode(&mut buf).unwrap();
     assert_eq!(buf[0], 0x1b);
     let (decoded, n) = Frame::decode(&buf).unwrap();
     assert_eq!(decoded, f);
@@ -106,11 +105,9 @@ fn unsolicited_path_response_does_not_falsely_validate() {
 
 #[test]
 fn pre_handshake_send_path_challenge_is_noop() {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
+    let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, cfg());
+    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, cfg()).unwrap();
     assert!(client.is_handshaking());
     let token = [0x01u8; 8];
     client.send_path_challenge(token);
@@ -136,7 +133,7 @@ fn unknown_path_response_does_not_break_conn() {
     use dope_quic::frame::Frame;
     let f = Frame::PathResponse { data: [0u8; 8] };
     let mut buf = Vec::new();
-    f.encode(&mut buf);
+    f.encode(&mut buf).unwrap();
     let frames = Frame::decode_all(&buf).expect("decode");
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0], f);

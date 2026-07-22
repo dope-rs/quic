@@ -21,41 +21,30 @@ struct CapturingHandler {
 }
 
 impl Handler for CapturingHandler {
-    fn on_established(&mut self, _conn: &mut Conn, h: ConnHandle) {
+    fn established(&mut self, _conn: &mut Conn, h: ConnHandle) {
         self.events.borrow_mut().established.push(h);
     }
-    fn on_stream_event(&mut self, _conn: &mut Conn, h: ConnHandle, event: StreamEvent) {
+    fn stream_event(&mut self, _conn: &mut Conn, h: ConnHandle, event: StreamEvent) {
         self.events.borrow_mut().streams.push((h, event));
     }
 }
 
-/// Delivers a burst to `dst`, expanding every GSO send back into its segments —
-/// exactly what the kernel does on the wire, so reassembly must match a plain
-/// per-packet send. Asserts the `UDP_SEGMENT` invariant: equal-size segments
-/// with only the trailing one allowed to be shorter.
 fn deliver(dst: &mut Mux<CapturingHandler>, src_addr: SocketAddr, burst: Vec<Outgoing>) -> usize {
     let now = Instant::now();
     let mut gso_runs = 0;
     for out in burst {
         match out {
             Outgoing::Plain(_, payload) => {
-                dst.on_udp_packet(src_addr, &payload, now).expect("recv");
+                dst.recv(src_addr, &payload, now).expect("recv");
             }
-            Outgoing::Gso(_, payload, seg) => {
-                let seg = seg as usize;
-                assert!(
-                    seg > 0 && payload.len() > seg,
-                    "a GSO run holds ≥2 segments"
-                );
-                assert!(
-                    payload.len() % seg == 0
-                        || payload.chunks(seg).next_back().unwrap().len() < seg,
-                    "only the trailing segment may be shorter than seg"
-                );
-                gso_runs += 1;
-                for pkt in payload.chunks(seg) {
-                    dst.on_udp_packet(src_addr, pkt, now).expect("recv");
+            Outgoing::Batch(_, payload, segments) => {
+                let mut offset = 0;
+                for segment in segments {
+                    let end = offset + segment as usize;
+                    dst.recv(src_addr, &payload[offset..end], now).unwrap();
+                    offset = end;
                 }
+                gso_runs += 1;
             }
         }
     }
@@ -77,21 +66,24 @@ fn gso_burst_reassembles_to_full_stream() {
 
     let server_handler = CapturingHandler::default();
     let server_events = server_handler.events.clone();
-    let mut server = Mux::server(server_handler, signing, tp.clone().into());
+    let mut server =
+        Mux::server_with_outgoing_capacity(server_handler, signing, tp.clone().into(), 2).unwrap();
     server.set_gso(true);
 
     let client_handler = CapturingHandler::default();
     let client_events = client_handler.events.clone();
-    let mut client = Mux::client(client_handler);
+    let mut client = Mux::client(client_handler).unwrap();
 
     let server_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
     let client_addr: SocketAddr = "10.0.0.1:50000".parse().unwrap();
 
     let mut now = Instant::now();
-    let client_handle = client.connect(server_addr, server_pubkey, tp.into(), CID.to_vec(), now);
-    deliver(&mut server, client_addr, client.pull_outgoing());
-    deliver(&mut client, server_addr, server.pull_outgoing());
-    deliver(&mut server, client_addr, client.pull_outgoing());
+    let client_handle = client
+        .connect(server_addr, server_pubkey, tp.into(), CID.to_vec(), now)
+        .unwrap();
+    deliver(&mut server, client_addr, client.drain_outgoing().collect());
+    deliver(&mut client, server_addr, server.drain_outgoing().collect());
+    deliver(&mut server, client_addr, client.drain_outgoing().collect());
 
     let server_handle = server_events.borrow().established[0];
 
@@ -99,8 +91,8 @@ fn gso_burst_reassembles_to_full_stream() {
     let stream_id = {
         let conn = server.conn_mut(server_handle).expect("server conn");
         let sid = conn.open_uni_stream().expect("uni stream");
-        conn.stream_send(sid, &body);
-        conn.stream_send_fin(sid);
+        conn.stream_send(sid, &body).unwrap();
+        conn.stream_send_fin(sid).unwrap();
         sid
     };
 
@@ -108,9 +100,11 @@ fn gso_burst_reassembles_to_full_stream() {
     for _ in 0..16 {
         now += Duration::from_millis(20);
         server.flush(server_handle, now);
-        gso_runs += deliver(&mut client, server_addr, server.pull_outgoing());
+        assert!(server.outgoing_len() <= server.outgoing_capacity());
+        assert!(server.outgoing_bytes() <= server.outgoing_bytes_capacity());
+        gso_runs += deliver(&mut client, server_addr, server.drain_outgoing().collect());
         client.flush(client_handle, now);
-        deliver(&mut server, client_addr, client.pull_outgoing());
+        deliver(&mut server, client_addr, client.drain_outgoing().collect());
         if client
             .conn_mut(client_handle)
             .is_some_and(|c| c.stream_recv_eof(stream_id))

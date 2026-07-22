@@ -1,5 +1,6 @@
 pub const BASE_PMTU: u64 = 1200;
 pub const DEFAULT_MAX_PMTU: u64 = 1500;
+pub const MAX_PMTU: u64 = 65_527;
 const MAX_PROBES_PER_SIZE: u32 = 3;
 const SEARCH_DONE_INTERVAL: u64 = 4;
 
@@ -16,7 +17,7 @@ impl Pmtud {
     pub fn new(max_pmtu: u64) -> Self {
         Self {
             current: BASE_PMTU,
-            upper_bound: max_pmtu.max(BASE_PMTU),
+            upper_bound: max_pmtu.clamp(BASE_PMTU, MAX_PMTU),
             in_flight_size: None,
             probes_at_size: 0,
             done: false,
@@ -25,10 +26,6 @@ impl Pmtud {
 
     pub fn current(&self) -> u64 {
         self.current
-    }
-
-    pub fn done(&self) -> bool {
-        self.done
     }
 
     pub fn next_probe(&self) -> Option<u64> {
@@ -45,7 +42,7 @@ impl Pmtud {
         self.in_flight_size = Some(size);
     }
 
-    pub fn on_probe_acked(&mut self) {
+    pub fn probe_acked(&mut self) {
         if let Some(size) = self.in_flight_size.take() {
             self.current = size.max(self.current);
             self.probes_at_size = 0;
@@ -53,7 +50,7 @@ impl Pmtud {
         self.recompute_done();
     }
 
-    pub fn on_probe_lost(&mut self) {
+    pub fn probe_lost(&mut self) {
         let Some(size) = self.in_flight_size else {
             return;
         };

@@ -1,8 +1,8 @@
+pub mod support;
+
 use std::time::Instant;
 
 use dope_quic::{Conn, transport_params};
-use ring::rand::{SecureRandom, SystemRandom};
-use shin::sig::SigningKey;
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
@@ -13,7 +13,7 @@ fn drain(from: &mut Conn, into: &mut Conn) {
     }
 }
 
-fn user_tp() -> dope_quic::ConnConfig {
+fn user_tp() -> dope_quic::conn::Config {
     transport_params::Params {
         max_idle_timeout_ms: 30_000,
         max_datagram_frame_size: Some(65535),
@@ -24,13 +24,13 @@ fn user_tp() -> dope_quic::ConnConfig {
 
 #[test]
 fn conn_handshake_and_datagram_round_trip() {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
+    let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
 
-    let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp());
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp());
+    let mut server =
+        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+    let mut client =
+        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
     assert!(client.is_handshaking());
     assert!(server.is_handshaking());
@@ -48,7 +48,7 @@ fn conn_handshake_and_datagram_round_trip() {
     let server_view = server.peer_transport_params().expect("client tp");
     assert_eq!(server_view.max_datagram_frame_size, Some(65535));
 
-    client.send_datagram(b"hello server".to_vec()).unwrap();
+    client.try_send_datagram(b"hello server".to_vec()).unwrap();
     drain(&mut client, &mut server);
     assert_eq!(
         server.recv_datagram().as_deref(),
@@ -56,7 +56,7 @@ fn conn_handshake_and_datagram_round_trip() {
     );
     assert_eq!(server.recv_datagram(), None);
 
-    server.send_datagram(b"hello client".to_vec()).unwrap();
+    server.try_send_datagram(b"hello client".to_vec()).unwrap();
     drain(&mut server, &mut client);
     assert_eq!(
         client.recv_datagram().as_deref(),
@@ -66,13 +66,13 @@ fn conn_handshake_and_datagram_round_trip() {
 
 #[test]
 fn conn_buffers_multiple_outgoing_datagrams() {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
+    let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
 
-    let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp());
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp());
+    let mut server =
+        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+    let mut client =
+        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
     drain(&mut client, &mut server);
     drain(&mut server, &mut client);
@@ -80,7 +80,7 @@ fn conn_buffers_multiple_outgoing_datagrams() {
     assert!(client.is_established());
 
     for i in 0..5 {
-        client.send_datagram(vec![i as u8; 16]).unwrap();
+        client.try_send_datagram(vec![i as u8; 16]).unwrap();
     }
     drain(&mut client, &mut server);
 

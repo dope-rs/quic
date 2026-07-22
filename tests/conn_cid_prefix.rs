@@ -1,8 +1,8 @@
+pub mod support;
+
 use std::time::Instant;
 
-use dope_quic::{Conn, ConnConfig, transport_params};
-use ring::rand::{SecureRandom, SystemRandom};
-use shin::sig::SigningKey;
+use dope_quic::{Conn, conn, transport_params};
 
 const CID: [u8; 8] = [0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33];
 
@@ -13,8 +13,8 @@ fn drain(from: &mut Conn, into: &mut Conn) {
     }
 }
 
-fn cfg(cid_prefix: Option<u8>) -> ConnConfig {
-    ConnConfig {
+fn cfg(cid_prefix: Option<u8>) -> conn::Config {
+    conn::Config {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
             max_datagram_frame_size: Some(65535),
@@ -27,9 +27,7 @@ fn cfg(cid_prefix: Option<u8>) -> ConnConfig {
 }
 
 fn make_pair(server_prefix: Option<u8>, client_prefix: Option<u8>) -> (Conn, Conn) {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
+    let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
 
     let mut server = Conn::new_server(
@@ -38,13 +36,15 @@ fn make_pair(server_prefix: Option<u8>, client_prefix: Option<u8>) -> (Conn, Con
         CID.to_vec(),
         signing,
         cfg(server_prefix),
-    );
+    )
+    .unwrap();
     let mut client = Conn::new_client(
         CID.to_vec(),
         CID.to_vec(),
         server_pubkey,
         cfg(client_prefix),
-    );
+    )
+    .unwrap();
 
     drain(&mut client, &mut server);
     drain(&mut server, &mut client);

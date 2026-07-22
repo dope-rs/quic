@@ -3,33 +3,32 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Instant;
 
-use dope::Driver;
+use dope::DriverContext;
 use dope::manifold::Manifold;
+use o3::collections::IndexedMinHeap;
+use o3::collections::SlotQueue;
 use pin_project::pin_project;
+use ring::rand::{SecureRandom, SystemRandom};
 
-use crate::conn::{Conn, ConnConfig, ConnHandle, DatagramError};
-use crate::endpoint::Endpoint;
+use crate::TrySendError;
+use crate::conn::{self, Conn, ConnHandle};
+use crate::endpoint::{self, Endpoint};
 use crate::mux::Handler;
+use dope::runtime::Idle;
+use std::io::Error;
+use std::io::ErrorKind;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct SlotId(u32);
 
 impl SlotId {
-    pub fn from_idx(idx: u32) -> Self {
-        Self(idx)
+    pub fn from_index(index: u32) -> Self {
+        Self(index)
     }
 
-    pub fn idx(self) -> u32 {
+    pub fn index(self) -> u32 {
         self.0
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SendError {
-    NotConnected,
-    QueueFull,
-    TooLarge,
-    Unsupported,
 }
 
 pub trait BackoffPolicy: 'static {
@@ -37,9 +36,9 @@ pub trait BackoffPolicy: 'static {
 }
 
 pub trait Protocol: 'static {
-    fn on_connect(&mut self, slot: SlotId);
-    fn on_datagram(&mut self, slot: SlotId, data: Vec<u8>);
-    fn on_close(&mut self, slot: SlotId);
+    fn connect(&mut self, slot: SlotId);
+    fn datagram(&mut self, slot: SlotId, data: Vec<u8>);
+    fn close(&mut self, slot: SlotId);
 }
 
 #[derive(Clone)]
@@ -48,80 +47,153 @@ pub struct EndpointSpec {
     pub pubkey: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    pub endpoint: endpoint::Config,
+    pub event_budget: usize,
+    pub retry_budget: usize,
+}
+
 struct EndpointSlot {
     addr: SocketAddr,
     pubkey: [u8; 32],
     handle: Option<ConnHandle>,
     attempt: u32,
-    next_retry_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy)]
+struct Binding {
+    handle: ConnHandle,
+    slot: SlotId,
 }
 
 struct Bridge<P: Protocol> {
     protocol: P,
-    handle_to_slot: Vec<(ConnHandle, SlotId)>,
-    pending_close: Vec<SlotId>,
-    pending_established: Vec<SlotId>,
+    handle_to_slot: Box<[Option<Binding>]>,
+    pending_close: SlotQueue<Binding>,
+    pending_established: SlotQueue<Binding>,
 }
 
 impl<P: Protocol> Bridge<P> {
     fn lookup_slot(&self, handle: ConnHandle) -> Option<SlotId> {
         self.handle_to_slot
-            .iter()
-            .find(|(h, _)| *h == handle)
-            .map(|(_, s)| *s)
+            .get(handle.index() as usize)
+            .copied()
+            .flatten()
+            .filter(|binding| binding.handle == handle)
+            .map(|binding| binding.slot)
+    }
+
+    fn bind(&mut self, handle: ConnHandle, slot: SlotId) -> bool {
+        let Some(binding) = self.handle_to_slot.get_mut(handle.index() as usize) else {
+            return false;
+        };
+        if binding.is_some() {
+            return false;
+        }
+        *binding = Some(Binding { handle, slot });
+        true
+    }
+
+    fn unbind(&mut self, handle: ConnHandle) -> Option<SlotId> {
+        let binding = self.handle_to_slot.get_mut(handle.index() as usize)?;
+        if !binding.is_some_and(|binding| binding.handle == handle) {
+            return None;
+        }
+        binding.take().map(|binding| binding.slot)
     }
 }
 
 impl<P: Protocol> Handler for Bridge<P> {
-    fn on_established(&mut self, _conn: &mut Conn, handle: ConnHandle) {
+    fn established(&mut self, _conn: &mut Conn, handle: ConnHandle) {
         if let Some(slot) = self.lookup_slot(handle) {
-            self.pending_established.push(slot);
-            self.protocol.on_connect(slot);
+            let binding = Binding { handle, slot };
+            if let Some(entry) = self.pending_established.vacant_entry(slot.index() as usize) {
+                entry.push_back(binding);
+            }
+            self.protocol.connect(slot);
         }
     }
 
-    fn on_datagram(&mut self, _conn: &mut Conn, handle: ConnHandle, data: Vec<u8>) {
+    fn datagram(&mut self, _conn: &mut Conn, handle: ConnHandle, data: Vec<u8>) {
         if let Some(slot) = self.lookup_slot(handle) {
-            self.protocol.on_datagram(slot, data);
+            self.protocol.datagram(slot, data);
         }
     }
 
-    fn on_close(&mut self, handle: ConnHandle) {
-        if let Some(slot) = self.lookup_slot(handle) {
-            self.protocol.on_close(slot);
-            self.pending_close.push(slot);
-            self.handle_to_slot.retain(|(h, _)| *h != handle);
+    fn close(&mut self, handle: ConnHandle) {
+        if let Some(slot) = self.unbind(handle) {
+            self.protocol.close(slot);
+            let binding = Binding { handle, slot };
+            if let Some(entry) = self.pending_close.vacant_entry(slot.index() as usize) {
+                entry.push_back(binding);
+            }
         }
     }
 }
 
 #[pin_project]
-pub struct Client<const ID: u8, P: Protocol, B: BackoffPolicy> {
+pub struct Client<'d, const ID: u8, P: Protocol, B: BackoffPolicy> {
     #[pin]
-    inner: Endpoint<0, Bridge<P>>,
+    inner: Endpoint<'d, ID, Bridge<P>>,
     endpoints: Vec<EndpointSlot>,
+    retries: IndexedMinHeap<Instant>,
     backoff: B,
-    client_config: ConnConfig,
+    client_config: conn::Config,
+    event_budget: usize,
+    retry_budget: usize,
     dcid_seed: u64,
 }
 
-impl<const ID: u8, P: Protocol, B: BackoffPolicy> Client<ID, P, B> {
+impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Client<'d, ID, P, B> {
     pub fn build(
         bind: SocketAddr,
         endpoints: Vec<EndpointSpec>,
-        client_config: ConnConfig,
+        client_config: conn::Config,
         protocol: P,
         backoff: B,
-        dcid_seed_initial: u64,
-        driver: &mut Driver,
+        config: Config,
+        driver: &mut DriverContext<'_, 'd>,
     ) -> io::Result<Self> {
+        let endpoint_config = config.endpoint.validate()?;
+        client_config
+            .validate()
+            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+        if config.event_budget == 0
+            || config.event_budget > crate::mux::MAX_OUTGOING_CAPACITY
+            || config.retry_budget == 0
+            || config.retry_budget > crate::mux::MAX_OUTGOING_CAPACITY
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid QUIC client work budget",
+            ));
+        }
+        let capacity = endpoints.len();
+        if endpoint_config.max_conns != capacity {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "QUIC endpoint capacity mismatch",
+            ));
+        }
+        let mut seed = [0; 8];
+        SystemRandom::new()
+            .fill(&mut seed)
+            .map_err(|_| Error::other("QUIC DCID entropy unavailable"))?;
         let bridge = Bridge {
             protocol,
-            handle_to_slot: Vec::with_capacity(endpoints.len()),
-            pending_close: Vec::new(),
-            pending_established: Vec::new(),
+            handle_to_slot: vec![None; capacity].into_boxed_slice(),
+            pending_close: SlotQueue::with_capacity(capacity),
+            pending_established: SlotQueue::with_capacity(capacity),
         };
-        let inner = Endpoint::build_client(bind, bridge, driver)?;
+        let inner = Endpoint::build_client(bind, bridge, endpoint_config, driver)?;
+        let now = Instant::now();
+        let mut retries = IndexedMinHeap::with_capacity(capacity);
+        for index in 0..capacity {
+            retries
+                .insert(index, now)
+                .map_err(|_| Error::other("QUIC retry scheduler capacity mismatch"))?;
+        }
         let endpoints = endpoints
             .into_iter()
             .map(|e| EndpointSlot {
@@ -129,15 +201,17 @@ impl<const ID: u8, P: Protocol, B: BackoffPolicy> Client<ID, P, B> {
                 pubkey: e.pubkey,
                 handle: None,
                 attempt: 0,
-                next_retry_at: Some(Instant::now()),
             })
             .collect();
         Ok(Self {
             inner,
             endpoints,
+            retries,
             backoff,
             client_config,
-            dcid_seed: dcid_seed_initial,
+            event_budget: config.event_budget,
+            retry_budget: config.retry_budget,
+            dcid_seed: u64::from_ne_bytes(seed),
         })
     }
 
@@ -159,114 +233,169 @@ impl<const ID: u8, P: Protocol, B: BackoffPolicy> Client<ID, P, B> {
 
     pub fn is_connected(&self, slot: SlotId) -> bool {
         self.endpoints
-            .get(slot.0 as usize)
+            .get(slot.index() as usize)
             .map(|ep| ep.handle.is_some())
             .unwrap_or(false)
     }
 
-    pub fn send_datagram(
+    pub fn try_send_datagram(
         self: Pin<&mut Self>,
         slot: SlotId,
         data: Vec<u8>,
-    ) -> Result<(), SendError> {
+    ) -> Result<(), TrySendError<Vec<u8>>> {
         let mut this = self.project();
-        let ep = this
-            .endpoints
-            .get_mut(slot.0 as usize)
-            .ok_or(SendError::NotConnected)?;
-        let handle = ep.handle.ok_or(SendError::NotConnected)?;
-        let send = this.inner.as_mut().send_datagram(handle, data);
-        match send {
+        let index = slot.index() as usize;
+        let Some(ep) = this.endpoints.get_mut(index) else {
+            return Err(TrySendError::Closed(data));
+        };
+        let Some(handle) = ep.handle else {
+            return Err(TrySendError::Closed(data));
+        };
+        match this.inner.as_mut().try_send_datagram(handle, data) {
             Ok(()) => Ok(()),
-            Err(DatagramError::Closed) => {
+            Err(TrySendError::Closed(data)) => {
+                this.inner.as_mut().close(handle);
+                this.inner.as_mut().handler_mut().unbind(handle);
                 ep.handle = None;
                 ep.attempt = ep.attempt.saturating_add(1);
-                ep.next_retry_at = Some(this.backoff.next_retry_at(ep.attempt, Instant::now()));
-                this.inner
-                    .handler_mut()
-                    .handle_to_slot
-                    .retain(|(h, _)| *h != handle);
-                Err(SendError::NotConnected)
+                let retry_at = this.backoff.next_retry_at(ep.attempt, Instant::now());
+                this.retries.remove(index);
+                let _ = this.retries.insert(index, retry_at);
+                Err(TrySendError::Closed(data))
             }
-            Err(DatagramError::QueueFull) => Err(SendError::QueueFull),
-            Err(DatagramError::TooLarge) => Err(SendError::TooLarge),
-            Err(DatagramError::PeerDoesNotSupport) => Err(SendError::Unsupported),
+            Err(error) => Err(error),
         }
     }
 
-    fn try_connect(self: Pin<&mut Self>, slot: SlotId) {
+    fn try_connect(self: Pin<&mut Self>, slot: SlotId) -> bool {
         let mut this = self.project();
-        let idx = slot.0 as usize;
-        let (addr, pubkey) = match this.endpoints.get(idx) {
-            Some(e) => (e.addr, e.pubkey),
-            None => return,
+        let index = slot.index() as usize;
+        let (addr, pubkey) = match this.endpoints.get(index) {
+            Some(endpoint) if endpoint.handle.is_none() => (endpoint.addr, endpoint.pubkey),
+            None => return false,
+            Some(_) => return false,
         };
         *this.dcid_seed = this.dcid_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let dcid = this.dcid_seed.to_be_bytes().to_vec();
         let config = this.client_config.clone();
-        let handle = this
+        let Ok(handle) = this
             .inner
             .as_mut()
-            .connect_with_config(addr, pubkey, config, dcid);
-        if let Some(ep) = this.endpoints.get_mut(idx) {
-            ep.handle = Some(handle);
-            ep.next_retry_at = None;
+            .connect_with_config(addr, pubkey, config, dcid)
+        else {
+            if let Some(endpoint) = this.endpoints.get_mut(index) {
+                endpoint.attempt = endpoint.attempt.saturating_add(1);
+                let retry_at = this.backoff.next_retry_at(endpoint.attempt, Instant::now());
+                this.retries.remove(index);
+                let _ = this.retries.insert(index, retry_at);
+            }
+            return false;
+        };
+        if this.inner.as_mut().handler_mut().bind(handle, slot) {
+            if let Some(endpoint) = this.endpoints.get_mut(index) {
+                endpoint.handle = Some(handle);
+            }
+            return true;
         }
-        this.inner.handler_mut().handle_to_slot.push((handle, slot));
+        this.inner.as_mut().close(handle);
+        if let Some(endpoint) = this.endpoints.get_mut(index) {
+            endpoint.attempt = endpoint.attempt.saturating_add(1);
+            let retry_at = this.backoff.next_retry_at(endpoint.attempt, Instant::now());
+            this.retries.remove(index);
+            let _ = this.retries.insert(index, retry_at);
+        }
+        false
     }
 }
 
-impl<const ID: u8, P: Protocol, B: BackoffPolicy> Manifold for Client<ID, P, B> {
+impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Manifold<'d> for Client<'d, ID, P, B> {
     const ID: u8 = ID;
 
-    fn dispatch(self: Pin<&mut Self>, ev: dope::Event, driver: &mut Driver) {
-        self.project().inner.dispatch(ev, driver);
+    fn dispatch(mut self: Pin<&mut Self>, ev: dope::Event, driver: &mut DriverContext<'_, 'd>) {
+        self.as_mut().project().inner.dispatch(ev, driver);
     }
 
-    fn pre_park(mut self: Pin<&mut Self>, driver: &mut Driver) {
+    fn pre_park(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
+        let mut this_client = self.as_mut();
+        this_client.as_mut().project().inner.flush_pending(driver);
         let now = Instant::now();
-        let due: Vec<usize> = {
-            let mut this = self.as_mut().project();
-
-            let established =
-                std::mem::take(&mut this.inner.as_mut().handler_mut().pending_established);
-            for slot in established {
-                if let Some(ep) = this.endpoints.get_mut(slot.0 as usize) {
-                    ep.attempt = 0;
+        {
+            let mut this = this_client.as_mut().project();
+            let mut remaining = *this.event_budget;
+            while remaining != 0 {
+                let Some(binding) = this.inner.as_mut().handler_mut().pending_close.pop_front()
+                else {
+                    break;
+                };
+                remaining -= 1;
+                let index = binding.slot.index() as usize;
+                if let Some(endpoint) = this.endpoints.get_mut(index)
+                    && endpoint.handle == Some(binding.handle)
+                {
+                    endpoint.handle = None;
+                    endpoint.attempt = endpoint.attempt.saturating_add(1);
+                    let retry_at = this.backoff.next_retry_at(endpoint.attempt, now);
+                    this.retries.remove(index);
+                    let _ = this.retries.insert(index, retry_at);
                 }
             }
-
-            let closed = std::mem::take(&mut this.inner.as_mut().handler_mut().pending_close);
-            for slot in closed {
-                if let Some(ep) = this.endpoints.get_mut(slot.0 as usize) {
-                    ep.handle = None;
-                    ep.attempt = ep.attempt.saturating_add(1);
-                    ep.next_retry_at = Some(this.backoff.next_retry_at(ep.attempt, now));
+            while remaining != 0 {
+                let Some(binding) = this
+                    .inner
+                    .as_mut()
+                    .handler_mut()
+                    .pending_established
+                    .pop_front()
+                else {
+                    break;
+                };
+                remaining -= 1;
+                if let Some(endpoint) = this.endpoints.get_mut(binding.slot.index() as usize)
+                    && endpoint.handle == Some(binding.handle)
+                {
+                    endpoint.attempt = 0;
                 }
             }
-
-            this.endpoints
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, ep)| match (ep.handle, ep.next_retry_at) {
-                    (None, Some(t)) if t <= now => Some(idx),
-                    _ => None,
-                })
-                .collect()
-        };
-        for idx in due {
-            self.as_mut().try_connect(SlotId(idx as u32));
         }
-        self.project().inner.pre_park(driver);
+        let mut connected = false;
+        let mut remaining = *this_client.as_ref().project_ref().retry_budget;
+        while remaining != 0 {
+            let due = {
+                let this = this_client.as_mut().project();
+                match this.retries.peek() {
+                    Some((_, retry_at)) if *retry_at <= now => this.retries.pop().map(|(i, _)| i),
+                    _ => None,
+                }
+            };
+            let Some(index) = due else { break };
+            remaining -= 1;
+            connected |= this_client
+                .as_mut()
+                .try_connect(SlotId::from_index(index as u32));
+        }
+        if connected {
+            this_client.project().inner.flush_pending(driver);
+        }
     }
 
-    fn idle(self: Pin<&Self>) -> dope::Idle {
-        let this = self.project_ref();
+    fn idle(self: Pin<&Self>) -> Idle {
+        let client = self.as_ref();
+        let this = client.project_ref();
         if !this.inner.handler().pending_close.is_empty()
             || !this.inner.handler().pending_established.is_empty()
         {
-            return dope::Idle::Busy;
+            return Idle::Busy;
         }
-        this.inner.idle()
+        match this.inner.get_ref().idle() {
+            Idle::Busy => Idle::Busy,
+            Idle::Park(deadline) => {
+                let retry = this.retries.peek().map(|(_, retry)| *retry);
+                Idle::Park(match (deadline, retry) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+                    (None, None) => None,
+                })
+            }
+        }
     }
 }

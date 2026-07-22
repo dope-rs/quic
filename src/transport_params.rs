@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::varint::Error;
 use crate::varint::VarInt;
 
 pub const ID_ORIGINAL_DESTINATION_CONNECTION_ID: u64 = 0x00;
@@ -26,7 +27,7 @@ pub const DEFAULT_MAX_ACK_DELAY_MS: u64 = 25;
 pub const DEFAULT_ACTIVE_CONNECTION_ID_LIMIT: u64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TpError {
+pub enum TransportParameterError {
     Underflow,
     BadVarInt,
     Duplicate,
@@ -34,8 +35,16 @@ pub enum TpError {
     OutOfRange,
 }
 
-impl From<crate::varint::Error> for TpError {
-    fn from(_: crate::varint::Error) -> Self {
+impl_error!(TransportParameterError {
+    Self::Underflow => "truncated transport parameter",
+    Self::BadVarInt => "invalid transport parameter integer",
+    Self::Duplicate => "duplicate transport parameter",
+    Self::BadValueLength => "invalid transport parameter length",
+    Self::OutOfRange => "transport parameter is out of range",
+});
+
+impl From<Error> for TransportParameterError {
+    fn from(_: Error) -> Self {
         Self::BadVarInt
     }
 }
@@ -86,29 +95,70 @@ impl Default for Params {
 }
 
 impl Params {
-    fn put_varint(out: &mut Vec<u8>, id: u64, value: u64) {
-        VarInt::encode(id, out).expect("tp id fits in varint");
+    pub fn validate(&self) -> Result<(), TransportParameterError> {
+        let varints = [
+            self.max_idle_timeout_ms,
+            self.max_udp_payload_size,
+            self.initial_max_data,
+            self.initial_max_stream_data_bidi_local,
+            self.initial_max_stream_data_bidi_remote,
+            self.initial_max_stream_data_uni,
+            self.initial_max_streams_bidi,
+            self.initial_max_streams_uni,
+            self.ack_delay_exponent,
+            self.max_ack_delay_ms,
+            self.active_connection_id_limit,
+        ];
+        if varints.into_iter().any(|value| value > VarInt::MAX)
+            || self.max_udp_payload_size < 1200
+            || self.initial_max_streams_bidi > (1u64 << 60)
+            || self.initial_max_streams_uni > (1u64 << 60)
+            || self.ack_delay_exponent > 20
+            || self.max_ack_delay_ms >= (1u64 << 14)
+            || self.active_connection_id_limit < 2
+            || self
+                .max_datagram_frame_size
+                .is_some_and(|value| value > VarInt::MAX)
+            || [
+                self.initial_source_connection_id.as_deref(),
+                self.original_destination_connection_id.as_deref(),
+                self.retry_source_connection_id.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|cid| cid.len() > 20)
+        {
+            return Err(TransportParameterError::OutOfRange);
+        }
+        Ok(())
+    }
+
+    fn put_varint(out: &mut Vec<u8>, id: u64, value: u64) -> Result<(), TransportParameterError> {
+        VarInt::encode(id, out)?;
         let mut value_buf = Vec::with_capacity(8);
-        VarInt::encode(value, &mut value_buf).expect("tp value fits in varint");
-        VarInt::encode(value_buf.len() as u64, out).expect("tp value length fits");
+        VarInt::encode(value, &mut value_buf)?;
+        VarInt::encode(value_buf.len() as u64, out)?;
         out.extend_from_slice(&value_buf);
+        Ok(())
     }
 
-    fn put_bytes(out: &mut Vec<u8>, id: u64, value: &[u8]) {
-        VarInt::encode(id, out).expect("tp id fits");
-        VarInt::encode(value.len() as u64, out).expect("tp value length fits");
+    fn put_bytes(out: &mut Vec<u8>, id: u64, value: &[u8]) -> Result<(), TransportParameterError> {
+        VarInt::encode(id, out)?;
+        VarInt::encode(value.len() as u64, out)?;
         out.extend_from_slice(value);
+        Ok(())
     }
 
-    fn put_empty(out: &mut Vec<u8>, id: u64) {
-        VarInt::encode(id, out).expect("tp id fits");
+    fn put_empty(out: &mut Vec<u8>, id: u64) -> Result<(), TransportParameterError> {
+        VarInt::encode(id, out)?;
         out.push(0);
+        Ok(())
     }
 
-    fn parse_varint(value: &[u8]) -> Result<u64, TpError> {
+    fn parse_varint(value: &[u8]) -> Result<u64, TransportParameterError> {
         let (v, n) = VarInt::decode(value)?;
         if n != value.len() {
-            return Err(TpError::BadValueLength);
+            return Err(TransportParameterError::BadValueLength);
         }
         Ok(v)
     }
@@ -117,63 +167,65 @@ impl Params {
         id >= 27 && (id - 27).is_multiple_of(31)
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        Self::put_varint(out, ID_MAX_IDLE_TIMEOUT, self.max_idle_timeout_ms);
-        Self::put_varint(out, ID_MAX_UDP_PAYLOAD_SIZE, self.max_udp_payload_size);
-        Self::put_varint(out, ID_INITIAL_MAX_DATA, self.initial_max_data);
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), TransportParameterError> {
+        self.validate()?;
+        Self::put_varint(out, ID_MAX_IDLE_TIMEOUT, self.max_idle_timeout_ms)?;
+        Self::put_varint(out, ID_MAX_UDP_PAYLOAD_SIZE, self.max_udp_payload_size)?;
+        Self::put_varint(out, ID_INITIAL_MAX_DATA, self.initial_max_data)?;
         Self::put_varint(
             out,
             ID_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
             self.initial_max_stream_data_bidi_local,
-        );
+        )?;
         Self::put_varint(
             out,
             ID_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
             self.initial_max_stream_data_bidi_remote,
-        );
+        )?;
         Self::put_varint(
             out,
             ID_INITIAL_MAX_STREAM_DATA_UNI,
             self.initial_max_stream_data_uni,
-        );
+        )?;
         Self::put_varint(
             out,
             ID_INITIAL_MAX_STREAMS_BIDI,
             self.initial_max_streams_bidi,
-        );
+        )?;
         Self::put_varint(
             out,
             ID_INITIAL_MAX_STREAMS_UNI,
             self.initial_max_streams_uni,
-        );
-        Self::put_varint(out, ID_ACK_DELAY_EXPONENT, self.ack_delay_exponent);
-        Self::put_varint(out, ID_MAX_ACK_DELAY, self.max_ack_delay_ms);
+        )?;
+        Self::put_varint(out, ID_ACK_DELAY_EXPONENT, self.ack_delay_exponent)?;
+        Self::put_varint(out, ID_MAX_ACK_DELAY, self.max_ack_delay_ms)?;
         if self.disable_active_migration {
-            Self::put_empty(out, ID_DISABLE_ACTIVE_MIGRATION);
+            Self::put_empty(out, ID_DISABLE_ACTIVE_MIGRATION)?;
         }
         Self::put_varint(
             out,
             ID_ACTIVE_CONNECTION_ID_LIMIT,
             self.active_connection_id_limit,
-        );
+        )?;
         if let Some(cid) = &self.initial_source_connection_id {
-            Self::put_bytes(out, ID_INITIAL_SOURCE_CONNECTION_ID, cid);
+            Self::put_bytes(out, ID_INITIAL_SOURCE_CONNECTION_ID, cid)?;
         }
         if let Some(cid) = &self.original_destination_connection_id {
-            Self::put_bytes(out, ID_ORIGINAL_DESTINATION_CONNECTION_ID, cid);
+            Self::put_bytes(out, ID_ORIGINAL_DESTINATION_CONNECTION_ID, cid)?;
         }
         if let Some(cid) = &self.retry_source_connection_id {
-            Self::put_bytes(out, ID_RETRY_SOURCE_CONNECTION_ID, cid);
+            Self::put_bytes(out, ID_RETRY_SOURCE_CONNECTION_ID, cid)?;
         }
         if let Some(size) = self.max_datagram_frame_size {
-            Self::put_varint(out, ID_MAX_DATAGRAM_FRAME_SIZE, size);
+            Self::put_varint(out, ID_MAX_DATAGRAM_FRAME_SIZE, size)?;
         }
         if let Some(token) = &self.stateless_reset_token {
-            Self::put_bytes(out, ID_STATELESS_RESET_TOKEN, token);
+            Self::put_bytes(out, ID_STATELESS_RESET_TOKEN, token)?;
         }
+        Ok(())
     }
 
-    pub fn decode(input: &[u8]) -> Result<Self, TpError> {
+    pub fn decode(input: &[u8]) -> Result<Self, TransportParameterError> {
         let mut params = Self::default();
         let mut pos = 0;
         let mut seen: HashSet<u64> = HashSet::new();
@@ -182,18 +234,20 @@ impl Params {
             pos += n;
             let (length, n) = VarInt::decode(&input[pos..])?;
             pos += n;
-            let length = length as usize;
-            if pos + length > input.len() {
-                return Err(TpError::Underflow);
-            }
-            let value = &input[pos..pos + length];
-            pos += length;
+            let length =
+                usize::try_from(length).map_err(|_| TransportParameterError::OutOfRange)?;
+            let end = pos
+                .checked_add(length)
+                .filter(|&end| end <= input.len())
+                .ok_or(TransportParameterError::Underflow)?;
+            let value = &input[pos..end];
+            pos = end;
 
             if Self::is_reserved(id) {
                 continue;
             }
             if !seen.insert(id) {
-                return Err(TpError::Duplicate);
+                return Err(TransportParameterError::Duplicate);
             }
 
             match id {
@@ -205,7 +259,7 @@ impl Params {
                 }
                 ID_STATELESS_RESET_TOKEN => {
                     if value.len() != 16 {
-                        return Err(TpError::BadValueLength);
+                        return Err(TransportParameterError::BadValueLength);
                     }
                     let mut token = [0u8; 16];
                     token.copy_from_slice(value);
@@ -214,7 +268,7 @@ impl Params {
                 ID_MAX_UDP_PAYLOAD_SIZE => {
                     let v = Self::parse_varint(value)?;
                     if v < 1200 {
-                        return Err(TpError::OutOfRange);
+                        return Err(TransportParameterError::OutOfRange);
                     }
                     params.max_udp_payload_size = v;
                 }
@@ -233,41 +287,41 @@ impl Params {
                 ID_INITIAL_MAX_STREAMS_BIDI => {
                     let v = Self::parse_varint(value)?;
                     if v > (1u64 << 60) {
-                        return Err(TpError::OutOfRange);
+                        return Err(TransportParameterError::OutOfRange);
                     }
                     params.initial_max_streams_bidi = v;
                 }
                 ID_INITIAL_MAX_STREAMS_UNI => {
                     let v = Self::parse_varint(value)?;
                     if v > (1u64 << 60) {
-                        return Err(TpError::OutOfRange);
+                        return Err(TransportParameterError::OutOfRange);
                     }
                     params.initial_max_streams_uni = v;
                 }
                 ID_ACK_DELAY_EXPONENT => {
                     let v = Self::parse_varint(value)?;
                     if v > 20 {
-                        return Err(TpError::OutOfRange);
+                        return Err(TransportParameterError::OutOfRange);
                     }
                     params.ack_delay_exponent = v;
                 }
                 ID_MAX_ACK_DELAY => {
                     let v = Self::parse_varint(value)?;
                     if v >= (1u64 << 14) {
-                        return Err(TpError::OutOfRange);
+                        return Err(TransportParameterError::OutOfRange);
                     }
                     params.max_ack_delay_ms = v;
                 }
                 ID_DISABLE_ACTIVE_MIGRATION => {
                     if !value.is_empty() {
-                        return Err(TpError::BadValueLength);
+                        return Err(TransportParameterError::BadValueLength);
                     }
                     params.disable_active_migration = true;
                 }
                 ID_ACTIVE_CONNECTION_ID_LIMIT => {
                     let v = Self::parse_varint(value)?;
                     if v < 2 {
-                        return Err(TpError::OutOfRange);
+                        return Err(TransportParameterError::OutOfRange);
                     }
                     params.active_connection_id_limit = v;
                 }

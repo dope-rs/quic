@@ -1,5 +1,5 @@
 use shin::hash::HashAlg;
-use shin::kdf::Hkdf;
+use shin::kdf::{Hkdf, HkdfError};
 
 const ALG: HashAlg = HashAlg::Sha256;
 
@@ -20,25 +20,13 @@ pub struct InitialSecrets {
 }
 
 impl InitialSecrets {
-    pub fn from_dcid(dcid: &[u8]) -> Self {
-        let initial_secret = Hkdf::extract(ALG, &INITIAL_SALT_V1, dcid);
+    pub fn from_dcid(dcid: &[u8]) -> Result<Self, HkdfError> {
+        let initial_secret = Hkdf::new(ALG).extract(&INITIAL_SALT_V1, dcid);
         let mut client = [0u8; HASH_LEN];
-        Hkdf::expand_label(
-            ALG,
-            initial_secret.as_slice(),
-            "client in",
-            &[],
-            &mut client,
-        );
+        Hkdf::new(ALG).expand_label(initial_secret.as_slice(), "client in", &[], &mut client)?;
         let mut server = [0u8; HASH_LEN];
-        Hkdf::expand_label(
-            ALG,
-            initial_secret.as_slice(),
-            "server in",
-            &[],
-            &mut server,
-        );
-        Self { client, server }
+        Hkdf::new(ALG).expand_label(initial_secret.as_slice(), "server in", &[], &mut server)?;
+        Ok(Self { client, server })
     }
 }
 
@@ -50,13 +38,13 @@ pub struct PacketKeys {
 }
 
 impl PacketKeys {
-    pub fn aes_128(secret: &[u8]) -> Self {
+    pub fn aes_128(secret: &[u8]) -> Result<Self, HkdfError> {
         let mut key = [0u8; KEY_LEN];
         let mut iv = [0u8; IV_LEN];
         let mut hp = [0u8; HP_KEY_LEN];
-        Hkdf::expand_label(ALG, secret, "quic key", &[], &mut key);
-        Hkdf::expand_label(ALG, secret, "quic iv", &[], &mut iv);
-        Hkdf::expand_label(ALG, secret, "quic hp", &[], &mut hp);
-        Self { key, iv, hp }
+        Hkdf::new(ALG).expand_label(secret, "quic key", &[], &mut key)?;
+        Hkdf::new(ALG).expand_label(secret, "quic iv", &[], &mut iv)?;
+        Hkdf::new(ALG).expand_label(secret, "quic hp", &[], &mut hp)?;
+        Ok(Self { key, iv, hp })
     }
 }

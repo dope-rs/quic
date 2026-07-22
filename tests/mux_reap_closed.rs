@@ -1,11 +1,11 @@
+pub mod support;
+
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use dope_quic::{Conn, ConnHandle, Handler, Mux, transport_params};
-use ring::rand::{SecureRandom, SystemRandom};
-use shin::sig::SigningKey;
+use dope_quic::{Conn, ConnHandle, Handler, Mux, TrySendError, transport_params};
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
@@ -22,13 +22,13 @@ struct CapturingHandler {
 }
 
 impl Handler for CapturingHandler {
-    fn on_established(&mut self, _conn: &mut Conn, h: ConnHandle) {
+    fn established(&mut self, _conn: &mut Conn, h: ConnHandle) {
         self.events.borrow_mut().established.push(h);
     }
-    fn on_datagram(&mut self, _conn: &mut Conn, h: ConnHandle, data: Vec<u8>) {
+    fn datagram(&mut self, _conn: &mut Conn, h: ConnHandle, data: Vec<u8>) {
         self.events.borrow_mut().datagrams.push((h, data.to_vec()));
     }
-    fn on_close(&mut self, h: ConnHandle) {
+    fn close(&mut self, h: ConnHandle) {
         self.events.borrow_mut().closed.push(h);
     }
 }
@@ -39,11 +39,10 @@ fn relay_once(
     src_addr: SocketAddr,
     now: Instant,
 ) -> usize {
-    let pkts = src.pull_outgoing();
+    let pkts: Vec<_> = src.drain_outgoing().collect();
     let n = pkts.len();
     for out in pkts {
-        dst.on_udp_packet(src_addr, out.payload(), now)
-            .expect("recv");
+        dst.recv(src_addr, out.payload(), now).expect("recv");
     }
     n
 }
@@ -59,9 +58,7 @@ fn build_pair(
     [u8; 32],
     transport_params::Params,
 ) {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
+    let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
 
     let tp = transport_params::Params {
@@ -72,11 +69,11 @@ fn build_pair(
 
     let server_h = CapturingHandler::default();
     let server_events = server_h.events.clone();
-    let server = Mux::server(server_h, signing, tp.clone().into());
+    let server = Mux::server(server_h, signing, tp.clone().into()).unwrap();
 
     let client_h = CapturingHandler::default();
     let client_events = client_h.events.clone();
-    let client = Mux::client(client_h);
+    let client = Mux::client(client_h).unwrap();
 
     (
         server,
@@ -97,7 +94,9 @@ fn complete_handshake(
     client_addr: SocketAddr,
     now: Instant,
 ) -> ConnHandle {
-    let client_handle = client.connect(server_addr, server_pubkey, tp.into(), CID.to_vec(), now);
+    let client_handle = client
+        .connect(server_addr, server_pubkey, tp.into(), CID.to_vec(), now)
+        .unwrap();
     relay_once(client, server, client_addr, now);
     relay_once(server, client, server_addr, now);
     relay_once(client, server, client_addr, now);
@@ -105,7 +104,7 @@ fn complete_handshake(
 }
 
 #[test]
-fn idle_timeout_fires_on_close_via_reap() {
+fn idle_timeout_fires_close_via_reap() {
     let server_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
     let client_addr: SocketAddr = "10.0.0.1:50000".parse().unwrap();
     let (mut server, server_events, mut client, client_events, server_pubkey, tp) = build_pair(50);
@@ -130,12 +129,12 @@ fn idle_timeout_fires_on_close_via_reap() {
     assert_eq!(
         server_events.borrow().closed.len(),
         1,
-        "server must fire on_close exactly once",
+        "server must fire close exactly once",
     );
     assert_eq!(
         client_events.borrow().closed.len(),
         1,
-        "client must fire on_close exactly once",
+        "client must fire close exactly once",
     );
 }
 
@@ -164,7 +163,7 @@ fn reap_is_idempotent() {
     assert_eq!(
         server_events.borrow().closed.len(),
         1,
-        "subsequent reaps must not double-fire on_close",
+        "subsequent reaps must not double-fire close",
     );
 }
 
@@ -188,7 +187,7 @@ fn active_conn_is_not_reaped() {
 
     let t1 = t0 + Duration::from_millis(80);
     client
-        .send_datagram(client_handle, b"keepalive".to_vec(), t1)
+        .try_send_datagram(client_handle, b"keepalive".to_vec(), t1)
         .unwrap();
     relay_once(&mut client, &mut server, client_addr, t1);
 
@@ -232,7 +231,27 @@ fn explicit_close_then_reap_does_not_double_fire() {
 }
 
 #[test]
-fn peer_connection_close_makes_reap_fire_on_close() {
+fn pto_deadline_retransmits_without_external_io_completion() {
+    let mut client = Mux::client(CapturingHandler::default()).unwrap();
+    let t0 = Instant::now();
+    client
+        .connect(
+            "10.0.0.2:443".parse().unwrap(),
+            [7; 32],
+            dope_quic::conn::Config::default(),
+            CID.to_vec(),
+            t0,
+        )
+        .unwrap();
+    assert_eq!(client.drain_outgoing().count(), 1);
+    let deadline = client.next_deadline(t0).expect("PTO deadline");
+    assert!(deadline > t0);
+    client.reap_closed(deadline + Duration::from_millis(1));
+    assert!(client.outgoing_len() > 0);
+}
+
+#[test]
+fn peer_connection_close_makes_reap_fire_close() {
     let server_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
     let client_addr: SocketAddr = "10.0.0.1:50000".parse().unwrap();
     let (mut server, server_events, mut client, _client_events, server_pubkey, tp) =
@@ -267,12 +286,12 @@ fn peer_connection_close_makes_reap_fire_on_close() {
     assert_eq!(
         server_events.borrow().closed.len(),
         1,
-        "peer CONNECTION_CLOSE → reap fires on_close on server",
+        "peer CONNECTION_CLOSE → reap fires close on server",
     );
 }
 
 #[test]
-fn reap_clears_routing_so_handle_index_recycles() {
+fn recycled_slot_rejects_stale_generation_handle() {
     let server_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
     let client_addr: SocketAddr = "10.0.0.1:50000".parse().unwrap();
     let (mut server, _server_events, mut client, _client_events, server_pubkey, tp) =
@@ -294,15 +313,24 @@ fn reap_clears_routing_so_handle_index_recycles() {
 
     let mut alt_cid = CID;
     alt_cid[0] = 0x99;
-    let h1 = client.connect(
-        server_addr,
-        server_pubkey,
-        tp.into(),
-        alt_cid.to_vec(),
-        t_past,
-    );
+    let h1 = client
+        .connect(
+            server_addr,
+            server_pubkey,
+            tp.into(),
+            alt_cid.to_vec(),
+            t_past,
+        )
+        .unwrap();
+    assert_eq!(h0.0 as u32, h1.0 as u32);
+    assert_ne!(h0, h1);
+    assert!(client.conn_mut(h0).is_none());
     assert_eq!(
-        h0, h1,
-        "freed slot index must be reused by next connect (free list pop)",
+        client.try_send_datagram(h0, b"stale".to_vec(), t_past),
+        Err(TrySendError::Closed(b"stale".to_vec()))
     );
+    client.flush(h0, t_past);
+    client.close(h0);
+    assert!(client.conn_mut(h1).is_some());
+    assert_eq!(client.active_conns(), 1);
 }

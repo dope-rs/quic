@@ -1,30 +1,44 @@
-use shin::aead::{AeadError, AeadKey};
+use std::ops::Range;
 
-use crate::hp::HpKey;
+use shin::aead::AeadKey;
+
+use crate::hp::HeaderProtectionKey;
 use crate::qkdf::PacketKeys;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProtectError {
-    Open,
-    Hp,
+pub enum PacketProtectionError {
+    InvalidKey,
+    Encrypt,
+    InvalidPacket,
+    Decrypt,
+    HeaderProtection,
 }
+
+impl_error!(PacketProtectionError {
+    Self::InvalidKey => "invalid packet protection key",
+    Self::Encrypt => "packet encryption failed",
+    Self::InvalidPacket => "invalid protected packet",
+    Self::Decrypt => "packet decryption failed",
+    Self::HeaderProtection => "header protection failed",
+});
 
 pub struct PacketProtection {
     aead: AeadKey,
-    hp: HpKey,
+    hp: HeaderProtectionKey,
 }
 
-/// Header-protection masks for the first byte (RFC 9001 §5.4.1): long headers
-/// protect the low 4 bits, short headers the low 5 (the spin bit included).
 const LONG_HEADER_MASK: u8 = 0x0f;
 const SHORT_HEADER_MASK: u8 = 0x1f;
+const MAX_PACKET_NUMBER: u64 = (1 << 62) - 1;
 
 impl PacketProtection {
-    pub fn aes_128(keys: &PacketKeys) -> Self {
-        Self {
-            aead: AeadKey::aes_128_gcm(&keys.key, keys.iv),
-            hp: HpKey::aes_128(&keys.hp),
-        }
+    pub fn aes_128(keys: &PacketKeys) -> Result<Self, PacketProtectionError> {
+        Ok(Self {
+            aead: AeadKey::aes_128_gcm(&keys.key, keys.iv)
+                .map_err(|_| PacketProtectionError::InvalidKey)?,
+            hp: HeaderProtectionKey::aes_128(&keys.hp)
+                .map_err(|_| PacketProtectionError::InvalidKey)?,
+        })
     }
 
     pub fn encrypt_long(
@@ -34,7 +48,7 @@ impl PacketProtection {
         packet_number: u64,
         pn_offset: usize,
         pn_len: usize,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, PacketProtectionError> {
         let mut buf = Vec::new();
         self.encrypt_long_into(
             &mut buf,
@@ -43,8 +57,8 @@ impl PacketProtection {
             packet_number,
             pn_offset,
             pn_len,
-        );
-        buf
+        )?;
+        Ok(buf)
     }
 
     pub fn encrypt_long_into(
@@ -55,14 +69,16 @@ impl PacketProtection {
         packet_number: u64,
         pn_offset: usize,
         pn_len: usize,
-    ) -> usize {
+    ) -> Result<usize, PacketProtectionError> {
+        let pn_end = pn_offset
+            .checked_add(pn_len)
+            .ok_or(PacketProtectionError::InvalidPacket)?;
         self.encrypt_into(
             dst,
             header_with_pn,
             payload,
             packet_number,
-            pn_offset,
-            pn_len,
+            pn_offset..pn_end,
             LONG_HEADER_MASK,
         )
     }
@@ -71,8 +87,23 @@ impl PacketProtection {
         &self,
         protected: &mut [u8],
         pn_offset: usize,
-    ) -> Result<Vec<u8>, ProtectError> {
-        self.decrypt_with_first_byte_mask(protected, pn_offset, LONG_HEADER_MASK)
+    ) -> Result<Vec<u8>, PacketProtectionError> {
+        let (_, plaintext) = self.decrypt_long_in_place(protected, pn_offset, 0)?;
+        Ok(protected[plaintext].to_vec())
+    }
+
+    pub fn decrypt_long_in_place(
+        &self,
+        protected: &mut [u8],
+        pn_offset: usize,
+        expected_packet_number: u64,
+    ) -> Result<(u64, Range<usize>), PacketProtectionError> {
+        self.decrypt_in_place(
+            protected,
+            pn_offset,
+            expected_packet_number,
+            LONG_HEADER_MASK,
+        )
     }
 
     pub fn encrypt_short(
@@ -82,7 +113,7 @@ impl PacketProtection {
         packet_number: u64,
         pn_offset: usize,
         pn_len: usize,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, PacketProtectionError> {
         let mut buf = Vec::new();
         self.encrypt_short_into(
             &mut buf,
@@ -91,8 +122,8 @@ impl PacketProtection {
             packet_number,
             pn_offset,
             pn_len,
-        );
-        buf
+        )?;
+        Ok(buf)
     }
 
     pub fn encrypt_short_into(
@@ -103,88 +134,163 @@ impl PacketProtection {
         packet_number: u64,
         pn_offset: usize,
         pn_len: usize,
-    ) -> usize {
+    ) -> Result<usize, PacketProtectionError> {
+        let pn_end = pn_offset
+            .checked_add(pn_len)
+            .ok_or(PacketProtectionError::InvalidPacket)?;
         self.encrypt_into(
             dst,
             header_with_pn,
             payload,
             packet_number,
-            pn_offset,
-            pn_len,
+            pn_offset..pn_end,
             SHORT_HEADER_MASK,
         )
     }
 
-    /// Seals the payload in place (AAD = header) and applies header protection,
-    /// appending one wire packet to `dst`. Returns the packet's byte length, so
-    /// callers can coalesce a burst into one buffer and recover segment bounds.
-    #[allow(clippy::too_many_arguments)]
     fn encrypt_into(
         &self,
         dst: &mut Vec<u8>,
         header_with_pn: &[u8],
         payload: &[u8],
         packet_number: u64,
-        pn_offset: usize,
-        pn_len: usize,
+        packet_number_range: Range<usize>,
         first_byte_mask: u8,
-    ) -> usize {
+    ) -> Result<usize, PacketProtectionError> {
         let start = dst.len();
         let hdr_len = header_with_pn.len();
+        let pn_len = packet_number_range
+            .end
+            .checked_sub(packet_number_range.start)
+            .ok_or(PacketProtectionError::InvalidPacket)?;
+        if pn_len == 0 || pn_len > 4 || packet_number_range.end > hdr_len {
+            return Err(PacketProtectionError::InvalidPacket);
+        }
         dst.reserve(hdr_len + payload.len() + 16);
         dst.extend_from_slice(header_with_pn);
         dst.extend_from_slice(payload);
-        let tag =
-            self.aead
-                .seal_detached(packet_number, header_with_pn, &mut dst[start + hdr_len..]);
+        let tag = self
+            .aead
+            .seal_detached(packet_number, header_with_pn, &mut dst[start + hdr_len..])
+            .map_err(|_| PacketProtectionError::Encrypt)?;
         dst.extend_from_slice(&tag);
 
-        let sample_start = start + pn_offset + 4;
+        let sample_start = start
+            .checked_add(packet_number_range.start)
+            .and_then(|offset| offset.checked_add(4))
+            .ok_or(PacketProtectionError::InvalidPacket)?;
+        let sample_end = sample_start
+            .checked_add(16)
+            .ok_or(PacketProtectionError::InvalidPacket)?;
         let mut sample = [0u8; 16];
-        sample.copy_from_slice(&dst[sample_start..sample_start + 16]);
-        let mask = self.hp.mask(&sample).expect("16-byte sample");
+        sample.copy_from_slice(
+            dst.get(sample_start..sample_end)
+                .ok_or(PacketProtectionError::InvalidPacket)?,
+        );
+        let mask = self
+            .hp
+            .mask(&sample)
+            .map_err(|_| PacketProtectionError::HeaderProtection)?;
 
-        dst[start] ^= mask[0] & first_byte_mask;
-        for i in 0..pn_len {
-            dst[start + pn_offset + i] ^= mask[1 + i];
+        let first = dst
+            .get_mut(start)
+            .ok_or(PacketProtectionError::InvalidPacket)?;
+        *first ^= mask[0] & first_byte_mask;
+        for (index, byte) in dst[start + packet_number_range.start..start + packet_number_range.end]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte ^= mask[1 + index];
         }
-        dst.len() - start
+        Ok(dst.len() - start)
     }
 
     pub fn decrypt_short(
         &self,
         protected: &mut [u8],
         pn_offset: usize,
-    ) -> Result<Vec<u8>, ProtectError> {
-        self.decrypt_with_first_byte_mask(protected, pn_offset, SHORT_HEADER_MASK)
+    ) -> Result<Vec<u8>, PacketProtectionError> {
+        let (_, plaintext) = self.decrypt_short_in_place(protected, pn_offset, 0)?;
+        Ok(protected[plaintext].to_vec())
     }
 
-    fn decrypt_with_first_byte_mask(
+    pub fn decrypt_short_in_place(
         &self,
         protected: &mut [u8],
         pn_offset: usize,
-        first_byte_mask: u8,
-    ) -> Result<Vec<u8>, ProtectError> {
-        let sample_start = pn_offset + 4;
-        let mut sample = [0u8; 16];
-        sample.copy_from_slice(&protected[sample_start..sample_start + 16]);
-        let mask = self.hp.mask(&sample).map_err(|_| ProtectError::Hp)?;
+        expected_packet_number: u64,
+    ) -> Result<(u64, Range<usize>), PacketProtectionError> {
+        self.decrypt_in_place(
+            protected,
+            pn_offset,
+            expected_packet_number,
+            SHORT_HEADER_MASK,
+        )
+    }
 
-        protected[0] ^= mask[0] & first_byte_mask;
-        let pn_len = ((protected[0] & 0x03) + 1) as usize;
-        let mut pn = 0u64;
-        for i in 0..pn_len {
-            protected[pn_offset + i] ^= mask[1 + i];
-            pn = (pn << 8) | (protected[pn_offset + i] as u64);
+    fn decrypt_in_place(
+        &self,
+        protected: &mut [u8],
+        pn_offset: usize,
+        expected_packet_number: u64,
+        first_byte_mask: u8,
+    ) -> Result<(u64, Range<usize>), PacketProtectionError> {
+        let sample_start = pn_offset
+            .checked_add(4)
+            .ok_or(PacketProtectionError::InvalidPacket)?;
+        let sample_end = sample_start
+            .checked_add(16)
+            .ok_or(PacketProtectionError::InvalidPacket)?;
+        let mut sample = [0u8; 16];
+        sample.copy_from_slice(
+            protected
+                .get(sample_start..sample_end)
+                .ok_or(PacketProtectionError::InvalidPacket)?,
+        );
+        let mask = self
+            .hp
+            .mask(&sample)
+            .map_err(|_| PacketProtectionError::HeaderProtection)?;
+
+        let first = protected
+            .first_mut()
+            .ok_or(PacketProtectionError::InvalidPacket)?;
+        *first ^= mask[0] & first_byte_mask;
+        let pn_len = ((*first & 0x03) + 1) as usize;
+        let pn_end = pn_offset
+            .checked_add(pn_len)
+            .ok_or(PacketProtectionError::InvalidPacket)?;
+        let pn_bytes = protected
+            .get_mut(pn_offset..pn_end)
+            .ok_or(PacketProtectionError::InvalidPacket)?;
+        let mut truncated = 0u64;
+        for (index, byte) in pn_bytes.iter_mut().enumerate() {
+            *byte ^= mask[1 + index];
+            truncated = (truncated << 8) | u64::from(*byte);
         }
 
-        let body_start = pn_offset + pn_len;
-        let header = protected[..body_start].to_vec();
-        let body = &mut protected[body_start..];
-        let plaintext = self.aead.open(pn, &header, body).map_err(|e: AeadError| {
-            let _ = e;
-            ProtectError::Open
-        })?;
-        Ok(plaintext.to_vec())
+        let packet_number = decode_packet_number(expected_packet_number, truncated, pn_len);
+        let (header, body) = protected.split_at_mut(pn_end);
+        let plaintext_len = self
+            .aead
+            .open(packet_number, header, body)
+            .map_err(|_| PacketProtectionError::Decrypt)?
+            .len();
+        Ok((packet_number, pn_end..pn_end + plaintext_len))
+    }
+}
+
+fn decode_packet_number(expected: u64, truncated: u64, encoded_len: usize) -> u64 {
+    let window = 1u64 << (encoded_len * 8);
+    let half_window = window / 2;
+    let mask = window - 1;
+    let candidate = (expected & !mask) | truncated;
+    if candidate <= MAX_PACKET_NUMBER - window && candidate.saturating_add(half_window) <= expected
+    {
+        candidate + window
+    } else if candidate > expected.saturating_add(half_window) && candidate >= window {
+        candidate - window
+    } else {
+        candidate
     }
 }

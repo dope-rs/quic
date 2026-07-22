@@ -1,12 +1,13 @@
+pub mod support;
+
 use std::time::Instant;
 
 use dope_quic::{Conn, transport_params};
-use ring::rand::{SecureRandom, SystemRandom};
 use shin::sig::SigningKey;
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
-fn user_tp() -> dope_quic::ConnConfig {
+fn user_tp() -> dope_quic::conn::Config {
     transport_params::Params {
         max_idle_timeout_ms: 30_000,
         max_datagram_frame_size: Some(65535),
@@ -16,9 +17,7 @@ fn user_tp() -> dope_quic::ConnConfig {
 }
 
 fn signed_keys() -> ([u8; 32], SigningKey) {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
+    let signing = support::signing_key(0x39);
     let pubkey = *signing.pubkey().unwrap();
     (pubkey, signing)
 }
@@ -26,14 +25,15 @@ fn signed_keys() -> ([u8; 32], SigningKey) {
 #[test]
 fn server_starts_unvalidated() {
     let (_, signing) = signed_keys();
-    let server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp());
+    let server =
+        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
     assert!(!server.peer_address_validated());
 }
 
 #[test]
 fn client_starts_validated_no_anti_amp_for_client() {
     let (server_pubkey, _) = signed_keys();
-    let client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp());
+    let client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
     assert!(client.peer_address_validated());
 }
 
@@ -41,8 +41,10 @@ fn client_starts_validated_no_anti_amp_for_client() {
 fn server_first_response_under_3x_client_initial() {
     let (server_pubkey, signing) = signed_keys();
     let t0 = Instant::now();
-    let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp());
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp());
+    let mut server =
+        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+    let mut client =
+        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
     let received_bytes: u64 = client
         .send_packets(t0)
@@ -69,8 +71,10 @@ fn server_first_response_under_3x_client_initial() {
 fn server_validates_on_handshake_packet_from_client() {
     let (server_pubkey, signing) = signed_keys();
     let t0 = Instant::now();
-    let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp());
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp());
+    let mut server =
+        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+    let mut client =
+        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
     for p in client.send_packets(t0) {
         server.recv_packet(&p, t0).expect("recv");
@@ -91,8 +95,10 @@ fn server_validates_on_handshake_packet_from_client() {
 fn validated_server_no_longer_capped() {
     let (server_pubkey, signing) = signed_keys();
     let t0 = Instant::now();
-    let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp());
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp());
+    let mut server =
+        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+    let mut client =
+        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
     for _ in 0..4 {
         for p in client.send_packets(t0) {
@@ -106,7 +112,7 @@ fn validated_server_no_longer_capped() {
     assert!(server.peer_address_validated());
 
     for i in 0..50u8 {
-        server.send_datagram(vec![i; 100]).unwrap();
+        server.try_send_datagram(vec![i; 100]).unwrap();
     }
     let pkts = server.send_packets(t0);
     assert!(

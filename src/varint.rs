@@ -4,6 +4,11 @@ pub enum Error {
     Underflow,
 }
 
+impl_error!(Error {
+    Self::TooLarge => "integer exceeds the QUIC variable-length range",
+    Self::Underflow => "truncated QUIC variable-length integer",
+});
+
 pub struct VarInt;
 
 impl VarInt {

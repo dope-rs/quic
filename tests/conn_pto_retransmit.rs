@@ -1,12 +1,13 @@
+pub mod support;
+
 use std::time::{Duration, Instant};
 
 use dope_quic::{Conn, transport_params};
-use ring::rand::{SecureRandom, SystemRandom};
 use shin::sig::SigningKey;
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
-fn user_tp() -> dope_quic::ConnConfig {
+fn user_tp() -> dope_quic::conn::Config {
     transport_params::Params {
         max_idle_timeout_ms: 30_000,
         max_datagram_frame_size: Some(65535),
@@ -16,21 +17,21 @@ fn user_tp() -> dope_quic::ConnConfig {
 }
 
 fn signed_keys() -> ([u8; 32], SigningKey) {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
+    let signing = support::signing_key(0x39);
     let pubkey = *signing.pubkey().unwrap();
     (pubkey, signing)
 }
 
 #[test]
-fn pto_retransmits_dropped_client_initial() {
+fn pto_probes_dropped_client_initial() {
     let (server_pubkey, signing) = signed_keys();
 
     let t0 = Instant::now();
 
-    let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp());
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp());
+    let mut server =
+        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+    let mut client =
+        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
     let dropped = client.send_packets(t0);
     assert_eq!(dropped.len(), 1);
@@ -42,7 +43,12 @@ fn pto_retransmits_dropped_client_initial() {
     let t1 = pto_deadline + Duration::from_millis(1);
     client.check_loss(t1);
     let retransmit = client.send_packets(t1);
-    assert_eq!(retransmit.len(), 1, "PTO produced exactly one retransmit");
+    assert_eq!(retransmit.len(), 2, "PTO produced two probes");
+    assert_eq!(
+        client.unacked_count(0),
+        3,
+        "original and probes remain tracked"
+    );
 
     server
         .recv_packet(&retransmit[0], t1)
@@ -71,7 +77,8 @@ fn pto_backs_off_on_consecutive_fires() {
     let (server_pubkey, _signing) = signed_keys();
 
     let t0 = Instant::now();
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp());
+    let mut client =
+        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
     let _ = client.send_packets(t0);
     let pto1 = client.next_timer().expect("first PTO");
@@ -103,8 +110,10 @@ fn ack_clears_pto_timer() {
     let (server_pubkey, signing) = signed_keys();
 
     let t0 = Instant::now();
-    let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp());
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp());
+    let mut server =
+        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+    let mut client =
+        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
     let pkts = client.send_packets(t0);
     for p in &pkts {

@@ -1,12 +1,12 @@
+pub mod support;
+
 use std::time::{Duration, Instant};
 
 use dope_quic::{Conn, transport_params};
-use ring::rand::{SecureRandom, SystemRandom};
-use shin::sig::SigningKey;
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
-fn user_tp(idle_ms: u64) -> dope_quic::ConnConfig {
+fn user_tp(idle_ms: u64) -> dope_quic::conn::Config {
     transport_params::Params {
         max_idle_timeout_ms: idle_ms,
         max_datagram_frame_size: Some(65535),
@@ -16,9 +16,7 @@ fn user_tp(idle_ms: u64) -> dope_quic::ConnConfig {
 }
 
 fn build_pair(idle_ms: u64) -> (Conn, Conn) {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    let signing = SigningKey::from_seed(&seed).unwrap();
+    let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
     let server = Conn::new_server(
         CID.to_vec(),
@@ -26,8 +24,10 @@ fn build_pair(idle_ms: u64) -> (Conn, Conn) {
         CID.to_vec(),
         signing,
         user_tp(idle_ms),
-    );
-    let client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp(idle_ms));
+    )
+    .unwrap();
+    let client =
+        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp(idle_ms)).unwrap();
     (server, client)
 }
 
@@ -97,7 +97,7 @@ fn activity_resets_idle_timer() {
     complete_handshake(&mut server, &mut client, t0);
 
     let t1 = t0 + Duration::from_millis(80);
-    client.send_datagram(b"keepalive".to_vec()).unwrap();
+    client.try_send_datagram(b"keepalive".to_vec()).unwrap();
     drain(&mut client, &mut server, t1);
     assert!(!client.is_closed());
     assert!(!server.is_closed());

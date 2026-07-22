@@ -1,13 +1,13 @@
 use std::time::Duration;
 
-pub const K_GRANULARITY: Duration = Duration::from_millis(1);
+pub const GRANULARITY: Duration = Duration::from_millis(1);
 
-pub const K_INITIAL_RTT: Duration = Duration::from_millis(333);
+pub const INITIAL_RTT: Duration = Duration::from_millis(333);
 
-pub const K_PACKET_THRESHOLD: u64 = 3;
+pub const PACKET_THRESHOLD: u64 = 3;
 
-pub const K_TIME_THRESHOLD_NUM: u32 = 9;
-pub const K_TIME_THRESHOLD_DEN: u32 = 8;
+pub const TIME_THRESHOLD_NUMERATOR: u32 = 9;
+pub const TIME_THRESHOLD_DENOMINATOR: u32 = 8;
 
 #[derive(Debug, Default, Clone)]
 pub struct RttTracker {
@@ -27,7 +27,10 @@ impl RttTracker {
             None => self.min_rtt = Some(sample),
             _ => {}
         }
-        let min_rtt = self.min_rtt.unwrap();
+        let min_rtt = match self.min_rtt {
+            Some(min_rtt) => min_rtt,
+            None => sample,
+        };
 
         let adjusted = if sample >= min_rtt + ack_delay {
             sample - ack_delay
@@ -49,24 +52,24 @@ impl RttTracker {
     }
 
     pub fn pto_period(&self, max_ack_delay: Duration) -> Duration {
-        let smoothed = self.smoothed_rtt.unwrap_or(K_INITIAL_RTT);
-        let rttvar_scaled = if 4 * self.rttvar > K_GRANULARITY {
+        let smoothed = self.smoothed_rtt.unwrap_or(INITIAL_RTT);
+        let rttvar_scaled = if 4 * self.rttvar > GRANULARITY {
             4 * self.rttvar
         } else {
-            K_GRANULARITY
+            GRANULARITY
         };
         smoothed + rttvar_scaled + max_ack_delay
     }
 
     pub fn loss_delay(&self) -> Duration {
-        let smoothed = self.smoothed_rtt.unwrap_or(K_INITIAL_RTT);
+        let smoothed = self.smoothed_rtt.unwrap_or(INITIAL_RTT);
         let latest = self.latest_rtt.unwrap_or(smoothed);
         let max_rtt = if smoothed > latest { smoothed } else { latest };
-        let scaled = (max_rtt * K_TIME_THRESHOLD_NUM) / K_TIME_THRESHOLD_DEN;
-        if scaled > K_GRANULARITY {
+        let scaled = (max_rtt * TIME_THRESHOLD_NUMERATOR) / TIME_THRESHOLD_DENOMINATOR;
+        if scaled > GRANULARITY {
             scaled
         } else {
-            K_GRANULARITY
+            GRANULARITY
         }
     }
 }

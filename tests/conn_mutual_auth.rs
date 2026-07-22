@@ -3,8 +3,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use dope_quic::client_auth::{ClientAuth, ClientCertSource, ClientCertVerifier, ClientIdentity};
-use dope_quic::{Conn, ConnClientAuth, ConnConfig, transport_params};
-use ring::rand::{SecureRandom, SystemRandom};
+use dope_quic::{ClientAuthentication, Conn, conn, transport_params};
 use shin::sig::SigningKey;
 
 const CID: [u8; 8] = [0x42; 8];
@@ -16,13 +15,11 @@ fn drain(from: &mut Conn, into: &mut Conn) {
     }
 }
 
-fn ed25519() -> SigningKey {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    SigningKey::from_seed(&seed).unwrap()
+fn ed25519(seed: u8) -> SigningKey {
+    SigningKey::from_seed(&[seed; 32]).unwrap()
 }
 
-fn base_cfg() -> ConnConfig {
+fn base_cfg() -> conn::Config {
     transport_params::Params {
         max_idle_timeout_ms: 30_000,
         ..transport_params::Params::default()
@@ -47,7 +44,7 @@ fn run(
     mode: ClientAuth,
     accept: bool,
 ) -> (bool, bool, Rc<PinVerifier>) {
-    let server_key = ed25519();
+    let server_key = ed25519(0x51);
     let server_pubkey = *server_key.pubkey().unwrap();
     let verifier = Rc::new(PinVerifier {
         accept,
@@ -55,7 +52,7 @@ fn run(
     });
 
     let mut server_cfg = base_cfg();
-    server_cfg.client_auth = Some(ConnClientAuth {
+    server_cfg.client_authentication = Some(ClientAuthentication {
         mode,
         verifier: verifier.clone(),
     });
@@ -68,8 +65,10 @@ fn run(
         CID.to_vec(),
         server_key,
         server_cfg,
-    );
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, client_cfg);
+    )
+    .unwrap();
+    let mut client =
+        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, client_cfg).unwrap();
 
     for _ in 0..6 {
         drain(&mut client, &mut server);
@@ -82,7 +81,7 @@ fn run(
 fn mutual_auth_required_accepts_pinned_client() {
     let (client_est, server_est, verifier) = run(
         Some(ClientCertSource::RawPublicKey {
-            signing_key: ed25519(),
+            signing_key: ed25519(0x52),
         }),
         ClientAuth::Required,
         true,
@@ -103,7 +102,7 @@ fn mutual_auth_required_accepts_pinned_client() {
 fn mutual_auth_rejects_unauthorized_client() {
     let (_client_est, server_est, verifier) = run(
         Some(ClientCertSource::RawPublicKey {
-            signing_key: ed25519(),
+            signing_key: ed25519(0x52),
         }),
         ClientAuth::Required,
         false,
