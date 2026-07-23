@@ -27,7 +27,7 @@ use std::array::from_fn;
 use std::iter;
 use std::iter::Take;
 
-pub trait Handler: 'static {
+pub trait Handler {
     fn established(&mut self, _conn: &mut Conn, _handle: ConnHandle) {}
     fn datagram(&mut self, _conn: &mut Conn, _handle: ConnHandle, _data: Vec<u8>) {}
     fn stream_event(&mut self, _conn: &mut Conn, _handle: ConnHandle, _event: StreamEvent) {}

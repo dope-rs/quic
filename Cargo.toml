@@ -1,6 +1,6 @@
 [package]
 name = "dope-quic"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "QUIC x dope"
 license = "MIT"
@@ -8,19 +8,11 @@ repository = "https://github.com/dope-rs/quic"
 readme = "README.md"
 
 [dependencies]
-o3 = "0.6"
+o3 = "0.7"
 shin = "0.10"
-dope = "0.9"
-dope-gen = "0.9"
-dope-tls = "0.13"
+dope = "0.10.0"
+dope-gen = "0.10.0"
+dope-tls = "0.15"
 ring = "0.17"
 subtle = "2.6"
 pin-project = "1"
-
-[patch.crates-io]
-shin = { path = "../shin" }
-o3 = { path = "../o3" }
-dope = { path = "../dope/dope" }
-dope-core = { path = "../dope/core" }
-dope-net = { path = "../dope/net" }
-dope-gen = { path = "../dope/gen" }
