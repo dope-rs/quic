@@ -334,6 +334,10 @@ where
             .connect(peer_addr, server_pubkey, client_config, initial_dcid, now)
     }
 
+    pub fn conn(&self, handle: ConnHandle) -> Option<&Conn> {
+        self.mux.conn(handle)
+    }
+
     pub fn conn_mut(self: Pin<&mut Self>, handle: ConnHandle) -> Option<&mut Conn> {
         self.project().mux.conn_mut(handle)
     }

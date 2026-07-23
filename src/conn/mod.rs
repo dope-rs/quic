@@ -5168,4 +5168,8 @@ impl Conn {
     pub fn smoothed_rtt(&self) -> Option<Duration> {
         self.rtt.smoothed_rtt
     }
+
+    pub fn min_rtt(&self) -> Option<Duration> {
+        self.rtt.min_rtt
+    }
 }

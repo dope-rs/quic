@@ -36,7 +36,8 @@ pub mod transport_params;
 pub mod varint;
 
 pub use client::{
-    BackoffPolicy, Client, ClientConfigProvider, EndpointSpec, Protocol, SlotId, StaticClientConfig,
+    BackoffPolicy, Client, ClientConfigProvider, EndpointSpec, PathStats, Protocol, SlotId,
+    StaticClientConfig,
 };
 pub use conn::{
     Conn, ConnError, ConnHandle, DatagramCongestionControl, Mutual, MutualAuthentication,

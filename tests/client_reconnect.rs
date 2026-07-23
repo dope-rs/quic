@@ -74,9 +74,11 @@ impl<'d> Runtime<'d> {
     fn coordinate(self: Pin<&mut Self>, _driver: &mut DriverContext<'_, 'd>) {
         let mut client = self.project().client;
         if client.as_ref().protocol().connected {
-            let _ = client
-                .as_mut()
-                .try_send_datagram(SlotId::from_index(0), vec![0x42]);
+            let slot = SlotId::from_index(0);
+            let stats = client.as_ref().path_stats(slot).unwrap();
+            assert_eq!(client.as_ref().smoothed_rtt(slot), stats.srtt);
+            assert!(stats.cwnd > 0);
+            let _ = client.as_mut().try_send_datagram(slot, vec![0x42]);
         }
     }
 }
@@ -127,6 +129,9 @@ fn immediate_reconnect_reuses_one_generation_checked_slot() {
             &mut driver,
         )
         .unwrap();
+        assert!(client.smoothed_rtt(SlotId::from_index(0)).is_none());
+        assert!(client.path_stats(SlotId::from_index(0)).is_none());
+        assert!(client.path_stats(SlotId::from_index(1)).is_none());
         let runtime = pin!(Branded::new(Runtime { server, client }));
         let mut completions = [const { None }; 64];
         let mut ready = Vec::with_capacity(64);

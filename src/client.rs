@@ -1,7 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dope::DriverContext;
 use dope::manifold::Manifold;
@@ -64,6 +64,14 @@ pub struct Config {
     pub endpoint: endpoint::Config,
     pub event_budget: usize,
     pub retry_budget: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PathStats {
+    pub srtt: Option<Duration>,
+    pub min_rtt: Option<Duration>,
+    pub cwnd: u64,
+    pub bytes_in_flight: u64,
 }
 
 struct EndpointSlot {
@@ -284,6 +292,24 @@ where
             .get(slot.index() as usize)
             .map(|ep| ep.handle.is_some())
             .unwrap_or(false)
+    }
+
+    /// Smoothed RTT of the QUIC connection on `slot`, if connected.
+    pub fn smoothed_rtt(&self, slot: SlotId) -> Option<Duration> {
+        let handle = self.endpoints.get(slot.index() as usize)?.handle?;
+        self.inner.conn(handle)?.smoothed_rtt()
+    }
+
+    /// Current path statistics for the QUIC connection on `slot`, if connected.
+    pub fn path_stats(&self, slot: SlotId) -> Option<PathStats> {
+        let handle = self.endpoints.get(slot.index() as usize)?.handle?;
+        let conn = self.inner.conn(handle)?;
+        Some(PathStats {
+            srtt: conn.smoothed_rtt(),
+            min_rtt: conn.min_rtt(),
+            cwnd: conn.cwnd(),
+            bytes_in_flight: conn.bytes_in_flight(),
+        })
     }
 
     pub fn try_send_datagram(
