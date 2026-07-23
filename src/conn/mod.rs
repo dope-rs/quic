@@ -1467,6 +1467,21 @@ impl Conn {
             Some(rs) => rs.read(dst),
             None => 0,
         };
+        self.release_stream_receive_credit(stream_id, n);
+        n
+    }
+
+    /// Transfers the stream's currently contiguous receive allocation to the caller.
+    ///
+    /// Returns `None` when the stream has no newly readable bytes. Consuming bytes
+    /// through this method releases flow-control credit exactly like [`Self::stream_recv`].
+    pub fn stream_recv_owned(&mut self, stream_id: u64) -> Option<Vec<u8>> {
+        let bytes = self.streams_recv.get_mut(&stream_id)?.read_owned()?;
+        self.release_stream_receive_credit(stream_id, bytes.len());
+        Some(bytes)
+    }
+
+    fn release_stream_receive_credit(&mut self, stream_id: u64, n: usize) {
         if n > 0 {
             let bump = n as u64;
             self.local_max_data = self.local_max_data.saturating_add(bump);
@@ -1479,7 +1494,6 @@ impl Conn {
             self.local_max_data_pending = true;
             self.local_max_stream_data_pending.insert(stream_id, ());
         }
-        n
     }
 
     fn local_stream_recv_limit(&self, id: u64) -> u64 {

@@ -61,6 +61,31 @@ fn reading_releases_stream_flow_control_credit() {
 }
 
 #[test]
+fn owned_receive_moves_each_batch_and_releases_flow_control_credit() {
+    let (mut server, mut client) = support::connected_pair_with(
+        support::config_with_credit(5, 1 << 20, 8, 8),
+        support::config_with_credit(5, 1 << 20, 8, 8),
+    );
+    let stream = server.open_bidi_stream().unwrap();
+    server.stream_send(stream, b"abcdefghij").unwrap();
+    let now = Instant::now();
+    support::transfer(&mut server, &mut client, now);
+
+    assert_eq!(
+        client.stream_recv_owned(stream).as_deref(),
+        Some(&b"abcde"[..])
+    );
+    assert!(client.stream_recv_owned(stream).is_none());
+
+    support::transfer(&mut client, &mut server, now);
+    support::transfer(&mut server, &mut client, now);
+    assert_eq!(
+        client.stream_recv_owned(stream).as_deref(),
+        Some(&b"fghij"[..])
+    );
+}
+
+#[test]
 fn stop_sending_returns_a_reset_with_the_same_error() {
     let (mut server, mut client) = support::connected_pair();
     let stream = server.open_bidi_stream().unwrap();

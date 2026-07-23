@@ -48,18 +48,33 @@ impl RecvStream {
             self.final_size = Some(end);
         }
         self.gaps
-            .insert(offset, data, usize::MAX, MAX_RANGES)
+            .insert_and_drain_into(offset, data, usize::MAX, MAX_RANGES, &mut self.assembled)
             .map_err(RecvError::from)?;
-        self.gaps.drain_contiguous_into(&mut self.assembled);
         Ok(())
     }
 
     pub fn read(&mut self, dst: &mut Vec<u8>) -> usize {
         let n = self.assembled.len();
-        dst.extend_from_slice(&self.assembled);
-        self.assembled.clear();
+        if n == 0 {
+            return 0;
+        }
+        if dst.is_empty() {
+            std::mem::swap(dst, &mut self.assembled);
+        } else {
+            dst.extend_from_slice(&self.assembled);
+            self.assembled.clear();
+        }
         self.delivered_to += n as u64;
         n
+    }
+
+    pub fn read_owned(&mut self) -> Option<Vec<u8>> {
+        if self.assembled.is_empty() {
+            return None;
+        }
+        let bytes = std::mem::take(&mut self.assembled);
+        self.delivered_to += bytes.len() as u64;
+        Some(bytes)
     }
 
     pub fn is_eof(&self) -> bool {
@@ -233,5 +248,58 @@ impl SendStream {
             self.buf.truncate(len);
             self.start = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RecvStream;
+
+    #[test]
+    fn owned_read_moves_the_assembled_allocation() {
+        let mut stream = RecvStream::default();
+        stream.insert(0, b"owned", false).unwrap();
+        let assembled = stream.assembled.as_ptr();
+
+        let bytes = stream.read_owned().unwrap();
+
+        assert_eq!(bytes, b"owned");
+        assert_eq!(bytes.as_ptr(), assembled);
+        assert!(stream.read_owned().is_none());
+    }
+
+    #[test]
+    fn empty_destination_exchanges_its_spare_allocation() {
+        let mut stream = RecvStream::default();
+        stream.insert(0, b"ready", false).unwrap();
+        let assembled = stream.assembled.as_ptr();
+        let mut destination = Vec::with_capacity(64);
+        let spare = destination.as_ptr();
+
+        assert_eq!(stream.read(&mut destination), 5);
+
+        assert_eq!(destination, b"ready");
+        assert_eq!(destination.as_ptr(), assembled);
+        assert_eq!(stream.assembled.as_ptr(), spare);
+    }
+
+    #[test]
+    fn contiguous_input_absorbs_overlapping_gaps_once() {
+        let mut stream = RecvStream::default();
+        stream.insert(3, b"def", true).unwrap();
+        stream.insert(0, b"abcd", false).unwrap();
+
+        assert_eq!(stream.read_owned().unwrap(), b"abcdef");
+        assert!(stream.is_eof());
+    }
+
+    #[test]
+    fn overlapping_input_preserves_the_first_received_bytes() {
+        let mut stream = RecvStream::default();
+        stream.insert(3, b"XYZ", true).unwrap();
+        stream.insert(0, b"abcdef", false).unwrap();
+
+        assert_eq!(stream.read_owned().unwrap(), b"abcXYZ");
+        assert!(stream.is_eof());
     }
 }

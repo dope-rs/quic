@@ -20,6 +20,31 @@ pub(crate) struct RangeBuffer {
 }
 
 impl RangeBuffer {
+    pub(crate) fn insert_and_drain_into(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        max_bytes: usize,
+        max_ranges: usize,
+        output: &mut Vec<u8>,
+    ) -> Result<(), InsertError> {
+        let end = offset
+            .checked_add(u64::try_from(data.len()).map_err(|_| InsertError::OffsetOverflow)?)
+            .ok_or(InsertError::OffsetOverflow)?;
+        let overlaps_buffered_range =
+            end > self.next && self.segments.range(self.next..end).next().is_some();
+        if offset <= self.next && end > self.next && !overlaps_buffered_range {
+            let skip =
+                usize::try_from(self.next - offset).map_err(|_| InsertError::OffsetOverflow)?;
+            output.extend_from_slice(&data[skip..]);
+            self.next = end;
+        } else {
+            self.insert(offset, data, max_bytes, max_ranges)?;
+        }
+        self.drain_contiguous_into(output);
+        Ok(())
+    }
+
     pub(crate) fn insert(
         &mut self,
         offset: u64,
@@ -115,10 +140,21 @@ impl RangeBuffer {
     }
 
     pub(crate) fn drain_contiguous_into(&mut self, output: &mut Vec<u8>) {
-        while let Some(segment) = self.segments.remove(&self.next) {
+        while let Some((&start, _)) = self.segments.first_key_value() {
+            if start > self.next {
+                break;
+            }
+            let segment = self
+                .segments
+                .remove(&start)
+                .expect("first range must remain present");
             self.buffered -= segment.len();
-            self.next += segment.len() as u64;
-            output.extend_from_slice(&segment);
+            let end = start + segment.len() as u64;
+            if end > self.next {
+                let skip = (self.next - start) as usize;
+                output.extend_from_slice(&segment[skip..]);
+                self.next = end;
+            }
         }
     }
 }
