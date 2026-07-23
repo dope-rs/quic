@@ -1,5 +1,6 @@
 use std::array::IntoIter;
 use std::hash::{BuildHasher, RandomState};
+use std::marker::PhantomData;
 use std::mem::take;
 use std::net::SocketAddr;
 use std::num::NonZeroU128;
@@ -10,13 +11,17 @@ use dope::DriverContext;
 use dope::manifold::datagram;
 use o3::collections::FixedQueue;
 use o3::collections::IndexedMinHeap;
+use shin::server::{ClientCertVerifier, EarlyDataGuard, NoGuard, Shard};
 use shin::sig::SigningKey;
+use shin::ticket::TicketKeys;
 
 use crate::ConnectError;
 use crate::TrySendError;
 use crate::clock::WallClock;
-use crate::conn::{self, Conn, ConnError, ConnHandle, PacketBatch, StreamEvent};
-use crate::early_data::SharedEarlyDataReplayCache;
+use crate::conn::{
+    self, Conn, ConnError, ConnHandle, Mutual, MutualAuthentication, PacketBatch, ServerPolicy,
+    Standard, StreamEvent,
+};
 use crate::packet::InitialHeader;
 use crate::packet::QUIC_V1;
 use crate::packet::RetryPacket;
@@ -237,13 +242,29 @@ impl Outgoing {
     }
 }
 
-pub struct Mux<H: Handler> {
+struct ServerRuntime<P: ServerPolicy> {
+    config: conn::Config,
+    shard: Shard<P::Guard, P::Verifier>,
+    _policy: PhantomData<fn() -> P>,
+}
+
+impl<P: ServerPolicy> ServerRuntime<P> {
+    fn new(config: conn::Config, shard: Shard<P::Guard, P::Verifier>) -> Self {
+        Self {
+            config,
+            shard,
+            _policy: PhantomData,
+        }
+    }
+}
+
+pub struct Mux<H: Handler, P: ServerPolicy = Standard> {
     entries: Vec<Entry>,
     free_head: u32,
     cid_buckets: Box<[Option<CidLink>]>,
     cid_hasher: RandomState,
     handler: H,
-    server_creds: Option<(SigningKey, conn::Config)>,
+    server: Option<ServerRuntime<P>>,
     pending_outgoing: FixedQueue<Outgoing>,
     pending_outgoing_packets: usize,
     pending_outgoing_bytes: usize,
@@ -259,117 +280,14 @@ pub struct Mux<H: Handler> {
     gso: bool,
 }
 
-impl<H: Handler> Mux<H> {
-    fn is_initial_packet(wire: &[u8]) -> bool {
-        matches!(wire.first(), Some(&b) if (b & 0xb0) == 0x80)
-    }
-
-    fn build_stateless_reset(token: [u8; 16], len: usize) -> Vec<u8> {
-        use ring::rand::{SecureRandom, SystemRandom};
-        let len = len.max(22);
-        let mut out = vec![0u8; len];
-        let _ = SystemRandom::new().fill(&mut out);
-        out[0] = (out[0] & 0x3F) | 0x40;
-        let tail = len - 16;
-        out[tail..].copy_from_slice(&token);
-        out
-    }
-
-    fn parse_dcid(wire: &[u8], short_header_dcid_len: usize) -> Option<&[u8]> {
-        let first = *wire.first()?;
-        if first & 0x80 != 0 {
-            if wire.len() < 6 {
-                return None;
-            }
-            let dcid_len = wire[5] as usize;
-            if wire.len() < 6 + dcid_len {
-                return None;
-            }
-            Some(&wire[6..6 + dcid_len])
-        } else {
-            if wire.len() < 1 + short_header_dcid_len {
-                return None;
-            }
-            Some(&wire[1..1 + short_header_dcid_len])
-        }
-    }
-
-    fn with_limits(
-        handler: H,
-        mut server_creds: Option<(SigningKey, conn::Config)>,
-        max_conns: usize,
-        outgoing_capacity: usize,
-        outgoing_bytes_capacity: usize,
-    ) -> Result<Self, ConnectError> {
-        if max_conns == 0
-            || max_conns > MAX_CONNECTIONS
-            || outgoing_capacity == 0
-            || outgoing_capacity > MAX_OUTGOING_CAPACITY
-            || outgoing_bytes_capacity == 0
-            || outgoing_bytes_capacity > MAX_OUTGOING_BYTES
-        {
-            return Err(ConnectError::InvalidConfig);
-        }
-        if let Some((_, config)) = &mut server_creds {
-            config.validate()?;
-            if config.accept_early_data && config.early_data_replay_cache.is_none() {
-                config.early_data_replay_cache = Some(SharedEarlyDataReplayCache::new());
-            }
-        }
-        Ok(Self {
-            entries: Self::entry_arena(max_conns),
-            free_head: 0,
-            cid_buckets: vec![None; Self::cid_bucket_count(max_conns)].into_boxed_slice(),
-            cid_hasher: RandomState::new(),
-            handler,
-            server_creds,
-            pending_outgoing: FixedQueue::with_capacity(outgoing_capacity),
-            pending_outgoing_packets: 0,
-            pending_outgoing_bytes: 0,
-            pending_outgoing_bytes_capacity: outgoing_bytes_capacity,
-            out_batch: PacketBatch::default(),
-            recycled_packets: Vec::with_capacity(outgoing_capacity),
-            flush: QueueState::default(),
-            reap: QueueState::default(),
-            deadlines: IndexedMinHeap::with_capacity(max_conns),
-            cid_counter: 0,
-            active_conns: 0,
-            max_conns,
-            gso: false,
-        })
-    }
-
-    fn max_packet_bytes(config: &conn::Config) -> usize {
-        config.max_pmtu as usize
-    }
-
-    fn connection_packet_ceiling(&self, config: &conn::Config) -> usize {
-        Self::max_packet_bytes(config).min(self.pending_outgoing_bytes_capacity)
-    }
-
-    fn cid_bucket_count(max_conns: usize) -> usize {
-        max_conns
-            .max(1)
-            .saturating_mul(2)
-            .checked_next_power_of_two()
-            .unwrap_or(1usize << (usize::BITS - 1))
-    }
-
-    fn entry_arena(capacity: usize) -> Vec<Entry> {
-        (0..capacity)
-            .map(|index| Entry {
-                slot: None,
-                generation: 0,
-                used: false,
-                free_next: if index + 1 == capacity {
-                    NONE
-                } else {
-                    index as u32 + 1
-                },
-                flush: QueueLinks::default(),
-                reap: QueueLinks::default(),
-            })
-            .collect()
+impl<H: Handler> Mux<H, Standard> {
+    fn standard_server(
+        signing_key: SigningKey,
+        mut config: conn::Config,
+    ) -> Result<ServerRuntime<Standard>, ConnectError> {
+        config.validate()?;
+        let shard_config = Conn::take_server_config(signing_key, &mut config)?;
+        Ok(ServerRuntime::new(config, Shard::new(shard_config)))
     }
 
     pub fn server(
@@ -425,9 +343,10 @@ impl<H: Handler> Mux<H> {
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
     ) -> Result<Self, ConnectError> {
+        let server = Self::standard_server(signing_key, server_config)?;
         Self::with_limits(
             handler,
-            Some((signing_key, server_config)),
+            Some(server),
             max_conns,
             outgoing_capacity,
             outgoing_bytes_capacity,
@@ -471,6 +390,265 @@ impl<H: Handler> Mux<H> {
             outgoing_capacity,
             outgoing_bytes_capacity,
         )
+    }
+}
+
+impl<H, G> Mux<H, Standard<G>>
+where
+    H: Handler,
+    G: EarlyDataGuard + 'static,
+{
+    pub fn server_with_early_data_guard(
+        handler: H,
+        signing_key: SigningKey,
+        mut server_config: conn::Config,
+        guard: G,
+    ) -> Result<Self, ConnectError> {
+        server_config.validate()?;
+        let shard_config = Conn::take_server_config(signing_key, &mut server_config)?;
+        let server = ServerRuntime::new(
+            server_config,
+            Shard::with_early_data_guard(shard_config, guard),
+        );
+        Self::with_limits(
+            handler,
+            Some(server),
+            DEFAULT_MAX_CONNS,
+            DEFAULT_OUTGOING_CAP,
+            DEFAULT_OUTGOING_BYTES_CAP,
+        )
+    }
+
+    pub fn server_with_early_data_guard_and_limits(
+        handler: H,
+        signing_key: SigningKey,
+        mut server_config: conn::Config,
+        guard: G,
+        max_conns: usize,
+        outgoing_capacity: usize,
+        outgoing_bytes_capacity: usize,
+    ) -> Result<Self, ConnectError> {
+        server_config.validate()?;
+        let shard_config = Conn::take_server_config(signing_key, &mut server_config)?;
+        let server = ServerRuntime::new(
+            server_config,
+            Shard::with_early_data_guard(shard_config, guard),
+        );
+        Self::with_limits(
+            handler,
+            Some(server),
+            max_conns,
+            outgoing_capacity,
+            outgoing_bytes_capacity,
+        )
+    }
+}
+
+impl<H, V> Mux<H, Mutual<NoGuard, V>>
+where
+    H: Handler,
+    V: ClientCertVerifier + 'static,
+{
+    pub fn server_mutual(
+        handler: H,
+        signing_key: SigningKey,
+        server_config: conn::Config,
+        authentication: MutualAuthentication<V>,
+    ) -> Result<Self, ConnectError> {
+        Self::server_mutual_with_limits(
+            handler,
+            signing_key,
+            server_config,
+            authentication,
+            DEFAULT_MAX_CONNS,
+            DEFAULT_OUTGOING_CAP,
+            DEFAULT_OUTGOING_BYTES_CAP,
+        )
+    }
+
+    pub fn server_mutual_with_limits(
+        handler: H,
+        signing_key: SigningKey,
+        mut server_config: conn::Config,
+        authentication: MutualAuthentication<V>,
+        max_conns: usize,
+        outgoing_capacity: usize,
+        outgoing_bytes_capacity: usize,
+    ) -> Result<Self, ConnectError> {
+        server_config.validate()?;
+        let shard_config = Conn::take_server_config(signing_key, &mut server_config)?;
+        let (_, auth, verifier) = authentication.into_parts();
+        let server = ServerRuntime::new(
+            server_config,
+            Shard::with_client_auth(shard_config, auth, verifier),
+        );
+        Self::with_limits(
+            handler,
+            Some(server),
+            max_conns,
+            outgoing_capacity,
+            outgoing_bytes_capacity,
+        )
+    }
+}
+
+impl<H, G, V> Mux<H, Mutual<G, V>>
+where
+    H: Handler,
+    G: EarlyDataGuard + 'static,
+    V: ClientCertVerifier + 'static,
+{
+    pub fn server_mutual_with_early_data_guard(
+        handler: H,
+        signing_key: SigningKey,
+        server_config: conn::Config,
+        authentication: MutualAuthentication<V, G>,
+    ) -> Result<Self, ConnectError> {
+        Self::server_mutual_with_early_data_guard_and_limits(
+            handler,
+            signing_key,
+            server_config,
+            authentication,
+            DEFAULT_MAX_CONNS,
+            DEFAULT_OUTGOING_CAP,
+            DEFAULT_OUTGOING_BYTES_CAP,
+        )
+    }
+
+    pub fn server_mutual_with_early_data_guard_and_limits(
+        handler: H,
+        signing_key: SigningKey,
+        mut server_config: conn::Config,
+        authentication: MutualAuthentication<V, G>,
+        max_conns: usize,
+        outgoing_capacity: usize,
+        outgoing_bytes_capacity: usize,
+    ) -> Result<Self, ConnectError> {
+        server_config.validate()?;
+        let shard_config = Conn::take_server_config(signing_key, &mut server_config)?;
+        let (guard, auth, verifier) = authentication.into_parts();
+        let server = ServerRuntime::new(
+            server_config,
+            Shard::with_early_data_guard_and_client_auth(shard_config, guard, auth, verifier),
+        );
+        Self::with_limits(
+            handler,
+            Some(server),
+            max_conns,
+            outgoing_capacity,
+            outgoing_bytes_capacity,
+        )
+    }
+}
+
+impl<H: Handler, P: ServerPolicy> Mux<H, P> {
+    fn is_initial_packet(wire: &[u8]) -> bool {
+        matches!(wire.first(), Some(&b) if (b & 0xb0) == 0x80)
+    }
+
+    fn build_stateless_reset(token: [u8; 16], len: usize) -> Vec<u8> {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let len = len.max(22);
+        let mut out = vec![0u8; len];
+        let _ = SystemRandom::new().fill(&mut out);
+        out[0] = (out[0] & 0x3F) | 0x40;
+        let tail = len - 16;
+        out[tail..].copy_from_slice(&token);
+        out
+    }
+
+    fn parse_dcid(wire: &[u8], short_header_dcid_len: usize) -> Option<&[u8]> {
+        let first = *wire.first()?;
+        if first & 0x80 != 0 {
+            if wire.len() < 6 {
+                return None;
+            }
+            let dcid_len = wire[5] as usize;
+            if wire.len() < 6 + dcid_len {
+                return None;
+            }
+            Some(&wire[6..6 + dcid_len])
+        } else {
+            if wire.len() < 1 + short_header_dcid_len {
+                return None;
+            }
+            Some(&wire[1..1 + short_header_dcid_len])
+        }
+    }
+
+    fn with_limits(
+        handler: H,
+        server: Option<ServerRuntime<P>>,
+        max_conns: usize,
+        outgoing_capacity: usize,
+        outgoing_bytes_capacity: usize,
+    ) -> Result<Self, ConnectError> {
+        if max_conns == 0
+            || max_conns > MAX_CONNECTIONS
+            || outgoing_capacity == 0
+            || outgoing_capacity > MAX_OUTGOING_CAPACITY
+            || outgoing_bytes_capacity == 0
+            || outgoing_bytes_capacity > MAX_OUTGOING_BYTES
+        {
+            return Err(ConnectError::InvalidConfig);
+        }
+        if let Some(server) = &server {
+            server.config.validate()?;
+        }
+        Ok(Self {
+            entries: Self::entry_arena(max_conns),
+            free_head: 0,
+            cid_buckets: vec![None; Self::cid_bucket_count(max_conns)].into_boxed_slice(),
+            cid_hasher: RandomState::new(),
+            handler,
+            server,
+            pending_outgoing: FixedQueue::with_capacity(outgoing_capacity),
+            pending_outgoing_packets: 0,
+            pending_outgoing_bytes: 0,
+            pending_outgoing_bytes_capacity: outgoing_bytes_capacity,
+            out_batch: PacketBatch::default(),
+            recycled_packets: Vec::with_capacity(outgoing_capacity),
+            flush: QueueState::default(),
+            reap: QueueState::default(),
+            deadlines: IndexedMinHeap::with_capacity(max_conns),
+            cid_counter: 0,
+            active_conns: 0,
+            max_conns,
+            gso: false,
+        })
+    }
+
+    fn max_packet_bytes(config: &conn::Config) -> usize {
+        config.max_pmtu as usize
+    }
+
+    fn connection_packet_ceiling(&self, config: &conn::Config) -> usize {
+        Self::max_packet_bytes(config).min(self.pending_outgoing_bytes_capacity)
+    }
+
+    fn cid_bucket_count(max_conns: usize) -> usize {
+        max_conns
+            .max(1)
+            .saturating_mul(2)
+            .checked_next_power_of_two()
+            .unwrap_or(1usize << (usize::BITS - 1))
+    }
+
+    fn entry_arena(capacity: usize) -> Vec<Entry> {
+        (0..capacity)
+            .map(|index| Entry {
+                slot: None,
+                generation: 0,
+                used: false,
+                free_next: if index + 1 == capacity {
+                    NONE
+                } else {
+                    index as u32 + 1
+                },
+                flush: QueueLinks::default(),
+                reap: QueueLinks::default(),
+            })
+            .collect()
     }
 
     pub fn set_gso(&mut self, on: bool) {
@@ -535,6 +713,14 @@ impl<H: Handler> Mux<H> {
         &mut self.handler
     }
 
+    pub fn replace_ticket_keys(&mut self, keys: Option<TicketKeys>) -> bool {
+        let Some(server) = self.server.as_mut() else {
+            return false;
+        };
+        server.shard.replace_ticket_keys(keys);
+        true
+    }
+
     pub fn connect(
         &mut self,
         peer_addr: SocketAddr,
@@ -573,7 +759,7 @@ impl<H: Handler> Mux<H> {
         let dcid = Self::parse_dcid(data, 8);
         let handle = match dcid.and_then(|value| self.find_cid(value)) {
             Some(h) => h,
-            None if Self::is_initial_packet(data) && self.server_creds.is_some() => {
+            None if Self::is_initial_packet(data) && self.server.is_some() => {
                 if self.active_conns >= self.max_conns {
                     return Ok(());
                 }
@@ -592,10 +778,16 @@ impl<H: Handler> Mux<H> {
         };
         let index = self.handle_index(handle).ok_or(ConnError::HeaderDecode)?;
         let new_cids = {
+            let server = &mut self.server;
             let slot = self.entries[index]
                 .slot_mut()
                 .ok_or(ConnError::HeaderDecode)?;
-            slot.conn.recv_packet(data, now)?;
+            if slot.conn.is_client() {
+                slot.conn.recv_packet(data, now)?;
+            } else {
+                let server = server.as_mut().ok_or(ConnError::HeaderDecode)?;
+                slot.conn.recv_packet_server(data, now, &mut server.shard)?;
+            }
             slot.conn.take_cids_to_register()
         };
         for cid in new_cids {
@@ -741,11 +933,13 @@ impl<H: Handler> Mux<H> {
         data: &[u8],
         retry_odcid: Option<Vec<u8>>,
     ) -> Result<ConnHandle, ConnError> {
-        let (signing_key, server_config) = self
-            .server_creds
+        let server_config = self
+            .server
             .as_ref()
             .ok_or(ConnError::HeaderDecode)?
-            .clone();
+            .config
+            .duplicate_connection()
+            .map_err(|_| ConnError::Tls)?;
         if !matches!(data.first(), Some(&b) if b & 0xb0 == 0x80) {
             return Err(ConnError::HeaderDecode);
         }
@@ -760,20 +954,18 @@ impl<H: Handler> Mux<H> {
             return Err(ConnError::PacketCeiling);
         }
         let conn = match retry_odcid {
-            Some(odcid) => Conn::new_server_retry(
+            Some(odcid) => Conn::new_server_connection_retry(
                 initial_dcid.clone(),
                 local_cid.clone(),
                 peer_cid,
                 odcid,
                 initial_dcid,
-                signing_key,
                 server_config,
             ),
-            None => Conn::new_server(
+            None => Conn::new_server_connection(
                 initial_dcid,
                 local_cid.clone(),
                 peer_cid,
-                signing_key,
                 server_config,
             ),
         }
@@ -1346,8 +1538,7 @@ impl<H: Handler> Mux<H> {
         data: &[u8],
     ) -> Result<RetryGate, ConnError> {
         let (require_address_validation, retry_token_secret, cid_prefix, configured_ceiling) = {
-            let (_signing, server_config) =
-                self.server_creds.as_ref().ok_or(ConnError::HeaderDecode)?;
+            let server_config = &self.server.as_ref().ok_or(ConnError::HeaderDecode)?.config;
             (
                 server_config.require_address_validation,
                 server_config.retry_token_secret,
@@ -1414,7 +1605,7 @@ impl<H: Handler> Mux<H> {
     }
 
     fn emit_stateless_reset(&mut self, from: SocketAddr, trigger: &[u8]) -> bool {
-        let Some((_signing, server_config)) = self.server_creds.as_ref() else {
+        let Some(server_config) = self.server.as_ref().map(|server| &server.config) else {
             return false;
         };
         let Some(reset_secret) = server_config.stateless_reset_secret else {
@@ -1481,7 +1672,7 @@ enum RetryGate {
     Drop,
 }
 
-impl<'d, const ID: u8, H: Handler> datagram::Handler<'d, ID> for Mux<H> {
+impl<'d, const ID: u8, H: Handler, P: ServerPolicy> datagram::Handler<'d, ID> for Mux<H, P> {
     fn packet(
         &mut self,
         addr: SocketAddr,

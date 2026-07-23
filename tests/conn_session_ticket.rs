@@ -2,11 +2,11 @@ pub mod support;
 
 use std::time::Instant;
 
-use dope_quic::{Conn, conn, transport_params};
+use dope_quic::{Conn, ServerConn, conn, transport_params};
 
 const HS_CID: [u8; 8] = [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8];
 
-fn handshake_pair() -> (Conn, Conn) {
+fn handshake_pair() -> (ServerConn, Conn) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
     let cfg = || conn::Config {

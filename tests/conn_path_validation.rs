@@ -2,14 +2,14 @@ pub mod support;
 
 use std::time::Instant;
 
-use dope_quic::{Conn, conn, transport_params};
+use dope_quic::{Conn, ServerConn, conn, transport_params};
 
 const CID: [u8; 8] = [0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44];
 
-fn drain(from: &mut Conn, into: &mut Conn) {
+fn drain<R: support::Receiver>(from: &mut Conn, into: &mut R) {
     let now = Instant::now();
     for pkt in from.send_packets(now) {
-        into.recv_packet(&pkt, now).expect("recv");
+        into.receive(&pkt, now);
     }
 }
 
@@ -25,7 +25,7 @@ fn cfg() -> conn::Config {
     }
 }
 
-fn handshake() -> (Conn, Conn) {
+fn handshake() -> (ServerConn, Conn) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
 

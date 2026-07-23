@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dope_quic::conn::PacketBatch;
-use dope_quic::{Conn, conn, transport_params};
+use dope_quic::{Conn, ServerConn, conn, transport_params};
 use shin::sig::SigningKey;
 
 struct CountingAllocator;
@@ -51,7 +51,7 @@ fn config() -> conn::Config {
     }
 }
 
-fn established() -> (Conn, Conn) {
+fn established() -> (Conn, ServerConn) {
     let cid = vec![0x71; 8];
     let signing = SigningKey::from_seed(&[0x39; 32]).unwrap();
     let public_key = *signing.pubkey().unwrap();

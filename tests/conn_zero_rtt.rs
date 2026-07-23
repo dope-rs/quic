@@ -1,6 +1,9 @@
+pub mod support;
+
 use std::time::Instant;
 
 use dope_quic::conn::PacketBatch;
+use dope_quic::early_data::EarlyDataReplayCache;
 use dope_quic::{Conn, SessionTicket, conn, transport_params};
 use shin::client::Resumption;
 use shin::sig::SigningKey;
@@ -30,7 +33,6 @@ fn first_session_ticket() -> SessionTicket {
     let server_cfg = conn::Config {
         transport_params: user_tp(),
         ticket_secret: Some(TICKET_SECRET),
-        accept_early_data: true,
         ..Default::default()
     };
     let client_cfg = conn::Config {
@@ -67,12 +69,6 @@ fn first_session_ticket() -> SessionTicket {
     tickets.into_iter().next().unwrap()
 }
 
-fn drain(from: &mut Conn, into: &mut Conn, now: Instant) {
-    for pkt in from.send_packets(now) {
-        into.recv_packet(&pkt, now).expect("recv");
-    }
-}
-
 #[test]
 fn zero_rtt_followed_by_one_rtt_full_round_trip() {
     let ticket = first_session_ticket();
@@ -80,28 +76,28 @@ fn zero_rtt_followed_by_one_rtt_full_round_trip() {
     let server_cfg = conn::Config {
         transport_params: user_tp(),
         ticket_secret: Some(TICKET_SECRET),
-        accept_early_data: true,
         ..Default::default()
     };
     let client_cfg = conn::Config {
         transport_params: user_tp(),
-        resumption: Some(Resumption {
-            psk: ticket.psk,
-            ticket: ticket.ticket.clone(),
-            ticket_age_add: ticket.ticket_age_add,
-            age_millis: 0,
-        }),
+        resumption: Some(Resumption::new(
+            ticket.psk,
+            ticket.ticket.clone(),
+            ticket.ticket_age_add,
+            0,
+        )),
         enable_early_data: true,
         resumption_peer_tp: Some(user_tp()),
         ..Default::default()
     };
 
-    let mut server = Conn::new_server(
+    let mut server = Conn::new_server_with_early_data_guard(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         signing(),
         server_cfg,
+        EarlyDataReplayCache::new(),
     )
     .unwrap();
     let mut client = Conn::new_client(
@@ -115,20 +111,20 @@ fn zero_rtt_followed_by_one_rtt_full_round_trip() {
     let now = Instant::now();
     let stream = client.open_bidi_stream().unwrap();
     client.stream_send(stream, b"early").unwrap();
-    drain(&mut client, &mut server, now);
+    support::transfer(&mut client, &mut server, now);
 
     let mut got_early = Vec::new();
     server.stream_recv(stream, &mut got_early);
     assert_eq!(&got_early, b"early", "0-RTT bytes arrived before handshake");
 
     for _ in 0..3 {
-        drain(&mut server, &mut client, now);
-        drain(&mut client, &mut server, now);
+        support::transfer(&mut server, &mut client, now);
+        support::transfer(&mut client, &mut server, now);
     }
     assert!(client.is_established() && server.is_established());
 
     server.stream_send(stream, b"late-1rtt").unwrap();
-    drain(&mut server, &mut client, now);
+    support::transfer(&mut server, &mut client, now);
     let mut got_late = Vec::new();
     client.stream_recv(stream, &mut got_late);
     assert_eq!(&got_late, b"late-1rtt", "1-RTT bytes flow after handshake");
@@ -141,17 +137,16 @@ fn server_rejects_early_data_drops_zero_rtt_but_handshake_completes() {
     let server_cfg = conn::Config {
         transport_params: user_tp(),
         ticket_secret: Some(TICKET_SECRET),
-        accept_early_data: false,
         ..Default::default()
     };
     let client_cfg = conn::Config {
         transport_params: user_tp(),
-        resumption: Some(Resumption {
-            psk: ticket.psk,
-            ticket: ticket.ticket.clone(),
-            ticket_age_add: ticket.ticket_age_add,
-            age_millis: 0,
-        }),
+        resumption: Some(Resumption::new(
+            ticket.psk,
+            ticket.ticket.clone(),
+            ticket.ticket_age_add,
+            0,
+        )),
         enable_early_data: true,
         resumption_peer_tp: Some(user_tp()),
         ..Default::default()
@@ -176,21 +171,21 @@ fn server_rejects_early_data_drops_zero_rtt_but_handshake_completes() {
     let now = Instant::now();
     let stream = client.open_bidi_stream().unwrap();
     client.stream_send(stream, b"rejected").unwrap();
-    drain(&mut client, &mut server, now);
+    support::transfer(&mut client, &mut server, now);
 
     let mut got = Vec::new();
     server.stream_recv(stream, &mut got);
     assert!(
         got.is_empty(),
-        "server has no 0-RTT keys when accept_early_data=false; 0-RTT bytes silently dropped",
+        "server has no 0-RTT guard, so 0-RTT bytes are silently dropped",
     );
 
     for _ in 0..3 {
-        drain(&mut server, &mut client, now);
-        drain(&mut client, &mut server, now);
+        support::transfer(&mut server, &mut client, now);
+        support::transfer(&mut client, &mut server, now);
     }
     assert!(client.is_established() && server.is_established());
-    drain(&mut client, &mut server, now);
+    support::transfer(&mut client, &mut server, now);
     let mut retried = Vec::new();
     server.stream_recv(stream, &mut retried);
     assert_eq!(&retried, b"rejected");
@@ -206,28 +201,28 @@ fn cached_peer_tp_caps_zero_rtt_stream_emission() {
     let server_cfg = conn::Config {
         transport_params: tight_tp.clone(),
         ticket_secret: Some(TICKET_SECRET),
-        accept_early_data: true,
         ..Default::default()
     };
     let client_cfg = conn::Config {
         transport_params: user_tp(),
-        resumption: Some(Resumption {
-            psk: ticket.psk,
-            ticket: ticket.ticket.clone(),
-            ticket_age_add: ticket.ticket_age_add,
-            age_millis: 0,
-        }),
+        resumption: Some(Resumption::new(
+            ticket.psk,
+            ticket.ticket.clone(),
+            ticket.ticket_age_add,
+            0,
+        )),
         enable_early_data: true,
         resumption_peer_tp: Some(tight_tp),
         ..Default::default()
     };
 
-    let mut server = Conn::new_server(
+    let mut server = Conn::new_server_with_early_data_guard(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         signing(),
         server_cfg,
+        EarlyDataReplayCache::new(),
     )
     .unwrap();
     let mut client = Conn::new_client(
@@ -259,28 +254,28 @@ fn zero_rtt_stream_data_arrives_before_handshake_completes() {
     let server_cfg = conn::Config {
         transport_params: user_tp(),
         ticket_secret: Some(TICKET_SECRET),
-        accept_early_data: true,
         ..Default::default()
     };
     let client_cfg = conn::Config {
         transport_params: user_tp(),
-        resumption: Some(Resumption {
-            psk: ticket.psk,
-            ticket: ticket.ticket.clone(),
-            ticket_age_add: ticket.ticket_age_add,
-            age_millis: 0,
-        }),
+        resumption: Some(Resumption::new(
+            ticket.psk,
+            ticket.ticket.clone(),
+            ticket.ticket_age_add,
+            0,
+        )),
         enable_early_data: true,
         resumption_peer_tp: Some(user_tp()),
         ..Default::default()
     };
 
-    let mut server = Conn::new_server(
+    let mut server = Conn::new_server_with_early_data_guard(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         signing(),
         server_cfg,
+        EarlyDataReplayCache::new(),
     )
     .unwrap();
     let mut client = Conn::new_client(
@@ -322,12 +317,12 @@ fn oversized_zero_rtt_stream_is_split_below_the_byte_ceiling() {
     let ticket = first_session_ticket();
     let client_cfg = conn::Config {
         transport_params: user_tp(),
-        resumption: Some(Resumption {
-            psk: ticket.psk,
-            ticket: ticket.ticket,
-            ticket_age_add: ticket.ticket_age_add,
-            age_millis: 0,
-        }),
+        resumption: Some(Resumption::new(
+            ticket.psk,
+            ticket.ticket,
+            ticket.ticket_age_add,
+            0,
+        )),
         enable_early_data: true,
         resumption_peer_tp: Some(user_tp()),
         ..Default::default()

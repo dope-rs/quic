@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound::{Excluded, Unbounded};
-use std::ops::Range;
+use std::ops::{Deref, DerefMut, Range};
 use std::time::{Duration, Instant};
 
 use shin::Event;
@@ -10,8 +10,6 @@ use subtle::ConstantTimeEq;
 use crate::ConnectError;
 use crate::TrySendError;
 use crate::clock::WallClock;
-use crate::early_data::EarlyDataReplayGuard;
-use crate::early_data::SharedEarlyDataReplayCache;
 use crate::frame::{AckRanges, Frame, TYPE_PADDING, TYPE_PING};
 use crate::new_reno::{MAX_DATAGRAM_SIZE, NewReno};
 use crate::pacer::Pacer;
@@ -47,14 +45,16 @@ use shin::server;
 use shin::server::CertSource;
 use shin::server::ClientAuth;
 use shin::server::ClientCertVerifier;
-use shin::server::ClientIdentity;
+use shin::server::EarlyDataGuard;
+use shin::server::NoClientAuth;
+use shin::server::NoGuard;
 use shin::server::Server;
+use shin::server::Shard;
 use shin::ticket::TicketKeys;
 use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::mem::take;
-use std::rc::Rc;
 
 mod batch;
 mod commit;
@@ -207,45 +207,96 @@ impl Epoch {
 
 type TlsClock = fn() -> u64;
 
-struct DynVerifier(Rc<dyn ClientCertVerifier>);
+mod sealed {
+    pub trait Sealed {}
+}
 
-impl ClientCertVerifier for DynVerifier {
-    fn verify(&self, identity: &ClientIdentity<'_>) -> bool {
-        self.0.verify(identity)
+pub trait ServerPolicy: sealed::Sealed + 'static {
+    type Guard: EarlyDataGuard + 'static;
+    type Verifier: ClientCertVerifier + 'static;
+}
+
+pub struct Standard<G = NoGuard>(core::marker::PhantomData<fn() -> G>);
+
+impl<G> sealed::Sealed for Standard<G> {}
+
+impl<G> ServerPolicy for Standard<G>
+where
+    G: EarlyDataGuard + 'static,
+{
+    type Guard = G;
+    type Verifier = NoClientAuth;
+}
+
+pub struct Mutual<G, V>(core::marker::PhantomData<fn() -> (G, V)>);
+
+impl<G, V> sealed::Sealed for Mutual<G, V> {}
+
+impl<G, V> ServerPolicy for Mutual<G, V>
+where
+    G: EarlyDataGuard + 'static,
+    V: ClientCertVerifier + 'static,
+{
+    type Guard = G;
+    type Verifier = V;
+}
+
+pub struct MutualAuthentication<V, G = NoGuard> {
+    guard: G,
+    mode: ClientAuth,
+    verifier: V,
+}
+
+impl<V> MutualAuthentication<V> {
+    pub fn new(mode: ClientAuth, verifier: V) -> Self {
+        Self {
+            guard: NoGuard,
+            mode,
+            verifier,
+        }
     }
 }
 
-enum ServerSide {
-    Plain(Server<TlsClock, EarlyDataReplayGuard>),
-    Mtls(Server<TlsClock, EarlyDataReplayGuard, DynVerifier>),
-}
-
-impl ServerSide {
-    fn read(&mut self, epoch: shin::Epoch, data: &[u8]) -> Result<Vec<Event>, shin::Error> {
-        match self {
-            Self::Plain(s) => s.read(epoch, data),
-            Self::Mtls(s) => s.read(epoch, data),
+impl<V, G> MutualAuthentication<V, G> {
+    pub fn with_early_data_guard(guard: G, mode: ClientAuth, verifier: V) -> Self {
+        Self {
+            guard,
+            mode,
+            verifier,
         }
     }
 
-    fn negotiated_cipher_suite(&self) -> Option<CipherSuite> {
-        match self {
-            Self::Plain(s) => s.negotiated_cipher_suite(),
-            Self::Mtls(s) => s.negotiated_cipher_suite(),
-        }
+    pub(crate) fn into_parts(self) -> (G, ClientAuth, V) {
+        (self.guard, self.mode, self.verifier)
     }
 }
 
 enum SideKind {
     Client(Box<Client<TlsClock>>),
-    Server(Box<ServerSide>),
+    Server(Box<Server<TlsClock>>),
 }
 
 impl SideKind {
-    fn read(&mut self, epoch: shin::Epoch, data: &[u8]) -> Result<Vec<Event>, shin::Error> {
+    fn read_client(&mut self, epoch: shin::Epoch, data: &[u8]) -> Result<Vec<Event>, shin::Error> {
         match self {
             Self::Client(c) => c.read(epoch, data),
-            Self::Server(s) => s.read(epoch, data),
+            Self::Server(_) => Err(shin::Error::BadConfig),
+        }
+    }
+
+    fn read_server<G, V>(
+        &mut self,
+        epoch: shin::Epoch,
+        data: &[u8],
+        shard: &mut Shard<G, V>,
+    ) -> Result<Vec<Event>, shin::Error>
+    where
+        G: EarlyDataGuard,
+        V: ClientCertVerifier,
+    {
+        match self {
+            Self::Client(_) => Err(shin::Error::BadConfig),
+            Self::Server(server) => server.read(epoch, data, shard),
         }
     }
 
@@ -254,6 +305,51 @@ impl SideKind {
             Self::Client(c) => c.negotiated_cipher_suite(),
             Self::Server(s) => s.negotiated_cipher_suite(),
         }
+    }
+}
+
+pub struct ServerConn<G: EarlyDataGuard = NoGuard, V: ClientCertVerifier = NoClientAuth> {
+    conn: Conn,
+    shard: Shard<G, V>,
+}
+
+impl<G, V> ServerConn<G, V>
+where
+    G: EarlyDataGuard,
+    V: ClientCertVerifier,
+{
+    fn new(conn: Conn, shard: Shard<G, V>) -> Self {
+        Self { conn, shard }
+    }
+
+    pub fn recv_packet(&mut self, wire: &[u8], now: Instant) -> Result<(), ConnError> {
+        self.conn.recv_packet_server(wire, now, &mut self.shard)
+    }
+
+    pub fn replace_ticket_keys(&mut self, keys: Option<TicketKeys>) {
+        self.shard.replace_ticket_keys(keys);
+    }
+}
+
+impl<G, V> Deref for ServerConn<G, V>
+where
+    G: EarlyDataGuard,
+    V: ClientCertVerifier,
+{
+    type Target = Conn;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+impl<G, V> DerefMut for ServerConn<G, V>
+where
+    G: EarlyDataGuard,
+    V: ClientCertVerifier,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.conn
     }
 }
 
@@ -436,13 +532,6 @@ pub enum DatagramCongestionControl {
     Uncongested,
 }
 
-#[derive(Clone)]
-pub struct ClientAuthentication {
-    pub mode: ClientAuth,
-    pub verifier: Rc<dyn ClientCertVerifier>,
-}
-
-#[derive(Clone)]
 pub struct Config {
     pub transport_params: transport_params::Params,
     pub datagram_congestion_control: DatagramCongestionControl,
@@ -460,12 +549,9 @@ pub struct Config {
     pub ticket_secret: Option<[u8; 32]>,
     pub resumption: Option<Resumption>,
     pub enable_early_data: bool,
-    pub accept_early_data: bool,
     pub resumption_peer_tp: Option<transport_params::Params>,
     pub alpn_protocols: Vec<Vec<u8>>,
     pub server_cert_chain: Option<Vec<Vec<u8>>>,
-    pub early_data_replay_cache: Option<SharedEarlyDataReplayCache>,
-    pub client_authentication: Option<ClientAuthentication>,
     pub client_cert: Option<ClientCertSource>,
     pub max_pmtu: u64,
 }
@@ -497,14 +583,9 @@ impl Debug for Config {
                 &self.require_address_validation,
             )
             .field("enable_early_data", &self.enable_early_data)
-            .field("accept_early_data", &self.accept_early_data)
             .field("resumption_peer_tp", &self.resumption_peer_tp)
             .field("alpn_protocols", &self.alpn_protocols)
             .field("server_cert_chain", &self.server_cert_chain.is_some())
-            .field(
-                "client_authentication",
-                &self.client_authentication.is_some(),
-            )
             .field("client_cert", &self.client_cert.is_some())
             .finish_non_exhaustive()
     }
@@ -529,12 +610,9 @@ impl Default for Config {
             ticket_secret: None,
             resumption: None,
             enable_early_data: false,
-            accept_early_data: false,
             resumption_peer_tp: None,
             alpn_protocols: Vec::new(),
             server_cert_chain: None,
-            early_data_replay_cache: None,
-            client_authentication: None,
             client_cert: None,
             max_pmtu: DEFAULT_MAX_PMTU,
         }
@@ -580,6 +658,35 @@ impl Config {
         }
         Ok(())
     }
+
+    pub(crate) fn duplicate_connection(&self) -> Result<Self, ConnectError> {
+        if self.resumption.is_some() || self.client_cert.is_some() {
+            return Err(ConnectError::InvalidConfig);
+        }
+        Ok(Self {
+            transport_params: self.transport_params.clone(),
+            datagram_congestion_control: self.datagram_congestion_control,
+            pending_datagrams_capacity: self.pending_datagrams_capacity,
+            incoming_datagrams_capacity: self.incoming_datagrams_capacity,
+            stream_events_capacity: self.stream_events_capacity,
+            packet_journal_capacity: self.packet_journal_capacity,
+            crypto_journal_capacity: self.crypto_journal_capacity,
+            control_journal_capacity: self.control_journal_capacity,
+            stream_journal_capacity: self.stream_journal_capacity,
+            cid_prefix: self.cid_prefix,
+            stateless_reset_secret: self.stateless_reset_secret,
+            require_address_validation: self.require_address_validation,
+            retry_token_secret: self.retry_token_secret,
+            ticket_secret: self.ticket_secret,
+            resumption: None,
+            enable_early_data: self.enable_early_data,
+            resumption_peer_tp: self.resumption_peer_tp.clone(),
+            alpn_protocols: self.alpn_protocols.clone(),
+            server_cert_chain: self.server_cert_chain.clone(),
+            client_cert: None,
+            max_pmtu: self.max_pmtu,
+        })
+    }
 }
 
 impl From<transport_params::Params> for Config {
@@ -612,13 +719,8 @@ struct PendingClose {
 }
 
 enum SideSetup {
-    Client {
-        server_pubkey: [u8; 32],
-    },
-    Server {
-        peer_cid: Vec<u8>,
-        signing_key: Box<SigningKey>,
-    },
+    Client { server_pubkey: [u8; 32] },
+    Server { peer_cid: Vec<u8> },
 }
 
 impl Conn {
@@ -668,6 +770,156 @@ impl Conn {
         local_cid: Vec<u8>,
         peer_cid: Vec<u8>,
         signing_key: SigningKey,
+        mut config: Config,
+    ) -> Result<ServerConn, ConnectError> {
+        config.validate()?;
+        let shard_config = Self::take_server_config(signing_key, &mut config)?;
+        let tp_original_dcid = initial_dcid.clone();
+        let conn = Self::new_with(
+            initial_dcid,
+            local_cid,
+            tp_original_dcid,
+            None,
+            config,
+            SideSetup::Server { peer_cid },
+        )?;
+        Ok(ServerConn::new(conn, Shard::new(shard_config)))
+    }
+
+    pub fn new_server_retry(
+        initial_dcid: Vec<u8>,
+        local_cid: Vec<u8>,
+        peer_cid: Vec<u8>,
+        original_dcid: Vec<u8>,
+        retry_scid: Vec<u8>,
+        signing_key: SigningKey,
+        mut config: Config,
+    ) -> Result<ServerConn, ConnectError> {
+        config.validate()?;
+        let shard_config = Self::take_server_config(signing_key, &mut config)?;
+        let conn = Self::new_with(
+            initial_dcid,
+            local_cid,
+            original_dcid,
+            Some(retry_scid),
+            config,
+            SideSetup::Server { peer_cid },
+        )?;
+        Ok(ServerConn::new(conn, Shard::new(shard_config)))
+    }
+
+    pub fn new_server_with_early_data_guard<G>(
+        initial_dcid: Vec<u8>,
+        local_cid: Vec<u8>,
+        peer_cid: Vec<u8>,
+        signing_key: SigningKey,
+        mut config: Config,
+        guard: G,
+    ) -> Result<ServerConn<G>, ConnectError>
+    where
+        G: EarlyDataGuard + 'static,
+    {
+        config.validate()?;
+        let shard_config = Self::take_server_config(signing_key, &mut config)?;
+        let tp_original_dcid = initial_dcid.clone();
+        let conn = Self::new_with(
+            initial_dcid,
+            local_cid,
+            tp_original_dcid,
+            None,
+            config,
+            SideSetup::Server { peer_cid },
+        )?;
+        Ok(ServerConn::new(
+            conn,
+            Shard::with_early_data_guard(shard_config, guard),
+        ))
+    }
+
+    pub fn new_server_mutual<V>(
+        initial_dcid: Vec<u8>,
+        local_cid: Vec<u8>,
+        peer_cid: Vec<u8>,
+        signing_key: SigningKey,
+        mut config: Config,
+        authentication: MutualAuthentication<V>,
+    ) -> Result<ServerConn<NoGuard, V>, ConnectError>
+    where
+        V: ClientCertVerifier + 'static,
+    {
+        config.validate()?;
+        let shard_config = Self::take_server_config(signing_key, &mut config)?;
+        let (_, auth, verifier) = authentication.into_parts();
+        let tp_original_dcid = initial_dcid.clone();
+        let conn = Self::new_with(
+            initial_dcid,
+            local_cid,
+            tp_original_dcid,
+            None,
+            config,
+            SideSetup::Server { peer_cid },
+        )?;
+        Ok(ServerConn::new(
+            conn,
+            Shard::with_client_auth(shard_config, auth, verifier),
+        ))
+    }
+
+    pub fn new_server_mutual_with_early_data_guard<G, V>(
+        initial_dcid: Vec<u8>,
+        local_cid: Vec<u8>,
+        peer_cid: Vec<u8>,
+        signing_key: SigningKey,
+        mut config: Config,
+        authentication: MutualAuthentication<V, G>,
+    ) -> Result<ServerConn<G, V>, ConnectError>
+    where
+        G: EarlyDataGuard + 'static,
+        V: ClientCertVerifier + 'static,
+    {
+        config.validate()?;
+        let shard_config = Self::take_server_config(signing_key, &mut config)?;
+        let (guard, auth, verifier) = authentication.into_parts();
+        let tp_original_dcid = initial_dcid.clone();
+        let conn = Self::new_with(
+            initial_dcid,
+            local_cid,
+            tp_original_dcid,
+            None,
+            config,
+            SideSetup::Server { peer_cid },
+        )?;
+        Ok(ServerConn::new(
+            conn,
+            Shard::with_early_data_guard_and_client_auth(shard_config, guard, auth, verifier),
+        ))
+    }
+
+    pub(crate) fn take_server_config(
+        signing_key: SigningKey,
+        config: &mut Config,
+    ) -> Result<server::Config, ConnectError> {
+        let server_config = server::Config {
+            source: match config.server_cert_chain.take() {
+                Some(chain_der) => CertSource::X509 {
+                    chain_der,
+                    signing_key,
+                },
+                None => CertSource::RawPublicKey { signing_key },
+            },
+            alpn_protocols: take(&mut config.alpn_protocols),
+            ticket_keys: config.ticket_secret.take().map(TicketKeys::single),
+        };
+        server_config
+            .validate()
+            .map_err(|_| ConnectError::InvalidConfig)?;
+        Ok(server_config)
+    }
+
+    pub(crate) fn new_server_connection(
+        initial_dcid: Vec<u8>,
+        local_cid: Vec<u8>,
+        peer_cid: Vec<u8>,
         config: Config,
     ) -> Result<Self, ConnectError> {
         config.validate()?;
@@ -678,20 +930,16 @@ impl Conn {
             tp_original_dcid,
             None,
             config,
-            SideSetup::Server {
-                peer_cid,
-                signing_key: Box::new(signing_key),
-            },
+            SideSetup::Server { peer_cid },
         )
     }
 
-    pub fn new_server_retry(
+    pub(crate) fn new_server_connection_retry(
         initial_dcid: Vec<u8>,
         local_cid: Vec<u8>,
         peer_cid: Vec<u8>,
         original_dcid: Vec<u8>,
         retry_scid: Vec<u8>,
-        signing_key: SigningKey,
         config: Config,
     ) -> Result<Self, ConnectError> {
         config.validate()?;
@@ -701,10 +949,7 @@ impl Conn {
             original_dcid,
             Some(retry_scid),
             config,
-            SideSetup::Server {
-                peer_cid,
-                signing_key: Box::new(signing_key),
-            },
+            SideSetup::Server { peer_cid },
         )
     }
 
@@ -733,15 +978,12 @@ impl Conn {
             stateless_reset_secret,
             require_address_validation: _,
             retry_token_secret: _,
-            ticket_secret,
+            ticket_secret: _,
             resumption,
             enable_early_data,
-            accept_early_data,
             resumption_peer_tp,
             alpn_protocols,
-            server_cert_chain,
-            early_data_replay_cache,
-            client_authentication,
+            server_cert_chain: _,
             client_cert,
             max_pmtu,
         } = config;
@@ -805,10 +1047,7 @@ impl Conn {
                     .map_err(|_| ConnectError::InvalidConfig)?,
                 )
             }
-            SideSetup::Server {
-                peer_cid,
-                signing_key,
-            } => {
+            SideSetup::Server { peer_cid } => {
                 user_tp.stateless_reset_token =
                     stateless_reset_secret.map(|s| StatelessResetSecret(s).token_for(&local_cid));
                 let tp_bytes = Self::local_tp_bytes(
@@ -818,34 +1057,11 @@ impl Conn {
                     retry_scid.as_deref(),
                     user_tp,
                 )?;
-                let cfg = server::Config {
-                    source: match server_cert_chain {
-                        Some(chain_der) => CertSource::X509 {
-                            chain_der,
-                            signing_key: *signing_key,
-                        },
-                        None => CertSource::RawPublicKey {
-                            signing_key: *signing_key,
-                        },
-                    },
+                let cfg = server::ConnectionConfig {
                     transport_params: tp_bytes,
-                    alpn_protocols,
-                    ticket_keys: ticket_secret.map(TicketKeys::single),
-                    accept_early_data,
                 };
-                let store = early_data_replay_cache.unwrap_or_default();
-                let guard = EarlyDataReplayGuard::new(store);
                 let clock = WallClock::now_millis as TlsClock;
-                let server = match client_authentication {
-                    Some(ca) => ServerSide::Mtls(Server::with_early_data_guard_and_client_auth(
-                        cfg,
-                        clock,
-                        guard,
-                        ca.mode,
-                        DynVerifier(ca.verifier),
-                    )),
-                    None => ServerSide::Plain(Server::with_early_data_guard(cfg, clock, guard)),
-                };
+                let server = Server::new(cfg, clock);
                 (
                     SideKind::Server(Box::new(server)),
                     false,
@@ -998,7 +1214,40 @@ impl Conn {
         Ok(())
     }
 
+    pub(crate) fn is_client(&self) -> bool {
+        self.is_client
+    }
+
     pub fn recv_packet(&mut self, wire: &[u8], now: Instant) -> Result<(), ConnError> {
+        self.recv_packet_with(wire, now, &mut |side, epoch, data| {
+            side.read_client(epoch, data)
+        })
+    }
+
+    pub(crate) fn recv_packet_server<G, V>(
+        &mut self,
+        wire: &[u8],
+        now: Instant,
+        shard: &mut Shard<G, V>,
+    ) -> Result<(), ConnError>
+    where
+        G: EarlyDataGuard,
+        V: ClientCertVerifier,
+    {
+        self.recv_packet_with(wire, now, &mut |side, epoch, data| {
+            side.read_server(epoch, data, shard)
+        })
+    }
+
+    fn recv_packet_with<R>(
+        &mut self,
+        wire: &[u8],
+        now: Instant,
+        read: &mut R,
+    ) -> Result<(), ConnError>
+    where
+        R: FnMut(&mut SideKind, shin::Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+    {
         if !self.peer_address_validated {
             self.amplification_received = self
                 .amplification_received
@@ -1014,7 +1263,7 @@ impl Conn {
                 if first & 0x40 == 0 {
                     break;
                 }
-                self.recv_one_rtt(rest, now)?;
+                self.recv_one_rtt(rest, now, read)?;
                 break;
             }
             if first & 0x30 == 0x30 {
@@ -1043,16 +1292,19 @@ impl Conn {
             }
             let pkt = &rest[..plen];
             match first & 0x30 {
-                0x00 => self.recv_initial(pkt, now)?,
-                0x10 => self.recv_zero_rtt(pkt, now)?,
-                _ => self.recv_handshake(pkt, now)?,
+                0x00 => self.recv_initial(pkt, now, read)?,
+                0x10 => self.recv_zero_rtt(pkt, now, read)?,
+                _ => self.recv_handshake(pkt, now, read)?,
             }
             rest = &rest[plen..];
         }
         Ok(())
     }
 
-    fn recv_zero_rtt(&mut self, wire: &[u8], now: Instant) -> Result<(), ConnError> {
+    fn recv_zero_rtt<R>(&mut self, wire: &[u8], now: Instant, read: &mut R) -> Result<(), ConnError>
+    where
+        R: FnMut(&mut SideKind, shin::Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+    {
         let Some(zr) = self.zero_rtt_r.as_ref() else {
             return Ok(());
         };
@@ -1065,7 +1317,9 @@ impl Conn {
             .decrypt_long_in_place(&mut buf, prefix.pn_offset, expected)
             .map_err(|_| ConnError::PacketDecrypt);
         let result = match decrypted {
-            Ok((pn, body)) => self.process_packet_body(Epoch::Application, pn, &buf[body], now),
+            Ok((pn, body)) => {
+                self.process_packet_body(Epoch::Application, pn, &buf[body], now, read)
+            }
             Err(error) => Err(error),
         };
         buf.clear();
@@ -1479,7 +1733,10 @@ impl Conn {
         Ok(id)
     }
 
-    fn recv_initial(&mut self, wire: &[u8], now: Instant) -> Result<(), ConnError> {
+    fn recv_initial<R>(&mut self, wire: &[u8], now: Instant, read: &mut R) -> Result<(), ConnError>
+    where
+        R: FnMut(&mut SideKind, shin::Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+    {
         let Some(initial_r) = self.initial_r.as_ref() else {
             return Ok(());
         };
@@ -1496,7 +1753,7 @@ impl Conn {
             .decrypt_long_in_place(&mut buf, prefix.pn_offset, expected)
             .map_err(|_| ConnError::PacketDecrypt);
         let result = match decrypted {
-            Ok((pn, body)) => self.process_packet_body(Epoch::Initial, pn, &buf[body], now),
+            Ok((pn, body)) => self.process_packet_body(Epoch::Initial, pn, &buf[body], now, read),
             Err(error) => Err(error),
         };
         buf.clear();
@@ -1504,7 +1761,15 @@ impl Conn {
         result
     }
 
-    fn recv_handshake(&mut self, wire: &[u8], now: Instant) -> Result<(), ConnError> {
+    fn recv_handshake<R>(
+        &mut self,
+        wire: &[u8],
+        now: Instant,
+        read: &mut R,
+    ) -> Result<(), ConnError>
+    where
+        R: FnMut(&mut SideKind, shin::Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+    {
         let Some(hr) = self.handshake_r.as_ref() else {
             return Ok(());
         };
@@ -1519,7 +1784,7 @@ impl Conn {
         let result = match decrypted {
             Ok((pn, body)) => {
                 self.peer_address_validated = true;
-                self.process_packet_body(Epoch::Handshake, pn, &buf[body], now)
+                self.process_packet_body(Epoch::Handshake, pn, &buf[body], now, read)
             }
             Err(error) => Err(error),
         };
@@ -1528,7 +1793,10 @@ impl Conn {
         result
     }
 
-    fn recv_one_rtt(&mut self, wire: &[u8], now: Instant) -> Result<(), ConnError> {
+    fn recv_one_rtt<R>(&mut self, wire: &[u8], now: Instant, read: &mut R) -> Result<(), ConnError>
+    where
+        R: FnMut(&mut SideKind, shin::Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+    {
         let Some(ar) = self.app_r.as_ref() else {
             return Ok(());
         };
@@ -1541,7 +1809,9 @@ impl Conn {
             .decrypt_short_in_place(&mut buf, pn_offset, expected)
             .map_err(|_| ConnError::PacketDecrypt);
         let result = match decrypted {
-            Ok((pn, body)) => self.process_packet_body(Epoch::Application, pn, &buf[body], now),
+            Ok((pn, body)) => {
+                self.process_packet_body(Epoch::Application, pn, &buf[body], now, read)
+            }
             Err(error) => Err(error),
         };
         buf.clear();
@@ -1549,13 +1819,17 @@ impl Conn {
         result
     }
 
-    fn process_packet_body(
+    fn process_packet_body<R>(
         &mut self,
         epoch: Epoch,
         pn: u64,
         body: &[u8],
         now: Instant,
-    ) -> Result<(), ConnError> {
+        read: &mut R,
+    ) -> Result<(), ConnError>
+    where
+        R: FnMut(&mut SideKind, shin::Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+    {
         if self.spaces[epoch as usize].has_received(pn) {
             return Ok(());
         }
@@ -1636,11 +1910,14 @@ impl Conn {
                         for msg in msgs {
                             if self.pending_synth_eod && epoch == Epoch::Handshake {
                                 self.pending_synth_eod = false;
-                                let evs = self
-                                    .feed_shin(shin::Epoch::EarlyData, &[0x05, 0x00, 0x00, 0x00])?;
+                                let evs = self.feed_shin(
+                                    shin::Epoch::EarlyData,
+                                    &[0x05, 0x00, 0x00, 0x00],
+                                    read,
+                                )?;
                                 self.absorb_shin_events(evs)?;
                             }
-                            let evs = self.feed_shin(shin_epoch, &msg)?;
+                            let evs = self.feed_shin(shin_epoch, &msg, read)?;
                             self.absorb_shin_events(evs)?;
                         }
                     }
@@ -2204,8 +2481,16 @@ impl Conn {
         true
     }
 
-    fn feed_shin(&mut self, epoch: shin::Epoch, data: &[u8]) -> Result<Vec<Event>, ConnError> {
-        let events = self.side.read(epoch, data).map_err(|_| ConnError::Tls)?;
+    fn feed_shin<R>(
+        &mut self,
+        epoch: shin::Epoch,
+        data: &[u8],
+        read: &mut R,
+    ) -> Result<Vec<Event>, ConnError>
+    where
+        R: FnMut(&mut SideKind, shin::Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+    {
+        let events = read(&mut self.side, epoch, data).map_err(|_| ConnError::Tls)?;
         if self.state != State::Established
             && let Some(suite) = self.side.negotiated_cipher_suite()
             && suite != CipherSuite::Aes128GcmSha256

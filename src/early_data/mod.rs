@@ -1,7 +1,5 @@
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::rc::Rc;
 
 use crate::clock::WallClock;
 use shin::server::EarlyDataGuard;
@@ -83,42 +81,8 @@ impl Default for EarlyDataReplayCache {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct SharedEarlyDataReplayCache(Rc<RefCell<EarlyDataReplayCache>>);
-
-impl SharedEarlyDataReplayCache {
-    pub fn new() -> Self {
-        Self(Rc::new(RefCell::new(EarlyDataReplayCache::new())))
-    }
-
-    pub fn with_capacity(capacity: usize) -> Result<Self, ReplayCacheError> {
-        Ok(Self(Rc::new(RefCell::new(
-            EarlyDataReplayCache::with_capacity(capacity)?,
-        ))))
-    }
-}
-
-impl Default for SharedEarlyDataReplayCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub(crate) struct EarlyDataReplayGuard {
-    store: SharedEarlyDataReplayCache,
-}
-
-impl EarlyDataReplayGuard {
-    pub(crate) fn new(store: SharedEarlyDataReplayCache) -> Self {
-        Self { store }
-    }
-}
-
-impl EarlyDataGuard for EarlyDataReplayGuard {
+impl EarlyDataGuard for EarlyDataReplayCache {
     fn register(&mut self, token: &[u8]) -> bool {
-        self.store
-            .0
-            .borrow_mut()
-            .register(token, WallClock::now_millis())
+        self.register(token, WallClock::now_millis())
     }
 }

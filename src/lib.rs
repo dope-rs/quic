@@ -35,10 +35,13 @@ mod stream;
 pub mod transport_params;
 pub mod varint;
 
-pub use client::{BackoffPolicy, Client, EndpointSpec, Protocol, SlotId};
+pub use client::{
+    BackoffPolicy, Client, ClientConfigProvider, EndpointSpec, Protocol, SlotId, StaticClientConfig,
+};
 pub use conn::{
-    ClientAuthentication, Conn, ConnError, ConnHandle, DatagramCongestionControl, SessionTicket,
-    State as ConnState, StreamError, StreamEvent,
+    Conn, ConnError, ConnHandle, DatagramCongestionControl, Mutual, MutualAuthentication,
+    ServerConn, ServerPolicy, SessionTicket, Standard, State as ConnState, StreamError,
+    StreamEvent,
 };
 pub use endpoint::Endpoint;
 pub use errors::{ConnectError, TrySendError};

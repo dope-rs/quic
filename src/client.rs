@@ -41,6 +41,18 @@ pub trait Protocol: 'static {
     fn close(&mut self, slot: SlotId);
 }
 
+pub trait ClientConfigProvider: 'static {
+    fn config(&mut self, slot: SlotId) -> Option<conn::Config>;
+}
+
+pub struct StaticClientConfig(conn::Config);
+
+impl ClientConfigProvider for StaticClientConfig {
+    fn config(&mut self, _slot: SlotId) -> Option<conn::Config> {
+        self.0.duplicate_connection().ok()
+    }
+}
+
 #[derive(Clone)]
 pub struct EndpointSpec {
     pub addr: SocketAddr,
@@ -133,19 +145,25 @@ impl<P: Protocol> Handler for Bridge<P> {
 }
 
 #[pin_project]
-pub struct Client<'d, const ID: u8, P: Protocol, B: BackoffPolicy> {
+pub struct Client<
+    'd,
+    const ID: u8,
+    P: Protocol,
+    B: BackoffPolicy,
+    C: ClientConfigProvider = StaticClientConfig,
+> {
     #[pin]
     inner: Endpoint<'d, ID, Bridge<P>>,
     endpoints: Vec<EndpointSlot>,
     retries: IndexedMinHeap<Instant>,
     backoff: B,
-    client_config: conn::Config,
+    config_provider: C,
     event_budget: usize,
     retry_budget: usize,
     dcid_seed: u64,
 }
 
-impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Client<'d, ID, P, B> {
+impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Client<'d, ID, P, B, StaticClientConfig> {
     pub fn build(
         bind: SocketAddr,
         endpoints: Vec<EndpointSpec>,
@@ -155,10 +173,40 @@ impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Client<'d, ID, P, B> {
         config: Config,
         driver: &mut DriverContext<'_, 'd>,
     ) -> io::Result<Self> {
-        let endpoint_config = config.endpoint.validate()?;
         client_config
             .validate()
             .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+        client_config
+            .duplicate_connection()
+            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+        Self::build_with_config_provider(
+            bind,
+            endpoints,
+            StaticClientConfig(client_config),
+            protocol,
+            backoff,
+            config,
+            driver,
+        )
+    }
+}
+
+impl<'d, const ID: u8, P, B, C> Client<'d, ID, P, B, C>
+where
+    P: Protocol,
+    B: BackoffPolicy,
+    C: ClientConfigProvider,
+{
+    pub fn build_with_config_provider(
+        bind: SocketAddr,
+        endpoints: Vec<EndpointSpec>,
+        config_provider: C,
+        protocol: P,
+        backoff: B,
+        config: Config,
+        driver: &mut DriverContext<'_, 'd>,
+    ) -> io::Result<Self> {
+        let endpoint_config = config.endpoint.validate()?;
         if config.event_budget == 0
             || config.event_budget > crate::mux::MAX_OUTGOING_CAPACITY
             || config.retry_budget == 0
@@ -208,7 +256,7 @@ impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Client<'d, ID, P, B> {
             endpoints,
             retries,
             backoff,
-            client_config,
+            config_provider,
             event_budget: config.event_budget,
             retry_budget: config.retry_budget,
             dcid_seed: u64::from_ne_bytes(seed),
@@ -277,7 +325,15 @@ impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Client<'d, ID, P, B> {
         };
         *this.dcid_seed = this.dcid_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let dcid = this.dcid_seed.to_be_bytes().to_vec();
-        let config = this.client_config.clone();
+        let Some(config) = this.config_provider.config(slot) else {
+            if let Some(endpoint) = this.endpoints.get_mut(index) {
+                endpoint.attempt = endpoint.attempt.saturating_add(1);
+                let retry_at = this.backoff.next_retry_at(endpoint.attempt, Instant::now());
+                this.retries.remove(index);
+                let _ = this.retries.insert(index, retry_at);
+            }
+            return false;
+        };
         let Ok(handle) = this
             .inner
             .as_mut()
@@ -308,7 +364,12 @@ impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Client<'d, ID, P, B> {
     }
 }
 
-impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Manifold<'d> for Client<'d, ID, P, B> {
+impl<'d, const ID: u8, P, B, C> Manifold<'d> for Client<'d, ID, P, B, C>
+where
+    P: Protocol,
+    B: BackoffPolicy,
+    C: ClientConfigProvider,
+{
     const ID: u8 = ID;
 
     fn dispatch(mut self: Pin<&mut Self>, ev: dope::Event<'d>, driver: &mut DriverContext<'_, 'd>) {

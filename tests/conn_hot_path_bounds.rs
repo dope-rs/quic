@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use dope_quic::{Conn, conn, transport_params};
+use dope_quic::{Conn, ServerConn, conn, transport_params};
 use shin::sig::SigningKey;
 
 const CID: [u8; 8] = [0x8b; 8];
@@ -19,7 +19,7 @@ fn config() -> conn::Config {
     }
 }
 
-fn established() -> (Conn, Conn, Instant) {
+fn established() -> (Conn, ServerConn, Instant) {
     let signing = SigningKey::from_seed(&[0x7d; 32]).unwrap();
     let public_key = *signing.pubkey().unwrap();
     let mut server =

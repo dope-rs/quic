@@ -41,8 +41,10 @@ fn bidirectional_data_fin_and_events_cross_the_connection() {
 
 #[test]
 fn reading_releases_stream_flow_control_credit() {
-    let config = support::config_with_credit(5, 1 << 20, 8, 8);
-    let (mut server, mut client) = support::connected_pair_with(config.clone(), config);
+    let (mut server, mut client) = support::connected_pair_with(
+        support::config_with_credit(5, 1 << 20, 8, 8),
+        support::config_with_credit(5, 1 << 20, 8, 8),
+    );
     let stream = server.open_bidi_stream().unwrap();
     server.stream_send(stream, b"abcdefghij").unwrap();
     let now = Instant::now();
@@ -74,8 +76,10 @@ fn stop_sending_returns_a_reset_with_the_same_error() {
 
 #[test]
 fn peer_stream_limits_are_enforced_by_the_allocator() {
-    let config = support::config_with_credit(1 << 20, 1 << 20, 1, 0);
-    let (_, mut client) = support::connected_pair_with(config.clone(), config);
+    let (_, mut client) = support::connected_pair_with(
+        support::config_with_credit(1 << 20, 1 << 20, 1, 0),
+        support::config_with_credit(1 << 20, 1 << 20, 1, 0),
+    );
     assert_eq!(client.open_bidi_stream(), Ok(0));
     assert_eq!(client.open_bidi_stream(), Err(StreamError::PeerLimit));
     assert_eq!(client.open_uni_stream(), Err(StreamError::PeerLimit));

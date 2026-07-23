@@ -6,10 +6,10 @@ use dope_quic::{Conn, transport_params};
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
-fn drain(from: &mut Conn, into: &mut Conn) {
+fn drain<R: support::Receiver>(from: &mut Conn, into: &mut R) {
     let now = Instant::now();
     for pkt in from.send_packets(now) {
-        into.recv_packet(&pkt, now).expect("recv");
+        into.receive(&pkt, now);
     }
 }
 

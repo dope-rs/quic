@@ -7,12 +7,13 @@ use dope::manifold::Manifold;
 use dope::manifold::datagram::Socket;
 use dope::{Completion as _, DriverContext, Event, EventKind};
 use pin_project::pin_project;
+use shin::server::{ClientCertVerifier, EarlyDataGuard, NoGuard};
 use shin::sig::SigningKey;
+use shin::ticket::TicketKeys;
 
 use crate::ConnectError;
 use crate::TrySendError;
-use crate::conn::{self, Conn, ConnHandle};
-use crate::early_data::SharedEarlyDataReplayCache;
+use crate::conn::{self, Conn, ConnHandle, Mutual, MutualAuthentication, ServerPolicy, Standard};
 use crate::mux::{self, Mux};
 use crate::mux::{MAX_CONNECTIONS, MAX_OUTGOING_BYTES, MAX_OUTGOING_CAPACITY, Outgoing};
 use crate::transport_params;
@@ -21,10 +22,10 @@ use std::io::Error;
 use std::io::ErrorKind;
 
 #[pin_project]
-pub struct Endpoint<'d, const ID: u8, H: mux::Handler> {
+pub struct Endpoint<'d, const ID: u8, H: mux::Handler, P: ServerPolicy = Standard> {
     #[pin]
     udp: Socket<'d, ID>,
-    mux: Mux<H>,
+    mux: Mux<H, P>,
     packet_buffer_bytes: u32,
     completion_budget: usize,
     flush_budget: usize,
@@ -67,7 +68,7 @@ impl Config {
     }
 }
 
-impl<'d, const ID: u8, H: mux::Handler> Endpoint<'d, ID, H> {
+impl<'d, const ID: u8, H: mux::Handler> Endpoint<'d, ID, H, Standard> {
     pub fn build_server(
         bind: SocketAddr,
         signing_key: SigningKey,
@@ -95,9 +96,6 @@ impl<'d, const ID: u8, H: mux::Handler> Endpoint<'d, ID, H> {
             .max_pmtu
             .min(u64::from(config.packet_buffer_bytes));
         let udp = Socket::bind(bind, driver)?;
-        if server_config.accept_early_data && server_config.early_data_replay_cache.is_none() {
-            server_config.early_data_replay_cache = Some(SharedEarlyDataReplayCache::new());
-        }
         let mux = Mux::server_with_limits(
             handler,
             signing_key,
@@ -139,7 +137,160 @@ impl<'d, const ID: u8, H: mux::Handler> Endpoint<'d, ID, H> {
             flush_budget: config.flush_budget,
         })
     }
+}
 
+impl<'d, const ID: u8, H, G> Endpoint<'d, ID, H, Standard<G>>
+where
+    H: mux::Handler,
+    G: EarlyDataGuard + 'static,
+{
+    pub fn build_server_with_early_data_guard(
+        bind: SocketAddr,
+        signing_key: SigningKey,
+        server_tp: transport_params::Params,
+        guard: G,
+        handler: H,
+        config: Config,
+        driver: &mut DriverContext<'_, 'd>,
+    ) -> io::Result<Self> {
+        Self::build_server_with_config_and_early_data_guard(
+            bind,
+            signing_key,
+            server_tp.into(),
+            guard,
+            handler,
+            config,
+            driver,
+        )
+    }
+
+    pub fn build_server_with_config_and_early_data_guard(
+        bind: SocketAddr,
+        signing_key: SigningKey,
+        mut server_config: conn::Config,
+        guard: G,
+        handler: H,
+        config: Config,
+        driver: &mut DriverContext<'_, 'd>,
+    ) -> io::Result<Self> {
+        let config = config.validate()?;
+        server_config
+            .validate()
+            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+        server_config.max_pmtu = server_config
+            .max_pmtu
+            .min(u64::from(config.packet_buffer_bytes));
+        let udp = Socket::bind(bind, driver)?;
+        let mux = Mux::server_with_early_data_guard_and_limits(
+            handler,
+            signing_key,
+            server_config,
+            guard,
+            config.max_conns,
+            config.outgoing_capacity,
+            config.outgoing_bytes_capacity,
+        )
+        .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+        Ok(Self {
+            udp,
+            mux,
+            packet_buffer_bytes: config.packet_buffer_bytes,
+            completion_budget: config.completion_budget,
+            flush_budget: config.flush_budget,
+        })
+    }
+}
+
+impl<'d, const ID: u8, H, V> Endpoint<'d, ID, H, Mutual<NoGuard, V>>
+where
+    H: mux::Handler,
+    V: ClientCertVerifier + 'static,
+{
+    pub fn build_server_mutual(
+        bind: SocketAddr,
+        signing_key: SigningKey,
+        mut server_config: conn::Config,
+        authentication: MutualAuthentication<V>,
+        handler: H,
+        config: Config,
+        driver: &mut DriverContext<'_, 'd>,
+    ) -> io::Result<Self> {
+        let config = config.validate()?;
+        server_config
+            .validate()
+            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+        server_config.max_pmtu = server_config
+            .max_pmtu
+            .min(u64::from(config.packet_buffer_bytes));
+        let udp = Socket::bind(bind, driver)?;
+        let mux = Mux::server_mutual_with_limits(
+            handler,
+            signing_key,
+            server_config,
+            authentication,
+            config.max_conns,
+            config.outgoing_capacity,
+            config.outgoing_bytes_capacity,
+        )
+        .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+        Ok(Self {
+            udp,
+            mux,
+            packet_buffer_bytes: config.packet_buffer_bytes,
+            completion_budget: config.completion_budget,
+            flush_budget: config.flush_budget,
+        })
+    }
+}
+
+impl<'d, const ID: u8, H, G, V> Endpoint<'d, ID, H, Mutual<G, V>>
+where
+    H: mux::Handler,
+    G: EarlyDataGuard + 'static,
+    V: ClientCertVerifier + 'static,
+{
+    pub fn build_server_mutual_with_early_data_guard(
+        bind: SocketAddr,
+        signing_key: SigningKey,
+        mut server_config: conn::Config,
+        authentication: MutualAuthentication<V, G>,
+        handler: H,
+        config: Config,
+        driver: &mut DriverContext<'_, 'd>,
+    ) -> io::Result<Self> {
+        let config = config.validate()?;
+        server_config
+            .validate()
+            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+        server_config.max_pmtu = server_config
+            .max_pmtu
+            .min(u64::from(config.packet_buffer_bytes));
+        let udp = Socket::bind(bind, driver)?;
+        let mux = Mux::server_mutual_with_early_data_guard_and_limits(
+            handler,
+            signing_key,
+            server_config,
+            authentication,
+            config.max_conns,
+            config.outgoing_capacity,
+            config.outgoing_bytes_capacity,
+        )
+        .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+        Ok(Self {
+            udp,
+            mux,
+            packet_buffer_bytes: config.packet_buffer_bytes,
+            completion_budget: config.completion_budget,
+            flush_budget: config.flush_budget,
+        })
+    }
+}
+
+impl<'d, const ID: u8, H, P> Endpoint<'d, ID, H, P>
+where
+    H: mux::Handler,
+    P: ServerPolicy,
+{
     pub fn local_addr(&self) -> SocketAddr {
         self.udp.local_addr()
     }
@@ -198,6 +349,10 @@ impl<'d, const ID: u8, H: mux::Handler> Endpoint<'d, ID, H> {
 
     pub fn close(self: Pin<&mut Self>, handle: ConnHandle) {
         self.project().mux.close(handle);
+    }
+
+    pub fn replace_ticket_keys(self: Pin<&mut Self>, keys: Option<TicketKeys>) -> bool {
+        self.project().mux.replace_ticket_keys(keys)
     }
 
     pub fn drive(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
@@ -259,7 +414,11 @@ impl<'d, const ID: u8, H: mux::Handler> Endpoint<'d, ID, H> {
     }
 }
 
-impl<'d, const ID: u8, H: mux::Handler> Manifold<'d> for Endpoint<'d, ID, H> {
+impl<'d, const ID: u8, H, P> Manifold<'d> for Endpoint<'d, ID, H, P>
+where
+    H: mux::Handler,
+    P: ServerPolicy,
+{
     const ID: u8 = ID;
 
     fn dispatch(mut self: Pin<&mut Self>, event: Event<'d>, driver: &mut DriverContext<'_, 'd>) {
@@ -275,11 +434,15 @@ impl<'d, const ID: u8, H: mux::Handler> Manifold<'d> for Endpoint<'d, ID, H> {
     }
 }
 
-fn flush<'d, const ID: u8, H: mux::Handler>(
+fn flush<'d, const ID: u8, H, P>(
     mut sock: Pin<&mut Socket<'d, ID>>,
-    mux: &mut Mux<H>,
+    mux: &mut Mux<H, P>,
     budget: usize,
-) -> usize {
+) -> usize
+where
+    H: mux::Handler,
+    P: ServerPolicy,
+{
     let now = Instant::now();
     let mut flushed = 0usize;
     while flushed != budget {

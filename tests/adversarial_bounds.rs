@@ -2,18 +2,18 @@ pub mod support;
 
 use std::time::Instant;
 
-use dope_quic::early_data::{EarlyDataReplayCache, SharedEarlyDataReplayCache};
+use dope_quic::early_data::EarlyDataReplayCache;
 use dope_quic::frame::Frame;
 use dope_quic::packet::{InitialHeader, QUIC_V1};
 use dope_quic::packet_protection::PacketProtection;
 use dope_quic::qkdf::{InitialSecrets, PacketKeys};
-use dope_quic::{Conn, ConnError, ConnectError, Handler, Mux, conn};
+use dope_quic::{Conn, ConnError, ConnectError, Handler, Mux, ServerConn, conn};
 
 const INITIAL_DCID: [u8; 8] = [0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce];
 const CLIENT_SCID: [u8; 4] = [1, 2, 3, 4];
 const SERVER_CID: [u8; 8] = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
 
-fn server() -> Conn {
+fn server() -> ServerConn {
     Conn::new_server(
         INITIAL_DCID.to_vec(),
         SERVER_CID.to_vec(),
@@ -40,7 +40,6 @@ impl Handler for Noop {}
 #[test]
 fn allocation_constructors_reject_unsupported_capacities() {
     assert!(EarlyDataReplayCache::with_capacity(usize::MAX).is_err());
-    assert!(SharedEarlyDataReplayCache::with_capacity(usize::MAX).is_err());
     assert_eq!(
         Mux::client_with_limits(Noop, 0, 1, 1).err(),
         Some(ConnectError::InvalidConfig)

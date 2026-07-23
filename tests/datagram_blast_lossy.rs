@@ -2,7 +2,7 @@ pub mod support;
 
 use std::time::{Duration, Instant};
 
-use dope_quic::{Conn, DatagramCongestionControl, conn, transport_params};
+use dope_quic::{Conn, DatagramCongestionControl, ServerConn, conn, transport_params};
 
 const CID: [u8; 8] = [0x88; 8];
 
@@ -30,7 +30,7 @@ fn cfg(mode: DatagramCongestionControl) -> conn::Config {
     }
 }
 
-fn handshake_pair(client_cfg: conn::Config, server_cfg: conn::Config) -> (Conn, Conn) {
+fn handshake_pair(client_cfg: conn::Config, server_cfg: conn::Config) -> (Conn, ServerConn) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
     let mut server = Conn::new_server(

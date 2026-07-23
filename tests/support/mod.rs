@@ -1,7 +1,8 @@
 use dope_quic::packet::{InitialHeader, QUIC_V1};
 use dope_quic::packet_protection::PacketProtection;
 use dope_quic::qkdf::{InitialSecrets, PacketKeys};
-use dope_quic::{Conn, conn, transport_params};
+use dope_quic::{Conn, ServerConn, conn, transport_params};
+use shin::server::{ClientCertVerifier, EarlyDataGuard};
 use shin::sig::SigningKey;
 use std::time::Instant;
 
@@ -36,14 +37,34 @@ pub fn config_with_credit(
     }
 }
 
-pub fn connected_pair() -> (Conn, Conn) {
+pub trait Receiver {
+    fn receive(&mut self, packet: &[u8], now: Instant);
+}
+
+impl Receiver for Conn {
+    fn receive(&mut self, packet: &[u8], now: Instant) {
+        self.recv_packet(packet, now).unwrap();
+    }
+}
+
+impl<G, V> Receiver for ServerConn<G, V>
+where
+    G: EarlyDataGuard,
+    V: ClientCertVerifier,
+{
+    fn receive(&mut self, packet: &[u8], now: Instant) {
+        self.recv_packet(packet, now).unwrap();
+    }
+}
+
+pub fn connected_pair() -> (ServerConn, Conn) {
     connected_pair_with(config(), config())
 }
 
 pub fn connected_pair_with(
     server_config: conn::Config,
     client_config: conn::Config,
-) -> (Conn, Conn) {
+) -> (ServerConn, Conn) {
     let cid = vec![0x71; 8];
     let signing = signing_key(0x39);
     let public_key = *signing.pubkey().unwrap();
@@ -65,9 +86,9 @@ pub fn connected_pair_with(
     (server, client)
 }
 
-pub fn transfer(from: &mut Conn, into: &mut Conn, now: Instant) {
+pub fn transfer<R: Receiver>(from: &mut Conn, into: &mut R, now: Instant) {
     for packet in from.send_packets(now) {
-        into.recv_packet(&packet, now).unwrap();
+        into.receive(&packet, now);
     }
 }
 

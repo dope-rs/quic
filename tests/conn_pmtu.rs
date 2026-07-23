@@ -2,7 +2,7 @@ pub mod support;
 
 use std::time::Instant;
 
-use dope_quic::{Conn, TrySendError, transport_params};
+use dope_quic::{Conn, ServerConn, TrySendError, transport_params};
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
@@ -15,7 +15,7 @@ fn user_tp(max_datagram: u64) -> dope_quic::conn::Config {
     .into()
 }
 
-fn pair(client_max: u64, server_max: u64) -> (Conn, Conn) {
+fn pair(client_max: u64, server_max: u64) -> (ServerConn, Conn) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
     let server = Conn::new_server(
@@ -36,17 +36,11 @@ fn pair(client_max: u64, server_max: u64) -> (Conn, Conn) {
     (server, client)
 }
 
-fn drain(from: &mut Conn, into: &mut Conn, now: Instant) {
-    for pkt in from.send_packets(now) {
-        into.recv_packet(&pkt, now).expect("recv");
-    }
-}
-
-fn complete_handshake(server: &mut Conn, client: &mut Conn, now: Instant) {
-    drain(client, server, now);
-    drain(server, client, now);
-    drain(client, server, now);
-    drain(server, client, now);
+fn complete_handshake(server: &mut ServerConn, client: &mut Conn, now: Instant) {
+    support::transfer(client, server, now);
+    support::transfer(server, client, now);
+    support::transfer(client, server, now);
+    support::transfer(server, client, now);
 }
 
 #[test]

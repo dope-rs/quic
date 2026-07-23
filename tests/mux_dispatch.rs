@@ -216,14 +216,13 @@ fn client_egress_stops_at_fixed_capacity_without_dropping_conn_work() {
     let handler = CapturingHandler::default();
     let mut client = Mux::client_with_outgoing_capacity(handler, 2).unwrap();
     let addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
-    let config = dope_quic::conn::Config::default();
     let handles = (0..4)
         .map(|index| {
             client
                 .connect(
                     addr,
                     [7; 32],
-                    config.clone(),
+                    dope_quic::conn::Config::default(),
                     vec![index as u8; 8],
                     Instant::now(),
                 )
@@ -244,7 +243,6 @@ fn client_egress_stops_at_fixed_capacity_without_dropping_conn_work() {
 #[test]
 fn client_egress_byte_budget_uses_encoded_packet_sizes() {
     let addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
-    let config = dope_quic::conn::Config::default();
     let mut tight =
         Mux::client_with_outgoing_limits(CapturingHandler::default(), 4, 4 * 1200).unwrap();
     for index in 0..4 {
@@ -252,7 +250,7 @@ fn client_egress_byte_budget_uses_encoded_packet_sizes() {
             .connect(
                 addr,
                 [7; 32],
-                config.clone(),
+                dope_quic::conn::Config::default(),
                 vec![index; 8],
                 Instant::now(),
             )
@@ -267,7 +265,7 @@ fn client_egress_byte_budget_uses_encoded_packet_sizes() {
             .connect(
                 addr,
                 [7; 32],
-                config.clone(),
+                dope_quic::conn::Config::default(),
                 index.to_be_bytes().repeat(4),
                 Instant::now(),
             )
@@ -302,12 +300,23 @@ fn thirteen_hundred_byte_cap_round_robins_two_connections() {
     let mut client =
         Mux::client_with_outgoing_limits(CapturingHandler::default(), 2, 1300).unwrap();
     let addr = "10.0.0.2:443".parse().unwrap();
-    let config = dope_quic::conn::Config::default();
     client
-        .connect(addr, [7; 32], config.clone(), vec![1; 8], Instant::now())
+        .connect(
+            addr,
+            [7; 32],
+            dope_quic::conn::Config::default(),
+            vec![1; 8],
+            Instant::now(),
+        )
         .unwrap();
     client
-        .connect(addr, [7; 32], config, vec![2; 8], Instant::now())
+        .connect(
+            addr,
+            [7; 32],
+            dope_quic::conn::Config::default(),
+            vec![2; 8],
+            Instant::now(),
+        )
         .unwrap();
     assert_eq!(client.active_conns(), 2);
     assert_eq!(client.outgoing_len(), 1);

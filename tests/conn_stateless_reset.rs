@@ -3,14 +3,14 @@ pub mod support;
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use dope_quic::{Conn, Handler, Mux, conn, transport_params};
+use dope_quic::{Conn, Handler, Mux, ServerConn, conn, transport_params};
 
 const CID: [u8; 8] = [0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55];
 
-fn drain(from: &mut Conn, into: &mut Conn) {
+fn drain<R: support::Receiver>(from: &mut Conn, into: &mut R) {
     let now = Instant::now();
     for pkt in from.send_packets(now) {
-        into.recv_packet(&pkt, now).expect("recv");
+        into.receive(&pkt, now);
     }
 }
 
@@ -27,7 +27,7 @@ fn cfg(secret: Option<[u8; 32]>) -> conn::Config {
     }
 }
 
-fn handshake(server_cfg: conn::Config, client_cfg: conn::Config) -> (Conn, Conn) {
+fn handshake(server_cfg: conn::Config, client_cfg: conn::Config) -> (ServerConn, Conn) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
 
