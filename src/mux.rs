@@ -583,6 +583,9 @@ impl<H: Handler> Mux<H> {
                 }
             }
             None => {
+                if self.receive_stateless_reset(from, data, now) {
+                    return Ok(());
+                }
                 self.emit_stateless_reset(from, data);
                 return Ok(());
             }
@@ -1436,6 +1439,24 @@ impl<H: Handler> Mux<H> {
         }
         let reset = Self::build_stateless_reset(secret.token_for(dcid), len);
         self.push_checked_packet(from, reset, packet_ceiling)
+    }
+
+    fn receive_stateless_reset(&mut self, from: SocketAddr, datagram: &[u8], now: Instant) -> bool {
+        let matched = self
+            .entries
+            .iter_mut()
+            .enumerate()
+            .find_map(|(index, entry)| {
+                let slot = entry.slot_mut()?;
+                (slot.peer_addr == from && slot.conn.try_receive_stateless_reset(datagram))
+                    .then_some(index)
+            });
+        let Some(index) = matched else {
+            return false;
+        };
+        let handle = self.handle_for_index(index);
+        self.refresh_deadline(handle, now);
+        true
     }
 
     fn gen_cid(&mut self, len: usize, prefix: Option<u8>) -> Vec<u8> {

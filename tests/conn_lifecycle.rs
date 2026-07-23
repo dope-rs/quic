@@ -110,6 +110,27 @@ fn activity_resets_idle_timer() {
 }
 
 #[test]
+fn repeated_sends_without_receive_do_not_defer_idle_timeout() {
+    let (mut server, mut client) = build_pair(100);
+    let t0 = Instant::now();
+    complete_handshake(&mut server, &mut client, t0);
+
+    let first_send = t0 + Duration::from_millis(80);
+    client.try_send_datagram(b"first".to_vec()).unwrap();
+    assert!(!client.send_packets(first_send).is_empty());
+
+    let later_send = t0 + Duration::from_millis(150);
+    client.try_send_datagram(b"second".to_vec()).unwrap();
+    assert!(!client.send_packets(later_send).is_empty());
+
+    client.check_loss(first_send + Duration::from_millis(101));
+    assert!(
+        client.is_closed(),
+        "only the first ack-eliciting send after a receive may restart idle timeout",
+    );
+}
+
+#[test]
 fn server_discards_handshake_keys_after_handshake_done_send() {
     let (mut server, mut client) = build_pair(30_000);
     let t0 = Instant::now();

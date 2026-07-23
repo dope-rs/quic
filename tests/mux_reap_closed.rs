@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use dope_quic::{Conn, ConnHandle, Handler, Mux, TrySendError, transport_params};
+use dope_quic::{Conn, ConnHandle, Handler, Mux, TrySendError, conn, transport_params};
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
@@ -136,6 +136,70 @@ fn idle_timeout_fires_close_via_reap() {
         1,
         "client must fire close exactly once",
     );
+}
+
+#[test]
+fn unknown_dcid_stateless_reset_closes_matching_mux_connection() {
+    let server_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
+    let client_addr: SocketAddr = "10.0.0.1:50000".parse().unwrap();
+    let wrong_addr: SocketAddr = "10.0.0.3:443".parse().unwrap();
+    let signing = support::signing_key(0x39);
+    let server_pubkey = *signing.pubkey().unwrap();
+    let tp = transport_params::Params {
+        max_idle_timeout_ms: 30_000,
+        max_datagram_frame_size: Some(65_535),
+        ..transport_params::Params::default()
+    };
+    let server_h = CapturingHandler::default();
+    let mut server = Mux::server(
+        server_h,
+        signing,
+        conn::Config {
+            transport_params: tp.clone(),
+            stateless_reset_secret: Some([0xA5; 32]),
+            ..conn::Config::default()
+        },
+    )
+    .unwrap();
+    let client_h = CapturingHandler::default();
+    let client_events = client_h.events.clone();
+    let mut client = Mux::client(client_h).unwrap();
+    let now = Instant::now();
+    let handle = complete_handshake(
+        &mut server,
+        &mut client,
+        server_pubkey,
+        tp,
+        server_addr,
+        client_addr,
+        now,
+    );
+    let token = client
+        .conn(handle)
+        .and_then(Conn::peer_transport_params)
+        .and_then(|params| params.stateless_reset_token)
+        .expect("server stateless reset token");
+    let mut reset = vec![0x40; 30];
+    reset[1..9].copy_from_slice(&[0xA7; 8]);
+    let tail = reset.len() - 16;
+    reset[tail..].copy_from_slice(&token);
+
+    client.recv(wrong_addr, &reset, now).unwrap();
+    assert!(
+        client.conn(handle).is_some_and(Conn::is_established),
+        "a token received from an unrelated address must be ignored",
+    );
+
+    client.recv(server_addr, &reset, now).unwrap();
+    assert!(
+        client.conn(handle).is_some_and(Conn::was_stateless_reset),
+        "the mux must route an unknown-DCID reset to the matching connection",
+    );
+    assert!(client.conn(handle).is_some_and(Conn::is_closed));
+
+    client.reap_closed(now);
+    assert!(client.conn(handle).is_none());
+    assert_eq!(client_events.borrow().closed, vec![handle]);
 }
 
 #[test]

@@ -310,6 +310,7 @@ pub struct Conn {
     pending_close: Option<PendingClose>,
 
     last_activity: Instant,
+    ack_eliciting_sent_since_last_receive: bool,
     local_max_idle_timeout: Duration,
 
     peer_address_validated: bool,
@@ -917,6 +918,7 @@ impl Conn {
             handshake_confirmed: false,
             pending_close: None,
             last_activity: Instant::now(),
+            ack_eliciting_sent_since_last_receive: false,
             local_max_idle_timeout: local_idle,
             peer_address_validated,
             amplification_received: 0,
@@ -1002,12 +1004,7 @@ impl Conn {
                 .amplification_received
                 .saturating_add(wire.len() as u64);
         }
-        if self.state == State::Established
-            && wire.first().copied().unwrap_or(0) & 0x80 == 0
-            && self.is_stateless_reset(wire)
-        {
-            self.state = State::Closed;
-            self.stateless_reset_received = true;
+        if self.try_receive_stateless_reset(wire) {
             return Ok(());
         }
         let mut rest = wire;
@@ -1168,21 +1165,29 @@ impl Conn {
     }
 
     fn is_stateless_reset(&self, wire: &[u8]) -> bool {
-        if wire.len() < 22 {
+        if wire.len() < 21 {
             return false;
         }
         let tail = &wire[wire.len() - 16..];
         let mut buf = [0u8; 16];
         buf.copy_from_slice(tail);
+        let mut matched = subtle::Choice::from(0);
         for (_cid, token) in self.peer_cids.values() {
             if *token == [0u8; 16] {
                 continue;
             }
-            if bool::from(buf[..].ct_eq(&token[..])) {
-                return true;
-            }
+            matched |= buf[..].ct_eq(&token[..]);
         }
-        false
+        bool::from(matched)
+    }
+
+    pub(crate) fn try_receive_stateless_reset(&mut self, wire: &[u8]) -> bool {
+        if self.state != State::Established || !self.is_stateless_reset(wire) {
+            return false;
+        }
+        self.state = State::Closed;
+        self.stateless_reset_received = true;
+        true
     }
 
     pub fn was_stateless_reset(&self) -> bool {
@@ -1613,7 +1618,6 @@ impl Conn {
             return Err(error);
         }
         self.spaces[epoch as usize].record_received(pn, ack_eliciting, now);
-        self.last_activity = now;
 
         let shin_epoch = match epoch {
             Epoch::Initial => shin::Epoch::Plaintext,
@@ -1910,6 +1914,10 @@ impl Conn {
         })();
         parsed_frames.clear();
         self.scratch_parsed_frames = parsed_frames;
+        if result.is_ok() {
+            self.last_activity = now;
+            self.ack_eliciting_sent_since_last_receive = false;
+        }
         result
     }
 
@@ -2615,7 +2623,6 @@ impl Conn {
                     if !self.commit_packet(commit, now) {
                         return;
                     }
-                    self.last_activity = now;
                     return;
                 }
             }
@@ -2725,7 +2732,6 @@ impl Conn {
         }
 
         if !sink.is_empty() {
-            self.last_activity = now;
             self.update_loss_timer();
         }
     }
@@ -3157,6 +3163,10 @@ impl Conn {
             if self.pto_probe_allowance == 0 {
                 self.pto_probe_epoch = None;
             }
+        }
+        if commit.ack_eliciting && !self.ack_eliciting_sent_since_last_receive {
+            self.last_activity = now;
+            self.ack_eliciting_sent_since_last_receive = true;
         }
         if commit.close {
             self.pending_close = None;
@@ -4845,7 +4855,16 @@ impl Conn {
             (l, 0) => l,
             (l, p) => l.min(p),
         };
-        Some(Duration::from_millis(effective))
+        let peer_max_ack_delay = if self.state == State::Established {
+            self.peer_transport_params
+                .as_ref()
+                .map(|tp| Duration::from_millis(tp.max_ack_delay_ms))
+                .unwrap_or(Duration::ZERO)
+        } else {
+            Duration::ZERO
+        };
+        let minimum = self.rtt.pto_period(peer_max_ack_delay).saturating_mul(3);
+        Some(Duration::from_millis(effective).max(minimum))
     }
 
     fn idle_deadline(&self) -> Option<Instant> {

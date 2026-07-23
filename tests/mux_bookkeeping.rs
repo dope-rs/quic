@@ -68,7 +68,9 @@ fn deadline_and_close_bookkeeping_do_not_allocate() {
         black_box(mux.next_deadline(now));
         mux.reap_closed(now);
     }
-    mux.reap_closed(deadline + Duration::from_millis(1));
+    // RFC 9000 requires the effective idle timeout to be at least 3×PTO, so the
+    // first deadline can be a loss timer rather than the configured 1ms idle timer.
+    mux.reap_closed(deadline + Duration::from_secs(5));
     COUNTING.store(false, Ordering::Relaxed);
 
     assert_eq!(mux.active_conns(), 0);

@@ -135,6 +135,24 @@ fn matching_srt_in_tail_closes_conn_and_surfaces_flag() {
 }
 
 #[test]
+fn minimum_length_reset_is_accepted_regardless_of_header_form() {
+    let secret = [0xC3u8; 32];
+    let (_server, mut client) = handshake(cfg(Some(secret)), cfg(None));
+    let token = client
+        .peer_transport_params()
+        .and_then(|params| params.stateless_reset_token)
+        .expect("peer stateless reset token");
+    let mut reset = vec![0xC0; 21];
+    let tail = reset.len() - 16;
+    reset[tail..].copy_from_slice(&token);
+
+    client.recv_packet(&reset, Instant::now()).unwrap();
+
+    assert!(client.was_stateless_reset());
+    assert!(client.is_closed());
+}
+
+#[test]
 fn unrecognised_tail_does_not_trigger_reset() {
     let secret = [0xC2u8; 32];
     let (_server, mut client) = handshake(cfg(Some(secret)), cfg(None));
