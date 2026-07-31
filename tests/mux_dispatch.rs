@@ -163,6 +163,7 @@ fn accept_flood_is_bounded_by_max_conns() {
     use dope_quic::packet::{InitialHeader, QUIC_V1};
     use dope_quic::packet_protection::PacketProtection;
     use dope_quic::qkdf::{InitialSecrets, PacketKeys};
+    use dope_quic::varint::VarInt;
 
     let signing = support::signing_key(0x39);
     let user_tp = transport_params::Params {
@@ -182,7 +183,7 @@ fn accept_flood_is_bounded_by_max_conns() {
         let prot = PacketProtection::aes_128(&keys).unwrap();
         let mut frames = Vec::new();
         Frame::Crypto {
-            offset: 0,
+            offset: VarInt::ZERO,
             data: vec![0u8; 16],
         }
         .encode(&mut frames)

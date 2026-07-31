@@ -5,9 +5,10 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
-use dope::runtime::Executor;
+use dope::runtime::executor::Executor;
 use dope::{Completion as _, DriverContext, driver};
-use dope_quic::{Conn, ConnHandle, Endpoint, Handler, endpoint, transport_params};
+use dope_quic::{Conn, ConnHandle, Endpoint, Handler, Standard, conn, endpoint, transport_params};
+use shin::server::config::NoGuard;
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 const MAX_TICKS: usize = 100;
@@ -84,10 +85,11 @@ fn quic_datagram_handshake_completes_on_loopback() {
             let server_handler = CapturingHandler::default();
             let server_events = server_handler.events.clone();
             let mut server = std::pin::pin!(
-                Endpoint::build_server(
+                Endpoint::<'_, 0, CapturingHandler, Standard>::build_server_with_policy(
                     "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
                     signing,
-                    user_tp.clone(),
+                    conn::Config::from(user_tp.clone()),
+                    NoGuard,
                     server_handler,
                     ENDPOINT,
                     &mut server_drv,

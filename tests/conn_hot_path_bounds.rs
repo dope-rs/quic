@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use dope_quic::{Conn, ServerConn, conn, transport_params};
-use shin::sig::SigningKey;
+use shin::crypto::sig::SigningKey;
 
 const CID: [u8; 8] = [0x8b; 8];
 

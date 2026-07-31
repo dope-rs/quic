@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use crate::clock::WallClock;
-use shin::server::EarlyDataGuard;
+use shin::server::config::EarlyDataGuard;
 
 const REPLAY_WINDOW_MS: u64 = 7_200_000;
 const MAX_REPLAY_CAPACITY: usize = 65_536;

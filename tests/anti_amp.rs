@@ -3,7 +3,7 @@ pub mod support;
 use std::time::Instant;
 
 use dope_quic::{Conn, transport_params};
-use shin::sig::SigningKey;
+use shin::crypto::sig::SigningKey;
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 

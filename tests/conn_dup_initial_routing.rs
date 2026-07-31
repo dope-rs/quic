@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use dope_quic::packet::{InitialHeader, QUIC_V1};
 use dope_quic::{Handler, Mux, conn, transport_params};
-use shin::sig::SigningKey;
+use shin::crypto::sig::SigningKey;
 
 #[derive(Default)]
 struct NoopHandler;

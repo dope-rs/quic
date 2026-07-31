@@ -6,7 +6,8 @@ use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use dope::runtime::{Dispatcher, Executor};
+use dope::runtime::dispatcher::Dispatcher;
+use dope::runtime::executor::Executor;
 use dope::{Completion as _, DriverContext, driver};
 use dope_quic::{
     BackoffPolicy, Client, Conn, ConnHandle, Endpoint, EndpointSpec, Handler, Protocol, SlotId,

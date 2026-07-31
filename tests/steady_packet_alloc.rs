@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use dope_quic::conn::PacketBatch;
 use dope_quic::{Conn, ServerConn, conn, transport_params};
-use shin::sig::SigningKey;
+use shin::crypto::sig::SigningKey;
 
 struct CountingAllocator;
 

@@ -2,7 +2,8 @@ pub mod support;
 
 use std::time::Instant;
 
-use dope_quic::{StreamError, StreamEvent};
+use dope_quic::{SendBuffer, StreamError, StreamEvent};
+use o3::buffer::{Bytes, Retained, Shared};
 
 #[test]
 fn bidirectional_data_fin_and_events_cross_the_connection() {
@@ -83,6 +84,30 @@ fn owned_receive_moves_each_batch_and_releases_flow_control_credit() {
         client.stream_recv_owned(stream).as_deref(),
         Some(&b"fghij"[..])
     );
+}
+
+#[test]
+fn inline_and_retained_segments_cross_as_one_stream() {
+    let (mut server, mut client) = support::connected_pair();
+    let stream = server.open_bidi_stream().unwrap();
+    server
+        .stream_send_buffer(stream, SendBuffer::inline(b"frame-").unwrap())
+        .unwrap();
+    server
+        .stream_send_buffer(
+            stream,
+            SendBuffer::Retained(Bytes::<Retained>::from(Shared::from_static(b"body"))),
+        )
+        .unwrap();
+    server.stream_send_fin(stream).unwrap();
+
+    support::transfer(&mut server, &mut client, Instant::now());
+
+    assert_eq!(
+        client.stream_recv_owned(stream).as_deref(),
+        Some(&b"frame-body"[..])
+    );
+    assert!(client.stream_recv_eof(stream));
 }
 
 #[test]

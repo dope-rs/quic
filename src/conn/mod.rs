@@ -3,8 +3,8 @@ use std::ops::Bound::{Excluded, Unbounded};
 use std::ops::{Deref, DerefMut, Range};
 use std::time::{Duration, Instant};
 
-use shin::Event;
-use shin::sig::SigningKey;
+use shin::connection::{DriveError, Event, EventContext, EventSink};
+use shin::crypto::sig::SigningKey;
 use subtle::ConstantTimeEq;
 
 use crate::ConnectError;
@@ -17,7 +17,7 @@ use crate::packet::RetryPacket;
 use crate::packet::ZeroRttHeader;
 use crate::packet::{
     HandshakeHeader, InitialHeader, LONG_HANDSHAKE, LONG_INITIAL, LONG_ZERO_RTT, LongHeader,
-    QUIC_V1, ShortHeader, encode_long_header_into, encode_short_header_into,
+    QUIC_V1, ShortHeader, ShortHeaderRef,
 };
 use crate::packet_protection::PacketProtection;
 use crate::pmtud::{DEFAULT_MAX_PMTU, MAX_PMTU, Pmtud};
@@ -28,29 +28,29 @@ use crate::rtt::PACKET_THRESHOLD;
 use crate::rtt::RttTracker;
 use crate::secrets::StatelessResetSecret;
 use crate::stream::RecvStream;
-use crate::stream::SendStream;
+use crate::stream::{SendBuffer, SendStream};
 use crate::transport_params;
 use crate::transport_params::DEFAULT_ACTIVE_CONNECTION_ID_LIMIT;
 use crate::transport_params::Params;
 use crate::transport_params::TransportParameterError;
 use crate::varint::VarInt;
 use core::array::from_fn;
-use shin::client;
 use shin::client::Client;
-use shin::client::ClientCertSource;
-use shin::client::Resumption;
-use shin::client::Verifier;
-use shin::record::CipherSuite;
+use shin::client::config::ClientCertSource;
+use shin::client::config::Config as ClientConfig;
+use shin::client::config::Resumption;
+use shin::client::config::Verifier;
+use shin::crypto::ticket::TicketKeys;
 use shin::server;
-use shin::server::CertSource;
-use shin::server::ClientAuth;
-use shin::server::ClientCertVerifier;
-use shin::server::EarlyDataGuard;
-use shin::server::NoClientAuth;
-use shin::server::NoGuard;
 use shin::server::Server;
 use shin::server::Shard;
-use shin::ticket::TicketKeys;
+use shin::server::config::CertSource;
+use shin::server::config::ClientAuth;
+use shin::server::config::ClientCertVerifier;
+use shin::server::config::EarlyDataGuard;
+use shin::server::config::NoClientAuth;
+use shin::server::config::NoGuard;
+use shin::wire::record::CipherSuite;
 use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Formatter;
@@ -62,6 +62,7 @@ mod delivery;
 mod journal;
 mod reassembly;
 
+pub(crate) use batch::GsoBatch;
 pub use batch::PacketBatch;
 use batch::{PacketSink, PacketSlot};
 use commit::*;
@@ -92,6 +93,46 @@ const MAX_PENDING_RETIRE_CONNECTION_IDS: usize = 64;
 const MAX_SESSION_TICKETS: usize = 8;
 const MAX_SESSION_TICKET_BYTES: usize = 256 * 1024;
 
+struct PacketPayload<'a> {
+    out: &'a mut Vec<u8>,
+    start: usize,
+}
+
+impl<'a> PacketPayload<'a> {
+    fn new(out: &'a mut Vec<u8>, start: usize) -> Self {
+        Self { out, start }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.out.len() == self.start
+    }
+
+    fn out_mut(&mut self) -> &mut Vec<u8> {
+        self.out
+    }
+}
+
+impl Deref for PacketPayload<'_> {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        self.out
+    }
+}
+
+impl DerefMut for PacketPayload<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.out
+    }
+}
+
+impl Extend<u8> for PacketPayload<'_> {
+    #[inline]
+    fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
+        self.out.extend(iter);
+    }
+}
+
 struct AckReceipt<'a> {
     largest: u64,
     delay_microseconds: u64,
@@ -102,7 +143,7 @@ struct AckReceipt<'a> {
 
 struct ParsedAckRanges {
     bytes: Range<usize>,
-    count: u64,
+    count: usize,
 }
 
 type ParsedFrame = Frame<Range<usize>, ParsedAckRanges>;
@@ -121,6 +162,48 @@ impl ConnHandle {
 
     pub(crate) fn generation(self) -> u32 {
         (self.0 >> 32) as u32
+    }
+}
+
+/// Connection IDs required to construct one server-side QUIC connection.
+pub struct ServerConnectionIds {
+    initial_dcid: Vec<u8>,
+    local_cid: Vec<u8>,
+    peer_cid: Vec<u8>,
+    tp_original_dcid: Vec<u8>,
+    retry_scid: Option<Vec<u8>>,
+}
+
+impl ServerConnectionIds {
+    /// Creates IDs for a connection accepted directly from its first Initial.
+    #[inline(always)]
+    pub fn initial(initial_dcid: Vec<u8>, local_cid: Vec<u8>, peer_cid: Vec<u8>) -> Self {
+        let tp_original_dcid = initial_dcid.clone();
+        Self {
+            initial_dcid,
+            local_cid,
+            peer_cid,
+            tp_original_dcid,
+            retry_scid: None,
+        }
+    }
+
+    /// Creates IDs for a connection accepted after a validated Retry.
+    #[inline(always)]
+    pub fn retry(
+        initial_dcid: Vec<u8>,
+        local_cid: Vec<u8>,
+        peer_cid: Vec<u8>,
+        original_dcid: Vec<u8>,
+        retry_scid: Vec<u8>,
+    ) -> Self {
+        Self {
+            initial_dcid,
+            local_cid,
+            peer_cid,
+            tp_original_dcid: original_dcid,
+            retry_scid: Some(retry_scid),
+        }
     }
 }
 
@@ -214,6 +297,15 @@ mod sealed {
 pub trait ServerPolicy: sealed::Sealed + 'static {
     type Guard: EarlyDataGuard + 'static;
     type Verifier: ClientCertVerifier + 'static;
+
+    /// Lane-owned input consumed when constructing this concrete policy.
+    type Setup;
+
+    #[doc(hidden)]
+    const BUILD_SHARD: fn(
+        server::config::Config,
+        Self::Setup,
+    ) -> Shard<Self::Guard, Self::Verifier>;
 }
 
 pub struct Standard<G = NoGuard>(core::marker::PhantomData<fn() -> G>);
@@ -226,6 +318,10 @@ where
 {
     type Guard = G;
     type Verifier = NoClientAuth;
+    type Setup = G;
+
+    const BUILD_SHARD: fn(server::config::Config, G) -> Shard<G, NoClientAuth> =
+        Shard::with_early_data_guard;
 }
 
 pub struct Mutual<G, V>(core::marker::PhantomData<fn() -> (G, V)>);
@@ -239,6 +335,10 @@ where
 {
     type Guard = G;
     type Verifier = V;
+    type Setup = MutualAuthentication<V, G>;
+
+    const BUILD_SHARD: fn(server::config::Config, MutualAuthentication<V, G>) -> Shard<G, V> =
+        MutualAuthentication::build_shard;
 }
 
 pub struct MutualAuthentication<V, G = NoGuard> {
@@ -265,8 +365,15 @@ impl<V, G> MutualAuthentication<V, G> {
             verifier,
         }
     }
+}
 
-    pub(crate) fn into_parts(self) -> (G, ClientAuth, V) {
+impl<V: ClientCertVerifier, G: EarlyDataGuard> MutualAuthentication<V, G> {
+    fn build_shard(config: server::config::Config, setup: Self) -> Shard<G, V> {
+        let (guard, mode, verifier) = setup.into_parts();
+        Shard::with_early_data_guard_and_client_auth(config, guard, mode, verifier)
+    }
+
+    fn into_parts(self) -> (G, ClientAuth, V) {
         (self.guard, self.mode, self.verifier)
     }
 }
@@ -277,34 +384,162 @@ enum SideKind {
 }
 
 impl SideKind {
-    fn read_client(&mut self, epoch: shin::Epoch, data: &[u8]) -> Result<Vec<Event>, shin::Error> {
+    fn read_client<S: EventSink + ?Sized>(
+        &mut self,
+        epoch: shin::connection::Epoch,
+        data: &[u8],
+        events: &mut S,
+    ) -> Result<(), DriveError<S::Error>> {
         match self {
-            Self::Client(c) => c.read(epoch, data),
-            Self::Server(_) => Err(shin::Error::BadConfig),
+            Self::Client(c) => c.read_into(epoch, data, events),
+            Self::Server(_) => Err(shin::connection::Error::BadConfig.into()),
         }
     }
 
-    fn read_server<G, V>(
+    fn read_server<G, V, S>(
         &mut self,
-        epoch: shin::Epoch,
+        epoch: shin::connection::Epoch,
         data: &[u8],
         shard: &mut Shard<G, V>,
-    ) -> Result<Vec<Event>, shin::Error>
+        events: &mut S,
+    ) -> Result<(), DriveError<S::Error>>
     where
         G: EarlyDataGuard,
         V: ClientCertVerifier,
+        S: EventSink + ?Sized,
     {
         match self {
-            Self::Client(_) => Err(shin::Error::BadConfig),
-            Self::Server(server) => server.read(epoch, data, shard),
+            Self::Client(_) => Err(shin::connection::Error::BadConfig.into()),
+            Self::Server(server) => server.read_into(epoch, data, shard, events),
         }
     }
+}
 
-    fn negotiated_cipher_suite(&self) -> Option<CipherSuite> {
-        match self {
-            Self::Client(c) => c.negotiated_cipher_suite(),
-            Self::Server(s) => s.negotiated_cipher_suite(),
+struct ShinEvents<'a> {
+    pending_crypto_initial: &'a mut Vec<u8>,
+    pending_crypto_handshake: &'a mut Vec<u8>,
+    pending_crypto_app: &'a mut Vec<u8>,
+    handshake_r: &'a mut Option<PacketProtection>,
+    handshake_w: &'a mut Option<PacketProtection>,
+    app_r: &'a mut Option<PacketProtection>,
+    app_w: &'a mut Option<PacketProtection>,
+    zero_rtt_r: &'a mut Option<PacketProtection>,
+    zero_rtt_w: &'a mut Option<PacketProtection>,
+    pending_synth_eod: &'a mut bool,
+    peer_transport_params_raw: &'a mut Option<Vec<u8>>,
+    pending_resumption_psk: &'a mut Option<[u8; 32]>,
+    received_tickets: &'a mut VecDeque<SessionTicket>,
+    received_ticket_bytes: &'a mut usize,
+    is_client: bool,
+    done: bool,
+    reject_early_data: bool,
+}
+
+impl EventSink for ShinEvents<'_> {
+    type Error = ConnError;
+
+    fn event(&mut self, event: Event<'_>, context: EventContext) -> Result<(), Self::Error> {
+        match event {
+            Event::Send { epoch, data } => match epoch {
+                shin::connection::Epoch::Plaintext => {
+                    self.pending_crypto_initial.extend_from_slice(data)
+                }
+                shin::connection::Epoch::Handshake => {
+                    self.pending_crypto_handshake.extend_from_slice(data)
+                }
+                shin::connection::Epoch::Application => {
+                    self.pending_crypto_app.extend_from_slice(data)
+                }
+                shin::connection::Epoch::EarlyData => {}
+            },
+            Event::KeysReady {
+                epoch,
+                read_secret,
+                write_secret,
+            } => {
+                if context.cipher_suite() != Some(CipherSuite::Aes128GcmSha256) {
+                    return Err(ConnError::Tls);
+                }
+                let read_keys =
+                    PacketKeys::aes_128(read_secret.as_slice()).map_err(|_| ConnError::Tls)?;
+                let write_keys =
+                    PacketKeys::aes_128(write_secret.as_slice()).map_err(|_| ConnError::Tls)?;
+                let read = PacketProtection::aes_128(&read_keys).map_err(|_| ConnError::Tls)?;
+                let write = PacketProtection::aes_128(&write_keys).map_err(|_| ConnError::Tls)?;
+                match epoch {
+                    shin::connection::Epoch::Handshake => {
+                        *self.handshake_r = Some(read);
+                        *self.handshake_w = Some(write);
+                    }
+                    shin::connection::Epoch::Application => {
+                        *self.app_r = Some(read);
+                        *self.app_w = Some(write);
+                    }
+                    shin::connection::Epoch::Plaintext | shin::connection::Epoch::EarlyData => {
+                        return Err(ConnError::Tls);
+                    }
+                }
+            }
+            Event::PeerExtension { data, .. } => {
+                *self.peer_transport_params_raw = Some(data.to_vec());
+            }
+            Event::Done => {
+                self.done = true;
+            }
+            Event::KeyUpdate { .. } => return Err(ConnError::Tls),
+            Event::ZeroRttKeysReady { secret } => {
+                let keys = PacketKeys::aes_128(secret.as_slice()).map_err(|_| ConnError::Tls)?;
+                if self.is_client {
+                    *self.zero_rtt_w =
+                        Some(PacketProtection::aes_128(&keys).map_err(|_| ConnError::Tls)?);
+                } else {
+                    *self.zero_rtt_r =
+                        Some(PacketProtection::aes_128(&keys).map_err(|_| ConnError::Tls)?);
+                    *self.pending_synth_eod = true;
+                }
+            }
+            Event::EarlyDataAccepted => {}
+            Event::EarlyDataRejected => {
+                *self.zero_rtt_w = None;
+                self.reject_early_data = true;
+            }
+            Event::NewSessionTicket {
+                ticket_lifetime,
+                ticket_age_add,
+                ticket_nonce,
+                ticket,
+                max_early_data: _,
+            } => {
+                let psk = self.pending_resumption_psk.take().ok_or(ConnError::Tls)?;
+                let ticket_bytes = ticket_nonce.len().saturating_add(ticket.len());
+                if ticket_bytes > MAX_SESSION_TICKET_BYTES {
+                    return Ok(());
+                }
+                while self.received_tickets.len() >= MAX_SESSION_TICKETS
+                    || self.received_ticket_bytes.saturating_add(ticket_bytes)
+                        > MAX_SESSION_TICKET_BYTES
+                {
+                    let Some(expired) = self.received_tickets.pop_front() else {
+                        break;
+                    };
+                    *self.received_ticket_bytes = self
+                        .received_ticket_bytes
+                        .saturating_sub(expired.ticket_nonce.len() + expired.ticket.len());
+                }
+                self.received_tickets.push_back(SessionTicket {
+                    ticket_lifetime,
+                    ticket_age_add,
+                    ticket_nonce: ticket_nonce.to_vec(),
+                    ticket: ticket.to_vec(),
+                    psk,
+                });
+                *self.received_ticket_bytes += ticket_bytes;
+            }
+            Event::ResumptionSecret { psk } => {
+                *self.pending_resumption_psk = Some(psk);
+            }
         }
+        Ok(())
     }
 }
 
@@ -689,6 +924,40 @@ impl Config {
     }
 }
 
+#[repr(transparent)]
+pub(crate) struct ValidatedConfig(Config);
+
+impl ValidatedConfig {
+    pub(crate) fn new(config: Config) -> Result<Self, ConnectError> {
+        config.validate()?;
+        Ok(Self(config))
+    }
+
+    pub(crate) fn cap_max_pmtu(&mut self, ceiling: u64) -> Result<(), ConnectError> {
+        if ceiling < MIN_INITIAL_LEN as u64 {
+            return Err(ConnectError::InvalidConfig);
+        }
+        self.0.max_pmtu = self.0.max_pmtu.min(ceiling);
+        Ok(())
+    }
+
+    pub(crate) fn duplicate_connection(&self) -> Result<Self, ConnectError> {
+        self.0.duplicate_connection().map(Self)
+    }
+
+    fn into_inner(self) -> Config {
+        self.0
+    }
+}
+
+impl Deref for ValidatedConfig {
+    type Target = Config;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl From<transport_params::Params> for Config {
     fn from(params: transport_params::Params) -> Self {
         Self {
@@ -770,20 +1039,10 @@ impl Conn {
         local_cid: Vec<u8>,
         peer_cid: Vec<u8>,
         signing_key: SigningKey,
-        mut config: Config,
+        config: Config,
     ) -> Result<ServerConn, ConnectError> {
-        config.validate()?;
-        let shard_config = Self::take_server_config(signing_key, &mut config)?;
-        let tp_original_dcid = initial_dcid.clone();
-        let conn = Self::new_with(
-            initial_dcid,
-            local_cid,
-            tp_original_dcid,
-            None,
-            config,
-            SideSetup::Server { peer_cid },
-        )?;
-        Ok(ServerConn::new(conn, Shard::new(shard_config)))
+        let ids = ServerConnectionIds::initial(initial_dcid, local_cid, peer_cid);
+        Self::new_server_with_policy::<Standard>(ids, signing_key, config, NoGuard)
     }
 
     pub fn new_server_retry(
@@ -793,19 +1052,16 @@ impl Conn {
         original_dcid: Vec<u8>,
         retry_scid: Vec<u8>,
         signing_key: SigningKey,
-        mut config: Config,
+        config: Config,
     ) -> Result<ServerConn, ConnectError> {
-        config.validate()?;
-        let shard_config = Self::take_server_config(signing_key, &mut config)?;
-        let conn = Self::new_with(
+        let ids = ServerConnectionIds::retry(
             initial_dcid,
             local_cid,
+            peer_cid,
             original_dcid,
-            Some(retry_scid),
-            config,
-            SideSetup::Server { peer_cid },
-        )?;
-        Ok(ServerConn::new(conn, Shard::new(shard_config)))
+            retry_scid,
+        );
+        Self::new_server_with_policy::<Standard>(ids, signing_key, config, NoGuard)
     }
 
     pub fn new_server_with_early_data_guard<G>(
@@ -813,27 +1069,14 @@ impl Conn {
         local_cid: Vec<u8>,
         peer_cid: Vec<u8>,
         signing_key: SigningKey,
-        mut config: Config,
+        config: Config,
         guard: G,
     ) -> Result<ServerConn<G>, ConnectError>
     where
         G: EarlyDataGuard + 'static,
     {
-        config.validate()?;
-        let shard_config = Self::take_server_config(signing_key, &mut config)?;
-        let tp_original_dcid = initial_dcid.clone();
-        let conn = Self::new_with(
-            initial_dcid,
-            local_cid,
-            tp_original_dcid,
-            None,
-            config,
-            SideSetup::Server { peer_cid },
-        )?;
-        Ok(ServerConn::new(
-            conn,
-            Shard::with_early_data_guard(shard_config, guard),
-        ))
+        let ids = ServerConnectionIds::initial(initial_dcid, local_cid, peer_cid);
+        Self::new_server_with_policy::<Standard<G>>(ids, signing_key, config, guard)
     }
 
     pub fn new_server_mutual<V>(
@@ -841,28 +1084,14 @@ impl Conn {
         local_cid: Vec<u8>,
         peer_cid: Vec<u8>,
         signing_key: SigningKey,
-        mut config: Config,
+        config: Config,
         authentication: MutualAuthentication<V>,
     ) -> Result<ServerConn<NoGuard, V>, ConnectError>
     where
         V: ClientCertVerifier + 'static,
     {
-        config.validate()?;
-        let shard_config = Self::take_server_config(signing_key, &mut config)?;
-        let (_, auth, verifier) = authentication.into_parts();
-        let tp_original_dcid = initial_dcid.clone();
-        let conn = Self::new_with(
-            initial_dcid,
-            local_cid,
-            tp_original_dcid,
-            None,
-            config,
-            SideSetup::Server { peer_cid },
-        )?;
-        Ok(ServerConn::new(
-            conn,
-            Shard::with_client_auth(shard_config, auth, verifier),
-        ))
+        let ids = ServerConnectionIds::initial(initial_dcid, local_cid, peer_cid);
+        Self::new_server_with_policy::<Mutual<NoGuard, V>>(ids, signing_key, config, authentication)
     }
 
     pub fn new_server_mutual_with_early_data_guard<G, V>(
@@ -870,45 +1099,46 @@ impl Conn {
         local_cid: Vec<u8>,
         peer_cid: Vec<u8>,
         signing_key: SigningKey,
-        mut config: Config,
+        config: Config,
         authentication: MutualAuthentication<V, G>,
     ) -> Result<ServerConn<G, V>, ConnectError>
     where
         G: EarlyDataGuard + 'static,
         V: ClientCertVerifier + 'static,
     {
-        config.validate()?;
+        let ids = ServerConnectionIds::initial(initial_dcid, local_cid, peer_cid);
+        Self::new_server_with_policy::<Mutual<G, V>>(ids, signing_key, config, authentication)
+    }
+
+    pub fn new_server_with_policy<P>(
+        ids: ServerConnectionIds,
+        signing_key: SigningKey,
+        config: Config,
+        setup: P::Setup,
+    ) -> Result<ServerConn<P::Guard, P::Verifier>, ConnectError>
+    where
+        P: ServerPolicy,
+    {
+        let mut config = ValidatedConfig::new(config)?;
         let shard_config = Self::take_server_config(signing_key, &mut config)?;
-        let (guard, auth, verifier) = authentication.into_parts();
-        let tp_original_dcid = initial_dcid.clone();
-        let conn = Self::new_with(
-            initial_dcid,
-            local_cid,
-            tp_original_dcid,
-            None,
-            config,
-            SideSetup::Server { peer_cid },
-        )?;
-        Ok(ServerConn::new(
-            conn,
-            Shard::with_early_data_guard_and_client_auth(shard_config, guard, auth, verifier),
-        ))
+        let conn = Self::new_server_connection(ids, config)?;
+        Ok(ServerConn::new(conn, (P::BUILD_SHARD)(shard_config, setup)))
     }
 
     pub(crate) fn take_server_config(
         signing_key: SigningKey,
-        config: &mut Config,
-    ) -> Result<server::Config, ConnectError> {
-        let server_config = server::Config {
-            source: match config.server_cert_chain.take() {
+        config: &mut ValidatedConfig,
+    ) -> Result<server::config::Config, ConnectError> {
+        let server_config = server::config::Config {
+            source: match config.0.server_cert_chain.take() {
                 Some(chain_der) => CertSource::X509 {
                     chain_der,
                     signing_key,
                 },
                 None => CertSource::RawPublicKey { signing_key },
             },
-            alpn_protocols: take(&mut config.alpn_protocols),
-            ticket_keys: config.ticket_secret.take().map(TicketKeys::single),
+            alpn_protocols: take(&mut config.0.alpn_protocols),
+            ticket_keys: config.0.ticket_secret.take().map(TicketKeys::single),
         };
         server_config
             .validate()
@@ -917,38 +1147,22 @@ impl Conn {
     }
 
     pub(crate) fn new_server_connection(
-        initial_dcid: Vec<u8>,
-        local_cid: Vec<u8>,
-        peer_cid: Vec<u8>,
-        config: Config,
+        ids: ServerConnectionIds,
+        config: ValidatedConfig,
     ) -> Result<Self, ConnectError> {
-        config.validate()?;
-        let tp_original_dcid = initial_dcid.clone();
+        let ServerConnectionIds {
+            initial_dcid,
+            local_cid,
+            peer_cid,
+            tp_original_dcid,
+            retry_scid,
+        } = ids;
         Self::new_with(
             initial_dcid,
             local_cid,
             tp_original_dcid,
-            None,
-            config,
-            SideSetup::Server { peer_cid },
-        )
-    }
-
-    pub(crate) fn new_server_connection_retry(
-        initial_dcid: Vec<u8>,
-        local_cid: Vec<u8>,
-        peer_cid: Vec<u8>,
-        original_dcid: Vec<u8>,
-        retry_scid: Vec<u8>,
-        config: Config,
-    ) -> Result<Self, ConnectError> {
-        config.validate()?;
-        Self::new_with(
-            initial_dcid,
-            local_cid,
-            original_dcid,
-            Some(retry_scid),
-            config,
+            retry_scid,
+            config.into_inner(),
             SideSetup::Server { peer_cid },
         )
     }
@@ -1016,7 +1230,7 @@ impl Conn {
                     retry_scid.as_deref(),
                     user_tp,
                 )?;
-                let cfg = client::Config {
+                let cfg = ClientConfig {
                     verifier: Verifier::RawPublicKey {
                         expected_pubkey: server_pubkey,
                     },
@@ -1025,7 +1239,11 @@ impl Conn {
                     resumption,
                     enable_early_data,
                 };
-                let mut client = Client::new(cfg, WallClock::now_millis as TlsClock);
+                let mut client = Client::with_workspace(
+                    cfg,
+                    WallClock::now_millis as TlsClock,
+                    shin::wire::handshake::workspace::HandshakeWorkspace::for_client(),
+                );
                 if let Some(source) = client_cert {
                     client.set_client_cert(source);
                 }
@@ -1057,11 +1275,15 @@ impl Conn {
                     retry_scid.as_deref(),
                     user_tp,
                 )?;
-                let cfg = server::ConnectionConfig {
+                let cfg = server::config::ConnectionConfig {
                     transport_params: tp_bytes,
                 };
                 let clock = WallClock::now_millis as TlsClock;
-                let server = Server::new(cfg, clock);
+                let server = Server::with_workspace(
+                    cfg,
+                    clock,
+                    shin::wire::handshake::workspace::HandshakeWorkspace::for_server(),
+                );
                 (
                     SideKind::Server(Box::new(server)),
                     false,
@@ -1206,12 +1428,11 @@ impl Conn {
     }
 
     fn start_client_handshake(&mut self) -> Result<(), ConnectError> {
-        if let SideKind::Client(c) = &mut self.side {
-            let evs = c.start().map_err(|_| ConnectError::Tls)?;
-            self.absorb_shin_events(evs)
-                .map_err(|_| ConnectError::Tls)?;
-        }
-        Ok(())
+        self.drive_shin(|side, events| match side {
+            SideKind::Client(client) => client.start_into(events),
+            SideKind::Server(_) => Err(shin::connection::Error::BadConfig.into()),
+        })
+        .map_err(|_| ConnectError::Tls)
     }
 
     pub(crate) fn is_client(&self) -> bool {
@@ -1219,8 +1440,8 @@ impl Conn {
     }
 
     pub fn recv_packet(&mut self, wire: &[u8], now: Instant) -> Result<(), ConnError> {
-        self.recv_packet_with(wire, now, &mut |side, epoch, data| {
-            side.read_client(epoch, data)
+        self.recv_packet_with(wire, now, &mut |side, epoch, data, events| {
+            side.read_client(epoch, data, events)
         })
     }
 
@@ -1234,8 +1455,8 @@ impl Conn {
         G: EarlyDataGuard,
         V: ClientCertVerifier,
     {
-        self.recv_packet_with(wire, now, &mut |side, epoch, data| {
-            side.read_server(epoch, data, shard)
+        self.recv_packet_with(wire, now, &mut |side, epoch, data, events| {
+            side.read_server(epoch, data, shard, events)
         })
     }
 
@@ -1246,7 +1467,12 @@ impl Conn {
         read: &mut R,
     ) -> Result<(), ConnError>
     where
-        R: FnMut(&mut SideKind, shin::Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+        R: FnMut(
+            &mut SideKind,
+            shin::connection::Epoch,
+            &[u8],
+            &mut ShinEvents<'_>,
+        ) -> Result<(), DriveError<ConnError>>,
     {
         if !self.peer_address_validated {
             self.amplification_received = self
@@ -1303,7 +1529,12 @@ impl Conn {
 
     fn recv_zero_rtt<R>(&mut self, wire: &[u8], now: Instant, read: &mut R) -> Result<(), ConnError>
     where
-        R: FnMut(&mut SideKind, shin::Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+        R: FnMut(
+            &mut SideKind,
+            shin::connection::Epoch,
+            &[u8],
+            &mut ShinEvents<'_>,
+        ) -> Result<(), DriveError<ConnError>>,
     {
         let Some(zr) = self.zero_rtt_r.as_ref() else {
             return Ok(());
@@ -1582,6 +1813,33 @@ impl Conn {
     }
 
     pub fn stream_send(&mut self, stream_id: u64, data: &[u8]) -> Result<(), StreamError> {
+        if self.validate_stream_send(stream_id)?
+            && !self.streams_send.entry(stream_id).or_default().write(data)
+        {
+            return Err(StreamError::ValueOutOfRange);
+        }
+        Ok(())
+    }
+
+    pub fn stream_send_buffer(
+        &mut self,
+        stream_id: u64,
+        data: SendBuffer,
+    ) -> Result<(), StreamError> {
+        if self.validate_stream_send(stream_id)? {
+            let written = self
+                .streams_send
+                .entry(stream_id)
+                .or_default()
+                .write_buffer(data);
+            if !written {
+                return Err(StreamError::ValueOutOfRange);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_stream_send(&self, stream_id: u64) -> Result<bool, StreamError> {
         self.validate_stream_operation(stream_id, StreamAccess::Send)?;
         if self
             .peer_max_stream_data
@@ -1592,10 +1850,9 @@ impl Conn {
                 .get(&stream_id)
                 .is_some_and(|stream| stream.blocked())
         {
-            return Ok(());
+            return Ok(false);
         }
-        self.streams_send.entry(stream_id).or_default().write(data);
-        Ok(())
+        Ok(true)
     }
 
     pub fn stream_send_fin(&mut self, stream_id: u64) -> Result<(), StreamError> {
@@ -1749,7 +2006,12 @@ impl Conn {
 
     fn recv_initial<R>(&mut self, wire: &[u8], now: Instant, read: &mut R) -> Result<(), ConnError>
     where
-        R: FnMut(&mut SideKind, shin::Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+        R: FnMut(
+            &mut SideKind,
+            shin::connection::Epoch,
+            &[u8],
+            &mut ShinEvents<'_>,
+        ) -> Result<(), DriveError<ConnError>>,
     {
         let Some(initial_r) = self.initial_r.as_ref() else {
             return Ok(());
@@ -1782,7 +2044,12 @@ impl Conn {
         read: &mut R,
     ) -> Result<(), ConnError>
     where
-        R: FnMut(&mut SideKind, shin::Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+        R: FnMut(
+            &mut SideKind,
+            shin::connection::Epoch,
+            &[u8],
+            &mut ShinEvents<'_>,
+        ) -> Result<(), DriveError<ConnError>>,
     {
         let Some(hr) = self.handshake_r.as_ref() else {
             return Ok(());
@@ -1809,7 +2076,12 @@ impl Conn {
 
     fn recv_one_rtt<R>(&mut self, wire: &[u8], now: Instant, read: &mut R) -> Result<(), ConnError>
     where
-        R: FnMut(&mut SideKind, shin::Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+        R: FnMut(
+            &mut SideKind,
+            shin::connection::Epoch,
+            &[u8],
+            &mut ShinEvents<'_>,
+        ) -> Result<(), DriveError<ConnError>>,
     {
         let Some(ar) = self.app_r.as_ref() else {
             return Ok(());
@@ -1842,7 +2114,12 @@ impl Conn {
         read: &mut R,
     ) -> Result<(), ConnError>
     where
-        R: FnMut(&mut SideKind, shin::Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+        R: FnMut(
+            &mut SideKind,
+            shin::connection::Epoch,
+            &[u8],
+            &mut ShinEvents<'_>,
+        ) -> Result<(), DriveError<ConnError>>,
     {
         if self.spaces[epoch as usize].has_received(pn) {
             return Ok(());
@@ -1866,7 +2143,7 @@ impl Conn {
                 parse_error = Some(ConnError::FrameDecode);
                 break;
             }
-            let decoded = Frame::decode_mapped(
+            let decoded = crate::frame::decode::FrameDecoder::new(
                 &body[position..],
                 |data: &[u8]| {
                     let start = data.as_ptr() as usize - body_start;
@@ -1879,7 +2156,8 @@ impl Conn {
                         count,
                     }
                 },
-            );
+            )
+            .decode();
             let (frame, consumed) = match decoded {
                 Ok(decoded) => decoded,
                 Err(_) => {
@@ -1908,9 +2186,9 @@ impl Conn {
         self.spaces[epoch as usize].record_received(pn, ack_eliciting, now);
 
         let shin_epoch = match epoch {
-            Epoch::Initial => shin::Epoch::Plaintext,
-            Epoch::Handshake => shin::Epoch::Handshake,
-            Epoch::Application => shin::Epoch::Application,
+            Epoch::Initial => shin::connection::Epoch::Plaintext,
+            Epoch::Handshake => shin::connection::Epoch::Handshake,
+            Epoch::Application => shin::connection::Epoch::Application,
         };
         let result = (|| {
             for parsed in parsed_frames.drain(..) {
@@ -1920,19 +2198,17 @@ impl Conn {
                 );
                 match f {
                     Frame::Crypto { offset, data } => {
-                        let msgs = self.recv_crypto[epoch as usize].accept(offset, data)?;
+                        let msgs = self.recv_crypto[epoch as usize].accept(offset.get(), data)?;
                         for msg in msgs {
                             if self.pending_synth_eod && epoch == Epoch::Handshake {
                                 self.pending_synth_eod = false;
-                                let evs = self.feed_shin(
-                                    shin::Epoch::EarlyData,
+                                self.feed_shin(
+                                    shin::connection::Epoch::EarlyData,
                                     &[0x05, 0x00, 0x00, 0x00],
                                     read,
                                 )?;
-                                self.absorb_shin_events(evs)?;
                             }
-                            let evs = self.feed_shin(shin_epoch, &msg, read)?;
-                            self.absorb_shin_events(evs)?;
+                            self.feed_shin(shin_epoch, &msg, read)?;
                         }
                     }
                     Frame::Ack {
@@ -1941,6 +2217,9 @@ impl Conn {
                         first_range,
                         additional_ranges,
                     } => {
+                        let largest = largest.get();
+                        let delay = delay.get();
+                        let first_range = first_range.get();
                         if largest >= self.spaces[epoch as usize].next_pn {
                             return Err(ConnError::ProtocolViolation);
                         }
@@ -1953,7 +2232,9 @@ impl Conn {
                             self.spaces[epoch as usize].process_ack(
                                 largest,
                                 first_range,
-                                additional_ranges.clone(),
+                                additional_ranges
+                                    .clone()
+                                    .map(|(gap, range)| (gap.get(), range.get())),
                             )
                         };
                         self.ack(
@@ -1987,6 +2268,8 @@ impl Conn {
                         connection_id,
                         stateless_reset_token,
                     } if epoch == Epoch::Application => {
+                        let sequence_number = sequence_number.get();
+                        let retire_prior_to = retire_prior_to.get();
                         if connection_id.is_empty()
                             || connection_id.len() > 20
                             || retire_prior_to > sequence_number
@@ -2034,7 +2317,7 @@ impl Conn {
                     Frame::RetireConnectionId { sequence_number }
                         if epoch == Epoch::Application =>
                     {
-                        self.local_cids.remove(&sequence_number);
+                        self.local_cids.remove(&sequence_number.get());
                     }
                     Frame::PathChallenge { data } if epoch == Epoch::Application => {
                         if self.pending_path_responses.len() < MAX_PATH_TOKENS
@@ -2050,6 +2333,8 @@ impl Conn {
                         data,
                         ..
                     } if epoch == Epoch::Application => {
+                        let stream_id = stream_id.get();
+                        let offset = offset.get();
                         self.validate_stream_access(stream_id, StreamAccess::Receive)?;
                         let new_end = offset.saturating_add(data.len() as u64);
                         let stream_limit = self.local_stream_recv_limit(stream_id);
@@ -2086,15 +2371,18 @@ impl Conn {
                         }
                     }
                     Frame::MaxData { maximum_data }
-                        if epoch == Epoch::Application && maximum_data > self.peer_max_data =>
+                        if epoch == Epoch::Application
+                            && maximum_data.get() > self.peer_max_data =>
                     {
-                        self.peer_max_data = maximum_data;
+                        self.peer_max_data = maximum_data.get();
                         self.blocked_data_emitted = false;
                     }
                     Frame::MaxStreamData {
                         stream_id,
                         maximum_stream_data,
                     } if epoch == Epoch::Application => {
+                        let stream_id = stream_id.get();
+                        let maximum_stream_data = maximum_stream_data.get();
                         self.validate_stream_access(stream_id, StreamAccess::Send)?;
                         let entry = self.peer_max_stream_data.entry(stream_id).or_insert(
                             PeerStreamSendState {
@@ -2111,13 +2399,16 @@ impl Conn {
                     }
                     Frame::DataBlocked { .. } if epoch == Epoch::Application => {}
                     Frame::StreamDataBlocked { stream_id, .. } if epoch == Epoch::Application => {
-                        self.validate_stream_access(stream_id, StreamAccess::Receive)?;
+                        self.validate_stream_access(stream_id.get(), StreamAccess::Receive)?;
                     }
                     Frame::ResetStream {
                         stream_id,
                         error_code,
                         final_size,
                     } if epoch == Epoch::Application => {
+                        let stream_id = stream_id.get();
+                        let error_code = error_code.get();
+                        let final_size = final_size.get();
                         self.validate_stream_access(stream_id, StreamAccess::Receive)?;
                         if final_size > self.local_stream_recv_limit(stream_id) {
                             return Err(ConnError::FlowControl);
@@ -2151,6 +2442,8 @@ impl Conn {
                         stream_id,
                         error_code,
                     } if epoch == Epoch::Application => {
+                        let stream_id = stream_id.get();
+                        let error_code = error_code.get();
                         self.validate_stream_access(stream_id, StreamAccess::Send)?;
                         let final_size = self
                             .streams_send
@@ -2497,21 +2790,88 @@ impl Conn {
 
     fn feed_shin<R>(
         &mut self,
-        epoch: shin::Epoch,
+        epoch: shin::connection::Epoch,
         data: &[u8],
         read: &mut R,
-    ) -> Result<Vec<Event>, ConnError>
+    ) -> Result<(), ConnError>
     where
-        R: FnMut(&mut SideKind, shin::Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+        R: FnMut(
+            &mut SideKind,
+            shin::connection::Epoch,
+            &[u8],
+            &mut ShinEvents<'_>,
+        ) -> Result<(), DriveError<ConnError>>,
     {
-        let events = read(&mut self.side, epoch, data).map_err(|_| ConnError::Tls)?;
-        if self.state != State::Established
-            && let Some(suite) = self.side.negotiated_cipher_suite()
-            && suite != CipherSuite::Aes128GcmSha256
-        {
-            return Err(ConnError::Tls);
+        self.drive_shin(|side, events| read(side, epoch, data, events))
+    }
+
+    fn drive_shin(
+        &mut self,
+        run: impl FnOnce(&mut SideKind, &mut ShinEvents<'_>) -> Result<(), DriveError<ConnError>>,
+    ) -> Result<(), ConnError> {
+        let (result, done, reject_early_data) = {
+            let Self {
+                side,
+                is_client,
+                pending_crypto_initial,
+                pending_crypto_handshake,
+                pending_crypto_app,
+                handshake_r,
+                handshake_w,
+                app_r,
+                app_w,
+                zero_rtt_r,
+                zero_rtt_w,
+                pending_synth_eod,
+                peer_transport_params_raw,
+                pending_resumption_psk,
+                received_tickets,
+                received_ticket_bytes,
+                ..
+            } = self;
+            let mut events = ShinEvents {
+                pending_crypto_initial,
+                pending_crypto_handshake,
+                pending_crypto_app,
+                handshake_r,
+                handshake_w,
+                app_r,
+                app_w,
+                zero_rtt_r,
+                zero_rtt_w,
+                pending_synth_eod,
+                peer_transport_params_raw,
+                pending_resumption_psk,
+                received_tickets,
+                received_ticket_bytes,
+                is_client: *is_client,
+                done: false,
+                reject_early_data: false,
+            };
+            let result = run(side, &mut events);
+            (result, events.done, events.reject_early_data)
+        };
+
+        match result {
+            Ok(()) => {}
+            Err(DriveError::Protocol(_)) => return Err(ConnError::Tls),
+            Err(DriveError::Sink(error)) => return Err(error),
         }
-        Ok(events)
+        if reject_early_data {
+            self.reject_early_data();
+        }
+        if done {
+            if self.finalize_peer_tp().is_err() {
+                self.state = State::Closed;
+                return Ok(());
+            }
+            self.state = State::Established;
+            if !self.is_client {
+                self.handshake_done_pending = true;
+            }
+            self.auto_issue_local_cids();
+        }
+        Ok(())
     }
 
     fn reject_early_data(&mut self) {
@@ -2531,113 +2891,6 @@ impl Conn {
         );
         self.packet_journals = journals;
         self.update_loss_timer();
-    }
-
-    fn absorb_shin_events(&mut self, events: Vec<Event>) -> Result<(), ConnError> {
-        for e in events {
-            match e {
-                Event::Send { epoch, data } => match epoch {
-                    shin::Epoch::Plaintext => self.pending_crypto_initial.extend_from_slice(&data),
-                    shin::Epoch::Handshake => {
-                        self.pending_crypto_handshake.extend_from_slice(&data)
-                    }
-                    shin::Epoch::Application => self.pending_crypto_app.extend_from_slice(&data),
-                    shin::Epoch::EarlyData => {}
-                },
-                Event::KeysReady {
-                    epoch,
-                    read_secret,
-                    write_secret,
-                } => {
-                    let read_keys =
-                        PacketKeys::aes_128(read_secret.as_slice()).map_err(|_| ConnError::Tls)?;
-                    let write_keys =
-                        PacketKeys::aes_128(write_secret.as_slice()).map_err(|_| ConnError::Tls)?;
-                    let r = PacketProtection::aes_128(&read_keys).map_err(|_| ConnError::Tls)?;
-                    let w = PacketProtection::aes_128(&write_keys).map_err(|_| ConnError::Tls)?;
-                    match epoch {
-                        shin::Epoch::Handshake => {
-                            self.handshake_r = Some(r);
-                            self.handshake_w = Some(w);
-                        }
-                        shin::Epoch::Application => {
-                            self.app_r = Some(r);
-                            self.app_w = Some(w);
-                        }
-                        shin::Epoch::Plaintext => {}
-                        shin::Epoch::EarlyData => {}
-                    }
-                }
-                Event::PeerExtension { ty: _, data } => {
-                    self.peer_transport_params_raw = Some(data);
-                }
-                Event::Done => {
-                    if let Err(_e) = self.finalize_peer_tp() {
-                        self.state = State::Closed;
-                        continue;
-                    }
-                    self.state = State::Established;
-                    if !self.is_client {
-                        self.handshake_done_pending = true;
-                    }
-                    self.auto_issue_local_cids();
-                }
-                Event::KeyUpdate { .. } => {}
-                Event::ZeroRttKeysReady { secret } => {
-                    let keys =
-                        PacketKeys::aes_128(secret.as_slice()).map_err(|_| ConnError::Tls)?;
-                    if self.is_client {
-                        self.zero_rtt_w =
-                            Some(PacketProtection::aes_128(&keys).map_err(|_| ConnError::Tls)?);
-                    } else {
-                        self.zero_rtt_r =
-                            Some(PacketProtection::aes_128(&keys).map_err(|_| ConnError::Tls)?);
-                        self.pending_synth_eod = true;
-                    }
-                }
-                Event::EarlyDataAccepted => {}
-                Event::EarlyDataRejected => {
-                    self.zero_rtt_w = None;
-                    self.reject_early_data();
-                }
-                Event::NewSessionTicket {
-                    ticket_lifetime,
-                    ticket_age_add,
-                    ticket_nonce,
-                    ticket,
-                    max_early_data: _,
-                } => {
-                    let psk = self.pending_resumption_psk.take().unwrap_or([0u8; 32]);
-                    let ticket_bytes = ticket_nonce.len().saturating_add(ticket.len());
-                    if ticket_bytes > MAX_SESSION_TICKET_BYTES {
-                        continue;
-                    }
-                    while self.received_tickets.len() >= MAX_SESSION_TICKETS
-                        || self.received_ticket_bytes.saturating_add(ticket_bytes)
-                            > MAX_SESSION_TICKET_BYTES
-                    {
-                        let Some(expired) = self.received_tickets.pop_front() else {
-                            break;
-                        };
-                        self.received_ticket_bytes = self
-                            .received_ticket_bytes
-                            .saturating_sub(expired.ticket_nonce.len() + expired.ticket.len());
-                    }
-                    self.received_tickets.push_back(SessionTicket {
-                        ticket_lifetime,
-                        ticket_age_add,
-                        ticket_nonce,
-                        ticket,
-                        psk,
-                    });
-                    self.received_ticket_bytes += ticket_bytes;
-                }
-                Event::ResumptionSecret { psk } => {
-                    self.pending_resumption_psk = Some(psk);
-                }
-            }
-        }
-        Ok(())
     }
 
     pub fn take_session_tickets(&mut self) -> Vec<SessionTicket> {
@@ -2734,11 +2987,29 @@ impl Conn {
         max_packets: usize,
         max_packet_bytes: usize,
     ) {
-        batch.clear();
+        self.send_into_batch(batch, now, max_packets, max_packet_bytes);
+    }
+
+    pub(crate) fn send_gso_batch(
+        &mut self,
+        batch: &mut GsoBatch,
+        now: Instant,
+        max_packets: usize,
+        max_packet_bytes: usize,
+    ) {
+        self.send_into_batch(batch, now, max_packets, max_packet_bytes);
+    }
+
+    fn send_into_batch(
+        &mut self,
+        batch: &mut impl PacketSink,
+        now: Instant,
+        max_packets: usize,
+        max_packet_bytes: usize,
+    ) {
         let packet_bytes = max_packet_bytes.min(self.path_mtu() as usize);
         let packet_slots = max_packets.min(MAX_BATCH_PACKETS);
-        batch.buf.reserve(packet_slots.saturating_mul(packet_bytes));
-        batch.segs.reserve(packet_slots);
+        batch.reset(packet_slots, packet_bytes);
         self.fill_batch(batch, now, packet_slots, packet_bytes);
     }
 
@@ -2819,7 +3090,7 @@ impl Conn {
             let Some(packet_ceiling) = self.emission_ceiling(normal_packet_bytes) else {
                 break;
             };
-            let Some(commit) = sink.emit(packet_ceiling, |dst| {
+            let Some(commit) = sink.emit(packet_ceiling, |dst, packet_ceiling| {
                 self.build_pto_probe(dst, packet_ceiling)
             }) else {
                 break;
@@ -2843,7 +3114,7 @@ impl Conn {
                 let Some(packet_ceiling) = self.emission_ceiling(normal_packet_bytes) else {
                     break;
                 };
-                let Some(commit) = sink.emit(packet_ceiling, |dst| {
+                let Some(commit) = sink.emit(packet_ceiling, |dst, packet_ceiling| {
                     self.build_crypto_packet(
                         dst,
                         packet_ceiling,
@@ -2866,7 +3137,7 @@ impl Conn {
                 let Some(packet_ceiling) = self.emission_ceiling(normal_packet_bytes) else {
                     break;
                 };
-                let Some(commit) = sink.emit(packet_ceiling, |dst| {
+                let Some(commit) = sink.emit(packet_ceiling, |dst, packet_ceiling| {
                     self.build_zero_rtt(dst, packet_ceiling, false)
                 }) else {
                     break;
@@ -2891,7 +3162,7 @@ impl Conn {
                 let Some(packet_ceiling) = self.emission_ceiling(normal_packet_bytes) else {
                     break;
                 };
-                let Some(commit) = sink.emit(packet_ceiling, |dst| {
+                let Some(commit) = sink.emit(packet_ceiling, |dst, packet_ceiling| {
                     self.build_crypto_packet(
                         dst,
                         packet_ceiling,
@@ -2914,7 +3185,7 @@ impl Conn {
                 let commit =
                     self.emission_ceiling(normal_packet_bytes)
                         .and_then(|packet_ceiling| {
-                            sink.emit(packet_ceiling, |dst| {
+                            sink.emit(packet_ceiling, |dst, packet_ceiling| {
                                 self.build_one_rtt_close(dst, packet_ceiling)
                             })
                         });
@@ -2967,7 +3238,7 @@ impl Conn {
                 let Some(packet_ceiling) = self.emission_ceiling(normal_packet_bytes) else {
                     break;
                 };
-                let Some(commit) = sink.emit(packet_ceiling, |dst| {
+                let Some(commit) = sink.emit(packet_ceiling, |dst, packet_ceiling| {
                     self.build_one_rtt(dst, false, want_handshake_done, false, packet_ceiling)
                 }) else {
                     break;
@@ -2994,7 +3265,7 @@ impl Conn {
                 let Some(packet_ceiling) = self.emission_ceiling(normal_packet_bytes) else {
                     break;
                 };
-                let Some(commit) = sink.emit(packet_ceiling, |dst| {
+                let Some(commit) = sink.emit(packet_ceiling, |dst, packet_ceiling| {
                     self.build_one_rtt(dst, true, false, false, packet_ceiling)
                 }) else {
                     break;
@@ -3011,7 +3282,7 @@ impl Conn {
                 let commit = self
                     .emission_ceiling(max_packet_bytes)
                     .and_then(|packet_ceiling| {
-                        sink.emit(packet_ceiling, |dst| {
+                        sink.emit(packet_ceiling, |dst, packet_ceiling| {
                             self.build_one_rtt_probe(dst, probe_size, packet_ceiling)
                         })
                     });
@@ -3081,10 +3352,23 @@ impl Conn {
             encoded -= Self::varint_len(old_count);
             encoded += Self::varint_len(additional_ranges.len());
         }
+        let Some(largest) = VarInt::new(largest) else {
+            return false;
+        };
+        let Some(first_range) = VarInt::new(first_range) else {
+            return false;
+        };
+        let Some(additional_ranges) = additional_ranges
+            .into_iter()
+            .map(|(gap, range)| Some((VarInt::new(gap)?, VarInt::new(range)?)))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
         let start = out.len();
         let encoded = Frame::Ack {
             largest,
-            delay: 0,
+            delay: VarInt::ZERO,
             first_range,
             additional_ranges,
         }
@@ -3224,11 +3508,23 @@ impl Conn {
         stream_id: u64,
         offset: u64,
         fin: bool,
-        data: &[u8],
+        stream: &SendStream,
+        len: usize,
     ) -> bool {
         let start = out.len();
-        if Frame::encode_stream(out, stream_id, offset, fin, true, data).is_ok()
-            && out.len() <= limit
+        let Ok(len_u64) = u64::try_from(len) else {
+            return false;
+        };
+        let Some(stream_id) = VarInt::new(stream_id) else {
+            return false;
+        };
+        let Some(wire_offset) = VarInt::new(offset) else {
+            return false;
+        };
+        if stream.range_available(offset, len_u64)
+            && Frame::encode_stream_header(out, stream_id, wire_offset, fin, Some(len)).is_ok()
+            && out.len().saturating_add(len) <= limit
+            && stream.append_range(out, offset, len)
         {
             true
         } else {
@@ -3673,7 +3969,7 @@ impl Conn {
                 .is_some_and(|stream| {
                     !stream.reset_sent()
                         && stream.stop_sending_error().is_none()
-                        && stream.chunk_at(record.offset, record.len).is_some()
+                        && stream.range_available(record.offset, record.len)
                 });
             if active {
                 self.spaces[Epoch::Application as usize]
@@ -3736,14 +4032,16 @@ impl Conn {
     fn encode_crypto(out: &mut Vec<u8>, offset: u64, data: &[u8]) -> bool {
         let start = out.len();
         out.push(0x06);
-        let encoded = u64::try_from(data.len())
-            .ok()
-            .filter(|_| VarInt::encode(offset, out).is_ok())
-            .is_some_and(|len| VarInt::encode(len, out).is_ok());
-        if !encoded {
+        let Some(offset) = VarInt::new(offset) else {
             out.truncate(start);
             return false;
-        }
+        };
+        let Some(len) = VarInt::from_usize(data.len()) else {
+            out.truncate(start);
+            return false;
+        };
+        offset.encode(out);
+        len.encode(out);
         out.extend_from_slice(data);
         true
     }
@@ -3788,11 +4086,12 @@ impl Conn {
                 };
                 let start = out.len();
                 out.push(0x18);
-                if VarInt::encode(sequence_number, out).is_err() || VarInt::encode(0, out).is_err()
-                {
+                let Some(sequence_number) = VarInt::new(sequence_number) else {
                     out.truncate(start);
                     return false;
-                }
+                };
+                sequence_number.encode(out);
+                VarInt::ZERO.encode(out);
                 out.push(cid.len() as u8);
                 out.extend_from_slice(cid);
                 out.extend_from_slice(reset_token);
@@ -3804,44 +4103,79 @@ impl Conn {
                 }
             }
             ControlRecord::RetireConnectionId(sequence_number) => {
+                let Some(sequence_number) = VarInt::new(sequence_number) else {
+                    return false;
+                };
                 Self::append_frame(out, limit, &Frame::RetireConnectionId { sequence_number })
             }
-            ControlRecord::StopSending(stream_id, error_code) => Self::append_frame(
-                out,
-                limit,
-                &Frame::StopSending {
-                    stream_id,
-                    error_code,
-                },
-            ),
-            ControlRecord::ResetStream(stream_id, error_code, final_size) => Self::append_frame(
-                out,
-                limit,
-                &Frame::ResetStream {
-                    stream_id,
-                    error_code,
-                    final_size,
-                },
-            ),
+            ControlRecord::StopSending(stream_id, error_code) => {
+                let Some(stream_id) = VarInt::new(stream_id) else {
+                    return false;
+                };
+                let Some(error_code) = VarInt::new(error_code) else {
+                    return false;
+                };
+                Self::append_frame(
+                    out,
+                    limit,
+                    &Frame::StopSending {
+                        stream_id,
+                        error_code,
+                    },
+                )
+            }
+            ControlRecord::ResetStream(stream_id, error_code, final_size) => {
+                let (Some(stream_id), Some(error_code), Some(final_size)) = (
+                    VarInt::new(stream_id),
+                    VarInt::new(error_code),
+                    VarInt::new(final_size),
+                ) else {
+                    return false;
+                };
+                Self::append_frame(
+                    out,
+                    limit,
+                    &Frame::ResetStream {
+                        stream_id,
+                        error_code,
+                        final_size,
+                    },
+                )
+            }
             ControlRecord::MaxData(maximum_data) => {
+                let Some(maximum_data) = VarInt::new(maximum_data) else {
+                    return false;
+                };
                 Self::append_frame(out, limit, &Frame::MaxData { maximum_data })
             }
-            ControlRecord::MaxStreamData(stream_id, maximum_stream_data) => Self::append_frame(
-                out,
-                limit,
-                &Frame::MaxStreamData {
-                    stream_id,
-                    maximum_stream_data,
-                },
-            ),
-            ControlRecord::MaxStreamsBidi(max_streams) => Self::append_frame(
-                out,
-                limit,
-                &Frame::MaxStreams {
-                    is_uni: false,
-                    max_streams,
-                },
-            ),
+            ControlRecord::MaxStreamData(stream_id, maximum_stream_data) => {
+                let (Some(stream_id), Some(maximum_stream_data)) =
+                    (VarInt::new(stream_id), VarInt::new(maximum_stream_data))
+                else {
+                    return false;
+                };
+                Self::append_frame(
+                    out,
+                    limit,
+                    &Frame::MaxStreamData {
+                        stream_id,
+                        maximum_stream_data,
+                    },
+                )
+            }
+            ControlRecord::MaxStreamsBidi(max_streams) => {
+                let Some(max_streams) = VarInt::new(max_streams) else {
+                    return false;
+                };
+                Self::append_frame(
+                    out,
+                    limit,
+                    &Frame::MaxStreams {
+                        is_uni: false,
+                        max_streams,
+                    },
+                )
+            }
             ControlRecord::PathResponse(data) => {
                 Self::append_frame(out, limit, &Frame::PathResponse { data })
             }
@@ -3849,16 +4183,26 @@ impl Conn {
                 Self::append_frame(out, limit, &Frame::PathChallenge { data })
             }
             ControlRecord::DataBlocked(maximum_data) => {
+                let Some(maximum_data) = VarInt::new(maximum_data) else {
+                    return false;
+                };
                 Self::append_frame(out, limit, &Frame::DataBlocked { maximum_data })
             }
-            ControlRecord::StreamDataBlocked(stream_id, maximum_stream_data) => Self::append_frame(
-                out,
-                limit,
-                &Frame::StreamDataBlocked {
-                    stream_id,
-                    maximum_stream_data,
-                },
-            ),
+            ControlRecord::StreamDataBlocked(stream_id, maximum_stream_data) => {
+                let (Some(stream_id), Some(maximum_stream_data)) =
+                    (VarInt::new(stream_id), VarInt::new(maximum_stream_data))
+                else {
+                    return false;
+                };
+                Self::append_frame(
+                    out,
+                    limit,
+                    &Frame::StreamDataBlocked {
+                        stream_id,
+                        maximum_stream_data,
+                    },
+                )
+            }
         }
     }
 
@@ -3899,19 +4243,16 @@ impl Conn {
         let mut header = take(&mut self.scratch_header);
         header.clear();
         let token = (epoch == Epoch::Initial).then_some(self.retry_token.as_slice());
-        let result = encode_long_header_into(
-            &mut header,
-            LongHeader {
-                version: QUIC_V1,
-                packet_type,
-                dcid: &self.peer_cid,
-                scid: &self.local_cid,
-                token,
-                packet_number: pn,
-                packet_number_len: PN_LEN,
-            },
-            frames.len() + TAG_LEN,
-        )
+        let result = LongHeader {
+            version: QUIC_V1,
+            packet_type,
+            dcid: &self.peer_cid,
+            scid: &self.local_cid,
+            token,
+            packet_number: pn,
+            packet_number_len: PN_LEN,
+        }
+        .encode_into(&mut header, frames.len() + TAG_LEN)
         .ok()
         .and_then(|pn_offset| {
             let protection = match epoch {
@@ -4029,18 +4370,25 @@ impl Conn {
         pto_probe: bool,
         max_packet_bytes: usize,
     ) -> Option<(usize, PacketCommit)> {
-        let payload_limit = self.short_payload_limit(max_packet_bytes);
         let pn = self.spaces[Epoch::Application as usize].next_pn;
-
-        let mut frames = take(&mut self.scratch_frames);
-        frames.clear();
+        let packet_start = dst.len();
+        let pn_off = ShortHeaderRef {
+            dcid: &self.peer_cid,
+            packet_number: pn,
+            pn_len: PN_LEN,
+        }
+        .encode_into(dst)
+        .ok()?;
+        let payload_start = dst.len();
+        let payload_limit =
+            payload_start.checked_add(self.short_payload_limit(max_packet_bytes))?;
+        let mut frames = PacketPayload::new(dst, payload_start);
         let mut commit = PacketCommit::new(Epoch::Application, pn);
         let track_delivery = self.can_track_packet();
         if dgram {
             if !track_delivery
                 && self.datagram_congestion_control == DatagramCongestionControl::Standard
             {
-                self.scratch_frames = frames;
                 return None;
             }
             commit.ack_included =
@@ -4049,7 +4397,6 @@ impl Conn {
             if data.len().saturating_add(1) > payload_limit.saturating_sub(frames.len()) {
                 if commit.ack_included {
                 } else {
-                    self.scratch_frames = frames;
                     return None;
                 }
             } else {
@@ -4059,7 +4406,6 @@ impl Conn {
                 commit.ack_eliciting = true;
             }
             if frames.is_empty() {
-                self.scratch_frames = frames;
                 return None;
             }
         } else if pto_probe {
@@ -4111,16 +4457,15 @@ impl Conn {
                 if record.len as usize > room {
                     break;
                 }
-                let Some(chunk) = self
-                    .streams_send
-                    .get(&record.stream_id)
-                    .and_then(|stream| stream.chunk_at(record.offset, record.len))
-                else {
+                let Some(stream) = self.streams_send.get(&record.stream_id) else {
                     if self.stream_deliveries.remove(handle).is_some()
                         && let Some(state) = self.peer_max_stream_data.get_mut(&record.stream_id)
                     {
                         state.deliveries = state.deliveries.saturating_sub(1);
                     }
+                    continue;
+                };
+                let Ok(len) = usize::try_from(record.len) else {
                     continue;
                 };
                 if !Self::append_stream_frame(
@@ -4129,7 +4474,8 @@ impl Conn {
                     record.stream_id,
                     record.offset,
                     record.fin,
-                    chunk,
+                    stream,
+                    len,
                 ) {
                     break;
                 }
@@ -4141,7 +4487,6 @@ impl Conn {
             }
             if !commit.ack_eliciting {
                 if !Self::append_frame(&mut frames, payload_limit, &Frame::Ping) {
-                    self.scratch_frames = frames;
                     return None;
                 }
                 commit.ack_eliciting = true;
@@ -4169,13 +4514,8 @@ impl Conn {
             {
                 let start = frames.len();
                 frames.push(0x18);
-                if VarInt::encode(*seq, &mut frames).is_err()
-                    || VarInt::encode(0, &mut frames).is_err()
-                {
-                    frames.truncate(start);
-                    self.scratch_frames = frames;
-                    return None;
-                }
+                VarInt::new(*seq)?.encode(&mut frames);
+                VarInt::ZERO.encode(&mut frames);
                 frames.push(cid.len() as u8);
                 frames.extend_from_slice(cid);
                 frames.extend_from_slice(token);
@@ -4195,7 +4535,7 @@ impl Conn {
                 !self.control_inflight(ControlRecord::RetireConnectionId(sequence))
             }) {
                 let frame = Frame::RetireConnectionId {
-                    sequence_number: seq,
+                    sequence_number: VarInt::new(seq)?,
                 };
                 if track_delivery
                     && self
@@ -4233,8 +4573,8 @@ impl Conn {
                 })
             {
                 let frame = Frame::StopSending {
-                    stream_id: id,
-                    error_code,
+                    stream_id: VarInt::new(id)?,
+                    error_code: VarInt::new(error_code)?,
                 };
                 if track_delivery
                     && self
@@ -4258,9 +4598,9 @@ impl Conn {
                     })
             {
                 let frame = Frame::ResetStream {
-                    stream_id: id,
-                    error_code,
-                    final_size,
+                    stream_id: VarInt::new(id)?,
+                    error_code: VarInt::new(error_code)?,
+                    final_size: VarInt::new(final_size)?,
                 };
                 if track_delivery
                     && self
@@ -4283,7 +4623,7 @@ impl Conn {
                     &mut frames,
                     payload_limit,
                     &Frame::MaxData {
-                        maximum_data: self.local_max_data,
+                        maximum_data: VarInt::new(self.local_max_data)?,
                     },
                 )
             {
@@ -4296,8 +4636,8 @@ impl Conn {
             }) {
                 let maximum = *self.local_max_stream_data.get(&id).unwrap_or(&0);
                 let frame = Frame::MaxStreamData {
-                    stream_id: id,
-                    maximum_stream_data: maximum,
+                    stream_id: VarInt::new(id)?,
+                    maximum_stream_data: VarInt::new(maximum)?,
                 };
                 if track_delivery
                     && self
@@ -4321,7 +4661,7 @@ impl Conn {
                     payload_limit,
                     &Frame::MaxStreams {
                         is_uni: false,
-                        max_streams: self.local_max_streams_bidi,
+                        max_streams: VarInt::new(self.local_max_streams_bidi)?,
                     },
                 )
             {
@@ -4402,11 +4742,7 @@ impl Conn {
                 };
                 let (sid, off, len, fin) =
                     self.spaces[Epoch::Application as usize].stream_retransmit[pos];
-                let Some(chunk) = self
-                    .streams_send
-                    .get(&sid)
-                    .and_then(|s| s.chunk_at(off, len))
-                else {
+                let Some(stream) = self.streams_send.get(&sid) else {
                     self.spaces[Epoch::Application as usize]
                         .stream_retransmit
                         .swap_remove(pos);
@@ -4415,7 +4751,18 @@ impl Conn {
                     }
                     continue;
                 };
-                if !Self::append_stream_frame(&mut frames, payload_limit, sid, off, fin, chunk) {
+                let Ok(len_usize) = usize::try_from(len) else {
+                    continue;
+                };
+                if !Self::append_stream_frame(
+                    &mut frames,
+                    payload_limit,
+                    sid,
+                    off,
+                    fin,
+                    stream,
+                    len_usize,
+                ) {
                     break;
                 }
                 commit.push_stream(StreamRecord {
@@ -4469,7 +4816,7 @@ impl Conn {
                             &mut frames,
                             payload_limit,
                             &Frame::DataBlocked {
-                                maximum_data: self.peer_max_data,
+                                maximum_data: VarInt::new(self.peer_max_data)?,
                             },
                         )
                     {
@@ -4488,8 +4835,8 @@ impl Conn {
                             &mut frames,
                             payload_limit,
                             &Frame::StreamDataBlocked {
-                                stream_id: id,
-                                maximum_stream_data: stream_limit,
+                                stream_id: VarInt::new(id)?,
+                                maximum_stream_data: VarInt::new(stream_limit)?,
                             },
                         )
                     {
@@ -4509,8 +4856,8 @@ impl Conn {
                     idx += 1;
                     continue;
                 }
-                let (offset, slice) = stream.unsent();
-                let n = take.min(slice.len());
+                let offset = stream.next_offset();
+                let n = take.min(stream.unsent_len());
                 if n == 0 && !stream.would_fin(0) {
                     idx += 1;
                     continue;
@@ -4522,7 +4869,8 @@ impl Conn {
                     id,
                     offset,
                     fin_now,
-                    &slice[..n],
+                    stream,
+                    n,
                 ) {
                     break;
                 }
@@ -4539,23 +4887,22 @@ impl Conn {
         }
 
         if frames.is_empty() {
-            self.scratch_frames = frames;
             return None;
         }
 
-        let mut header = take(&mut self.scratch_header);
-        header.clear();
-        let pn_off = encode_short_header_into(&mut header, &self.peer_cid, pn, PN_LEN).ok()?;
         let seg = self
             .app_w
             .as_ref()?
-            .encrypt_short_into(dst, &header, &frames, pn, pn_off, PN_LEN as usize)
+            .protect_short_in_place(
+                frames.out_mut(),
+                packet_start,
+                payload_start,
+                pn,
+                pn_off,
+                PN_LEN as usize,
+            )
             .ok()?;
 
-        header.clear();
-        self.scratch_header = header;
-        frames.clear();
-        self.scratch_frames = frames;
         commit.bytes = seg;
         commit.in_flight = commit.ack_eliciting
             && !(commit.datagram
@@ -4601,16 +4948,15 @@ impl Conn {
                 if record.len as usize > room {
                     break;
                 }
-                let Some(chunk) = self
-                    .streams_send
-                    .get(&record.stream_id)
-                    .and_then(|stream| stream.chunk_at(record.offset, record.len))
-                else {
+                let Some(stream) = self.streams_send.get(&record.stream_id) else {
                     if self.stream_deliveries.remove(handle).is_some()
                         && let Some(state) = self.peer_max_stream_data.get_mut(&record.stream_id)
                     {
                         state.deliveries = state.deliveries.saturating_sub(1);
                     }
+                    continue;
+                };
+                let Ok(len) = usize::try_from(record.len) else {
                     continue;
                 };
                 if !Self::append_stream_frame(
@@ -4619,7 +4965,8 @@ impl Conn {
                     record.stream_id,
                     record.offset,
                     record.fin,
-                    chunk,
+                    stream,
+                    len,
                 ) {
                     break;
                 }
@@ -4675,8 +5022,8 @@ impl Conn {
             if stream.blocked() {
                 continue;
             }
-            let (offset, slice) = stream.unsent();
-            let n = take.min(slice.len());
+            let offset = stream.next_offset();
+            let n = take.min(stream.unsent_len());
             if n == 0 && !stream.would_fin(0) {
                 continue;
             }
@@ -4687,7 +5034,8 @@ impl Conn {
                 id,
                 offset,
                 fin_now,
-                &slice[..n],
+                stream,
+                n,
             ) {
                 break;
             }
@@ -4711,19 +5059,16 @@ impl Conn {
         let body_len_after_pn = frames.len() + TAG_LEN;
         let mut header = take(&mut self.scratch_header);
         header.clear();
-        let pn_off = encode_long_header_into(
-            &mut header,
-            LongHeader {
-                version: QUIC_V1,
-                packet_type: LONG_ZERO_RTT,
-                dcid: &self.peer_cid,
-                scid: &self.local_cid,
-                token: None,
-                packet_number: pn,
-                packet_number_len: PN_LEN,
-            },
-            body_len_after_pn,
-        )
+        let pn_off = LongHeader {
+            version: QUIC_V1,
+            packet_type: LONG_ZERO_RTT,
+            dcid: &self.peer_cid,
+            scid: &self.local_cid,
+            token: None,
+            packet_number: pn,
+            packet_number_len: PN_LEN,
+        }
+        .encode_into(&mut header, body_len_after_pn)
         .ok()?;
         let n = self
             .zero_rtt_w
@@ -4766,7 +5111,13 @@ impl Conn {
 
         let mut header = take(&mut self.scratch_header);
         header.clear();
-        let pn_off = encode_short_header_into(&mut header, &self.peer_cid, pn, PN_LEN).ok()?;
+        let pn_off = ShortHeaderRef {
+            dcid: &self.peer_cid,
+            packet_number: pn,
+            pn_len: PN_LEN,
+        }
+        .encode_into(&mut header)
+        .ok()?;
         let n = self
             .app_w
             .as_ref()?
@@ -4812,19 +5163,22 @@ impl Conn {
         let mut frames = take(&mut self.scratch_frames);
         frames.clear();
         frames.push(if close.is_application { 0x1d } else { 0x1c });
-        let encoded = VarInt::encode(close.error_code, &mut frames).is_ok()
-            && (close.is_application || VarInt::encode(close.frame_type, &mut frames).is_ok())
-            && u64::try_from(reason_len).is_ok_and(|len| VarInt::encode(len, &mut frames).is_ok());
-        if !encoded {
-            frames.clear();
-            self.scratch_frames = frames;
-            return None;
+        VarInt::new(close.error_code)?.encode(&mut frames);
+        if !close.is_application {
+            VarInt::new(close.frame_type)?.encode(&mut frames);
         }
+        VarInt::from_usize(reason_len)?.encode(&mut frames);
         frames.extend_from_slice(&close.reason[..reason_len]);
 
         let mut header = take(&mut self.scratch_header);
         header.clear();
-        let pn_off = encode_short_header_into(&mut header, &self.peer_cid, pn, PN_LEN).ok()?;
+        let pn_off = ShortHeaderRef {
+            dcid: &self.peer_cid,
+            packet_number: pn,
+            pn_len: PN_LEN,
+        }
+        .encode_into(&mut header)
+        .ok()?;
         let n = self
             .app_w
             .as_ref()?

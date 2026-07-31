@@ -1,6 +1,6 @@
 [package]
 name = "dope-quic"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2024"
 description = "QUIC x dope"
 license = "MIT"
@@ -8,12 +8,12 @@ repository = "https://github.com/dope-rs/quic"
 readme = "README.md"
 
 [dependencies]
-o3 = "0.7"
-shin = "0.11"
-dope = "0.11.0"
+o3 = "0.9"
+shin = "0.13"
+dope = "0.13"
 ring = "0.17"
 subtle = "2.6"
 pin-project = "1"
 
 [dev-dependencies]
-dope-gen = "0.11.0"
+dope-gen = "0.13"

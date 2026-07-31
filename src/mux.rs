@@ -1,9 +1,8 @@
-use std::array::IntoIter;
 use std::hash::{BuildHasher, RandomState};
 use std::marker::PhantomData;
 use std::mem::take;
 use std::net::SocketAddr;
-use std::num::NonZeroU128;
+use std::num::{NonZeroU16, NonZeroU128};
 use std::pin::Pin;
 use std::time::Instant;
 
@@ -11,16 +10,16 @@ use dope::DriverContext;
 use dope::manifold::datagram;
 use o3::collections::FixedQueue;
 use o3::collections::IndexedMinHeap;
-use shin::server::{ClientCertVerifier, EarlyDataGuard, NoGuard, Shard};
-use shin::sig::SigningKey;
-use shin::ticket::TicketKeys;
+use shin::crypto::sig::SigningKey;
+use shin::crypto::ticket::TicketKeys;
+use shin::server::{Shard, config::ClientCertVerifier, config::EarlyDataGuard, config::NoGuard};
 
 use crate::ConnectError;
 use crate::TrySendError;
 use crate::clock::WallClock;
 use crate::conn::{
-    self, Conn, ConnError, ConnHandle, Mutual, MutualAuthentication, PacketBatch, ServerPolicy,
-    Standard, StreamEvent,
+    self, Conn, ConnError, ConnHandle, GsoBatch, Mutual, MutualAuthentication, ServerConnectionIds,
+    ServerPolicy, Standard, StreamEvent, ValidatedConfig,
 };
 use crate::packet::InitialHeader;
 use crate::packet::QUIC_V1;
@@ -30,7 +29,6 @@ use crate::secrets::RetryTokenSecret;
 use crate::secrets::StatelessResetSecret;
 use std::array::from_fn;
 use std::iter;
-use std::iter::Take;
 
 pub trait Handler {
     fn established(&mut self, _conn: &mut Conn, _handle: ConnHandle) {}
@@ -174,47 +172,9 @@ enum FlushRound {
     Closed,
 }
 
-pub struct Segments {
-    values: [u32; FLUSH_PACKET_QUANTUM],
-    len: u8,
-}
-
-impl Segments {
-    fn from_slice(values: &[u32]) -> Self {
-        debug_assert!(values.len() <= FLUSH_PACKET_QUANTUM);
-        let mut segments = Self {
-            values: [0; FLUSH_PACKET_QUANTUM],
-            len: values.len() as u8,
-        };
-        segments.values[..values.len()].copy_from_slice(values);
-        segments
-    }
-
-    pub fn as_slice(&self) -> &[u32] {
-        &self.values[..self.len as usize]
-    }
-
-    pub fn len(&self) -> usize {
-        self.len as usize
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl IntoIterator for Segments {
-    type Item = u32;
-    type IntoIter = Take<IntoIter<u32, FLUSH_PACKET_QUANTUM>>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.values.into_iter().take(self.len as usize)
-    }
-}
-
 pub enum Outgoing {
     Plain(SocketAddr, Vec<u8>),
-    Batch(SocketAddr, Vec<u8>, Segments),
+    Batch(SocketAddr, Vec<u8>, NonZeroU16),
 }
 
 impl Outgoing {
@@ -233,7 +193,9 @@ impl Outgoing {
     fn packets(&self) -> usize {
         match self {
             Self::Plain(_, _) => 1,
-            Self::Batch(_, _, segments) => segments.len(),
+            Self::Batch(_, payload, segment_size) => {
+                payload.len().div_ceil(usize::from(segment_size.get()))
+            }
         }
     }
 
@@ -243,13 +205,13 @@ impl Outgoing {
 }
 
 struct ServerRuntime<P: ServerPolicy> {
-    config: conn::Config,
+    config: ValidatedConfig,
     shard: Shard<P::Guard, P::Verifier>,
     _policy: PhantomData<fn() -> P>,
 }
 
 impl<P: ServerPolicy> ServerRuntime<P> {
-    fn new(config: conn::Config, shard: Shard<P::Guard, P::Verifier>) -> Self {
+    fn new(config: ValidatedConfig, shard: Shard<P::Guard, P::Verifier>) -> Self {
         Self {
             config,
             shard,
@@ -269,7 +231,7 @@ pub struct Mux<H: Handler, P: ServerPolicy = Standard> {
     pending_outgoing_packets: usize,
     pending_outgoing_bytes: usize,
     pending_outgoing_bytes_capacity: usize,
-    out_batch: PacketBatch,
+    out_batch: GsoBatch,
     recycled_packets: Vec<Vec<u8>>,
     flush: QueueState,
     reap: QueueState,
@@ -281,15 +243,6 @@ pub struct Mux<H: Handler, P: ServerPolicy = Standard> {
 }
 
 impl<H: Handler> Mux<H, Standard> {
-    fn standard_server(
-        signing_key: SigningKey,
-        mut config: conn::Config,
-    ) -> Result<ServerRuntime<Standard>, ConnectError> {
-        config.validate()?;
-        let shard_config = Conn::take_server_config(signing_key, &mut config)?;
-        Ok(ServerRuntime::new(config, Shard::new(shard_config)))
-    }
-
     pub fn server(
         handler: H,
         signing_key: SigningKey,
@@ -343,10 +296,11 @@ impl<H: Handler> Mux<H, Standard> {
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
     ) -> Result<Self, ConnectError> {
-        let server = Self::standard_server(signing_key, server_config)?;
-        Self::with_limits(
+        Self::server_with_policy_and_limits(
             handler,
-            Some(server),
+            signing_key,
+            server_config,
+            NoGuard,
             max_conns,
             outgoing_capacity,
             outgoing_bytes_capacity,
@@ -401,18 +355,14 @@ where
     pub fn server_with_early_data_guard(
         handler: H,
         signing_key: SigningKey,
-        mut server_config: conn::Config,
+        server_config: conn::Config,
         guard: G,
     ) -> Result<Self, ConnectError> {
-        server_config.validate()?;
-        let shard_config = Conn::take_server_config(signing_key, &mut server_config)?;
-        let server = ServerRuntime::new(
-            server_config,
-            Shard::with_early_data_guard(shard_config, guard),
-        );
-        Self::with_limits(
+        Self::server_with_policy_and_limits(
             handler,
-            Some(server),
+            signing_key,
+            server_config,
+            guard,
             DEFAULT_MAX_CONNS,
             DEFAULT_OUTGOING_CAP,
             DEFAULT_OUTGOING_BYTES_CAP,
@@ -422,21 +372,17 @@ where
     pub fn server_with_early_data_guard_and_limits(
         handler: H,
         signing_key: SigningKey,
-        mut server_config: conn::Config,
+        server_config: conn::Config,
         guard: G,
         max_conns: usize,
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
     ) -> Result<Self, ConnectError> {
-        server_config.validate()?;
-        let shard_config = Conn::take_server_config(signing_key, &mut server_config)?;
-        let server = ServerRuntime::new(
-            server_config,
-            Shard::with_early_data_guard(shard_config, guard),
-        );
-        Self::with_limits(
+        Self::server_with_policy_and_limits(
             handler,
-            Some(server),
+            signing_key,
+            server_config,
+            guard,
             max_conns,
             outgoing_capacity,
             outgoing_bytes_capacity,
@@ -469,22 +415,17 @@ where
     pub fn server_mutual_with_limits(
         handler: H,
         signing_key: SigningKey,
-        mut server_config: conn::Config,
+        server_config: conn::Config,
         authentication: MutualAuthentication<V>,
         max_conns: usize,
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
     ) -> Result<Self, ConnectError> {
-        server_config.validate()?;
-        let shard_config = Conn::take_server_config(signing_key, &mut server_config)?;
-        let (_, auth, verifier) = authentication.into_parts();
-        let server = ServerRuntime::new(
-            server_config,
-            Shard::with_client_auth(shard_config, auth, verifier),
-        );
-        Self::with_limits(
+        Self::server_with_policy_and_limits(
             handler,
-            Some(server),
+            signing_key,
+            server_config,
+            authentication,
             max_conns,
             outgoing_capacity,
             outgoing_bytes_capacity,
@@ -518,22 +459,17 @@ where
     pub fn server_mutual_with_early_data_guard_and_limits(
         handler: H,
         signing_key: SigningKey,
-        mut server_config: conn::Config,
+        server_config: conn::Config,
         authentication: MutualAuthentication<V, G>,
         max_conns: usize,
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
     ) -> Result<Self, ConnectError> {
-        server_config.validate()?;
-        let shard_config = Conn::take_server_config(signing_key, &mut server_config)?;
-        let (guard, auth, verifier) = authentication.into_parts();
-        let server = ServerRuntime::new(
-            server_config,
-            Shard::with_early_data_guard_and_client_auth(shard_config, guard, auth, verifier),
-        );
-        Self::with_limits(
+        Self::server_with_policy_and_limits(
             handler,
-            Some(server),
+            signing_key,
+            server_config,
+            authentication,
             max_conns,
             outgoing_capacity,
             outgoing_bytes_capacity,
@@ -542,6 +478,64 @@ where
 }
 
 impl<H: Handler, P: ServerPolicy> Mux<H, P> {
+    pub fn server_with_policy(
+        handler: H,
+        signing_key: SigningKey,
+        server_config: conn::Config,
+        setup: P::Setup,
+    ) -> Result<Self, ConnectError> {
+        Self::server_with_policy_and_limits(
+            handler,
+            signing_key,
+            server_config,
+            setup,
+            DEFAULT_MAX_CONNS,
+            DEFAULT_OUTGOING_CAP,
+            DEFAULT_OUTGOING_BYTES_CAP,
+        )
+    }
+
+    pub fn server_with_policy_and_limits(
+        handler: H,
+        signing_key: SigningKey,
+        server_config: conn::Config,
+        setup: P::Setup,
+        max_conns: usize,
+        outgoing_capacity: usize,
+        outgoing_bytes_capacity: usize,
+    ) -> Result<Self, ConnectError> {
+        let server_config = ValidatedConfig::new(server_config)?;
+        Self::server_with_validated_policy_and_limits(
+            handler,
+            signing_key,
+            server_config,
+            setup,
+            max_conns,
+            outgoing_capacity,
+            outgoing_bytes_capacity,
+        )
+    }
+
+    pub(crate) fn server_with_validated_policy_and_limits(
+        handler: H,
+        signing_key: SigningKey,
+        mut server_config: ValidatedConfig,
+        setup: P::Setup,
+        max_conns: usize,
+        outgoing_capacity: usize,
+        outgoing_bytes_capacity: usize,
+    ) -> Result<Self, ConnectError> {
+        let shard_config = Conn::take_server_config(signing_key, &mut server_config)?;
+        let server = ServerRuntime::new(server_config, (P::BUILD_SHARD)(shard_config, setup));
+        Self::with_limits(
+            handler,
+            Some(server),
+            max_conns,
+            outgoing_capacity,
+            outgoing_bytes_capacity,
+        )
+    }
+
     fn is_initial_packet(wire: &[u8]) -> bool {
         matches!(wire.first(), Some(&b) if (b & 0xb0) == 0x80)
     }
@@ -592,9 +586,6 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         {
             return Err(ConnectError::InvalidConfig);
         }
-        if let Some(server) = &server {
-            server.config.validate()?;
-        }
         Ok(Self {
             entries: Self::entry_arena(max_conns),
             free_head: 0,
@@ -606,7 +597,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
             pending_outgoing_packets: 0,
             pending_outgoing_bytes: 0,
             pending_outgoing_bytes_capacity: outgoing_bytes_capacity,
-            out_batch: PacketBatch::default(),
+            out_batch: GsoBatch::default(),
             recycled_packets: Vec::with_capacity(outgoing_capacity),
             flush: QueueState::default(),
             reap: QueueState::default(),
@@ -652,7 +643,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
     }
 
     pub fn set_gso(&mut self, on: bool) {
-        self.gso = on;
+        self.gso = on && datagram::MAX_GSO_SEGMENTS > 1;
     }
 
     #[must_use]
@@ -953,23 +944,17 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         if max_packet_bytes < BASE_PMTU as usize {
             return Err(ConnError::PacketCeiling);
         }
-        let conn = match retry_odcid {
-            Some(odcid) => Conn::new_server_connection_retry(
+        let ids = match retry_odcid {
+            Some(odcid) => ServerConnectionIds::retry(
                 initial_dcid.clone(),
                 local_cid.clone(),
                 peer_cid,
                 odcid,
                 initial_dcid,
-                server_config,
             ),
-            None => Conn::new_server_connection(
-                initial_dcid,
-                local_cid.clone(),
-                peer_cid,
-                server_config,
-            ),
-        }
-        .map_err(|_| ConnError::Tls)?;
+            None => ServerConnectionIds::initial(initial_dcid, local_cid.clone(), peer_cid),
+        };
+        let conn = Conn::new_server_connection(ids, server_config).map_err(|_| ConnError::Tls)?;
         let handle = self
             .insert_slot(Slot::new(conn, from, max_packet_bytes))
             .ok_or(ConnError::EventCapacity)?;
@@ -1014,8 +999,16 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         let global_byte_room = self
             .pending_outgoing_bytes_capacity
             .saturating_sub(self.pending_outgoing_bytes);
-        let byte_room = global_byte_room.min(FLUSH_BYTE_QUANTUM.max(max_packet_bytes));
-        let packet_limit = packet_room.min(byte_room / max_packet_bytes);
+        let byte_quantum = if self.gso {
+            FLUSH_BYTE_QUANTUM.min(datagram::MAX_GSO_BYTES)
+        } else {
+            FLUSH_BYTE_QUANTUM
+        };
+        let byte_room = global_byte_room.min(byte_quantum.max(max_packet_bytes));
+        let mut packet_limit = packet_room.min(byte_room / max_packet_bytes);
+        if self.gso {
+            packet_limit = packet_limit.min(datagram::MAX_GSO_SEGMENTS);
+        }
         if packet_limit == 0 {
             return FlushRound::Backpressure;
         }
@@ -1024,7 +1017,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
             let addr = match self.entries.get_mut(idx).and_then(Entry::slot_mut) {
                 Some(s) => {
                     s.conn
-                        .send_batch(&mut batch, now, packet_limit, max_packet_bytes);
+                        .send_gso_batch(&mut batch, now, packet_limit, max_packet_bytes);
                     s.peer_addr
                 }
                 None => {
@@ -1106,18 +1099,13 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         }
     }
 
-    fn coalesce_gso(addr: SocketAddr, batch: &mut PacketBatch) -> Option<Outgoing> {
-        let n = batch.segs.len();
-        if n == 0 {
-            return None;
+    fn coalesce_gso(addr: SocketAddr, batch: &mut GsoBatch) -> Option<Outgoing> {
+        let (payload, segment_size, packets) = batch.take()?;
+        if packets == 1 {
+            Some(Outgoing::Plain(addr, payload))
+        } else {
+            Some(Outgoing::Batch(addr, payload, segment_size))
         }
-        if n == 1 {
-            batch.segs.clear();
-            return Some(Outgoing::Plain(addr, take(&mut batch.buf)));
-        }
-        let segments = Segments::from_slice(&batch.segs);
-        batch.segs.clear();
-        Some(Outgoing::Batch(addr, take(&mut batch.buf), segments))
     }
 
     fn schedule_flush(&mut self, handle: ConnHandle) {

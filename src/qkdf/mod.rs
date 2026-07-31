@@ -1,5 +1,5 @@
-use shin::hash::HashAlg;
-use shin::kdf::{Hkdf, HkdfError};
+use shin::crypto::hash::HashAlg;
+use shin::crypto::kdf::{Hkdf, HkdfError};
 
 const ALG: HashAlg = HashAlg::Sha256;
 

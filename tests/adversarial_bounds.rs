@@ -7,6 +7,7 @@ use dope_quic::frame::Frame;
 use dope_quic::packet::{InitialHeader, QUIC_V1};
 use dope_quic::packet_protection::PacketProtection;
 use dope_quic::qkdf::{InitialSecrets, PacketKeys};
+use dope_quic::varint::VarInt;
 use dope_quic::{Conn, ConnError, ConnectError, Handler, Mux, ServerConn, conn};
 
 const INITIAL_DCID: [u8; 8] = [0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce];
@@ -59,10 +60,10 @@ fn incoming_ack_ranges_are_bounded_before_iteration() {
     let mut server = server();
     let mut frames = Vec::new();
     Frame::Ack {
-        largest: 600,
-        delay: 0,
-        first_range: 0,
-        additional_ranges: vec![(0, 0); 257],
+        largest: VarInt::new(600).unwrap(),
+        delay: VarInt::ZERO,
+        first_range: VarInt::ZERO,
+        additional_ranges: vec![(VarInt::ZERO, VarInt::ZERO); 257],
     }
     .encode(&mut frames)
     .unwrap();
@@ -80,7 +81,7 @@ fn fragmented_crypto_ranges_are_bounded_on_the_wire() {
     for packet_number in 0..=256 {
         let mut frames = Vec::new();
         Frame::Crypto {
-            offset: packet_number * 2 + 1,
+            offset: VarInt::new(packet_number * 2 + 1).unwrap(),
             data: vec![packet_number as u8],
         }
         .encode(&mut frames)

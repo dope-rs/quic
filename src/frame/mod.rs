@@ -1,7 +1,7 @@
 use crate::varint;
 use crate::varint::VarInt;
 
-mod decode;
+pub(crate) mod decode;
 
 use decode::FrameDecoder;
 
@@ -59,17 +59,17 @@ impl From<varint::Error> for FrameError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AckRanges<'a> {
     input: &'a [u8],
-    remaining: u64,
+    remaining: usize,
 }
 
 impl<'a> AckRanges<'a> {
-    pub(crate) fn new(input: &'a [u8], remaining: u64) -> Self {
+    pub(crate) fn new(input: &'a [u8], remaining: usize) -> Self {
         Self { input, remaining }
     }
 }
 
 impl Iterator for AckRanges<'_> {
-    type Item = (u64, u64);
+    type Item = (VarInt, VarInt);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {
@@ -90,25 +90,24 @@ impl Iterator for AckRanges<'_> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.remaining as usize;
-        (remaining, Some(remaining))
+        (self.remaining, Some(self.remaining))
     }
 }
 
 impl ExactSizeIterator for AckRanges<'_> {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Frame<Data = Vec<u8>, Ranges = Vec<(u64, u64)>> {
+pub enum Frame<Data = Vec<u8>, Ranges = Vec<(VarInt, VarInt)>> {
     Padding,
     Ping,
     Ack {
-        largest: u64,
-        delay: u64,
-        first_range: u64,
+        largest: VarInt,
+        delay: VarInt,
+        first_range: VarInt,
         additional_ranges: Ranges,
     },
     Crypto {
-        offset: u64,
+        offset: VarInt,
         data: Data,
     },
     Datagram {
@@ -118,18 +117,18 @@ pub enum Frame<Data = Vec<u8>, Ranges = Vec<(u64, u64)>> {
     HandshakeDone,
     ConnectionClose {
         is_application: bool,
-        error_code: u64,
-        frame_type: u64,
+        error_code: VarInt,
+        frame_type: VarInt,
         reason: Data,
     },
     NewConnectionId {
-        sequence_number: u64,
-        retire_prior_to: u64,
+        sequence_number: VarInt,
+        retire_prior_to: VarInt,
         connection_id: Data,
         stateless_reset_token: [u8; 16],
     },
     RetireConnectionId {
-        sequence_number: u64,
+        sequence_number: VarInt,
     },
     PathChallenge {
         data: [u8; 8],
@@ -138,42 +137,42 @@ pub enum Frame<Data = Vec<u8>, Ranges = Vec<(u64, u64)>> {
         data: [u8; 8],
     },
     Stream {
-        stream_id: u64,
-        offset: u64,
+        stream_id: VarInt,
+        offset: VarInt,
         fin: bool,
         length_prefixed: bool,
         data: Data,
     },
     ResetStream {
-        stream_id: u64,
-        error_code: u64,
-        final_size: u64,
+        stream_id: VarInt,
+        error_code: VarInt,
+        final_size: VarInt,
     },
     StopSending {
-        stream_id: u64,
-        error_code: u64,
+        stream_id: VarInt,
+        error_code: VarInt,
     },
     MaxData {
-        maximum_data: u64,
+        maximum_data: VarInt,
     },
     MaxStreamData {
-        stream_id: u64,
-        maximum_stream_data: u64,
+        stream_id: VarInt,
+        maximum_stream_data: VarInt,
     },
     DataBlocked {
-        maximum_data: u64,
+        maximum_data: VarInt,
     },
     StreamDataBlocked {
-        stream_id: u64,
-        maximum_stream_data: u64,
+        stream_id: VarInt,
+        maximum_stream_data: VarInt,
     },
     MaxStreams {
         is_uni: bool,
-        max_streams: u64,
+        max_streams: VarInt,
     },
     StreamsBlocked {
         is_uni: bool,
-        max_streams: u64,
+        max_streams: VarInt,
     },
 }
 
@@ -300,45 +299,52 @@ impl<Data, Ranges> Frame<Data, Ranges> {
 }
 
 impl Frame {
-    pub(crate) fn decode_mapped<'a, Data, Ranges, DataMap, RangeMap>(
-        input: &'a [u8],
-        data: DataMap,
-        ranges: RangeMap,
-    ) -> Result<(Frame<Data, Ranges>, usize), FrameError>
-    where
-        DataMap: Copy + Fn(&'a [u8]) -> Data,
-        RangeMap: Fn(&'a [u8], u64) -> Ranges,
-    {
-        FrameDecoder::new(input, data, ranges).decode()
-    }
-
     pub fn encode_stream(
         out: &mut Vec<u8>,
-        stream_id: u64,
-        offset: u64,
+        stream_id: VarInt,
+        offset: VarInt,
         fin: bool,
         length_prefixed: bool,
         data: &[u8],
     ) -> Result<(), FrameError> {
+        Self::encode_stream_header(
+            out,
+            stream_id,
+            offset,
+            fin,
+            length_prefixed.then_some(data.len()),
+        )?;
+        out.extend_from_slice(data);
+        Ok(())
+    }
+
+    pub fn encode_stream_header(
+        out: &mut Vec<u8>,
+        stream_id: VarInt,
+        offset: VarInt,
+        fin: bool,
+        length: Option<usize>,
+    ) -> Result<(), FrameError> {
         let mut ty = TYPE_STREAM_BASE;
-        if offset != 0 {
+        if offset != VarInt::ZERO {
             ty |= STREAM_FLAG_OFF;
         }
-        if length_prefixed {
+        if length.is_some() {
             ty |= STREAM_FLAG_LEN;
         }
         if fin {
             ty |= STREAM_FLAG_FIN;
         }
         out.push(ty);
-        VarInt::encode(stream_id, out)?;
-        if offset != 0 {
-            VarInt::encode(offset, out)?;
+        stream_id.encode(out);
+        if offset != VarInt::ZERO {
+            offset.encode(out);
         }
-        if length_prefixed {
-            VarInt::encode(data.len() as u64, out)?;
+        if let Some(length) = length {
+            VarInt::from_usize(length)
+                .ok_or(FrameError::BadVarInt)?
+                .encode(out);
         }
-        out.extend_from_slice(data);
         Ok(())
     }
 
@@ -353,19 +359,23 @@ impl Frame {
                 additional_ranges,
             } => {
                 out.push(TYPE_ACK);
-                VarInt::encode(*largest, out)?;
-                VarInt::encode(*delay, out)?;
-                VarInt::encode(additional_ranges.len() as u64, out)?;
-                VarInt::encode(*first_range, out)?;
+                largest.encode(out);
+                delay.encode(out);
+                VarInt::from_usize(additional_ranges.len())
+                    .ok_or(FrameError::BadVarInt)?
+                    .encode(out);
+                first_range.encode(out);
                 for (gap, range_len) in additional_ranges {
-                    VarInt::encode(*gap, out)?;
-                    VarInt::encode(*range_len, out)?;
+                    gap.encode(out);
+                    range_len.encode(out);
                 }
             }
             Self::Crypto { offset, data } => {
                 out.push(TYPE_CRYPTO);
-                VarInt::encode(*offset, out)?;
-                VarInt::encode(data.len() as u64, out)?;
+                offset.encode(out);
+                VarInt::from_usize(data.len())
+                    .ok_or(FrameError::BadVarInt)?
+                    .encode(out);
                 out.extend_from_slice(data);
             }
             Self::Datagram {
@@ -374,7 +384,9 @@ impl Frame {
             } => {
                 if *length_prefixed {
                     out.push(TYPE_DATAGRAM_LEN);
-                    VarInt::encode(data.len() as u64, out)?;
+                    VarInt::from_usize(data.len())
+                        .ok_or(FrameError::BadVarInt)?
+                        .encode(out);
                     out.extend_from_slice(data);
                 } else {
                     out.push(TYPE_DATAGRAM);
@@ -389,15 +401,15 @@ impl Frame {
                 stateless_reset_token,
             } => {
                 out.push(TYPE_NEW_CONNECTION_ID);
-                VarInt::encode(*sequence_number, out)?;
-                VarInt::encode(*retire_prior_to, out)?;
+                sequence_number.encode(out);
+                retire_prior_to.encode(out);
                 out.push(connection_id.len() as u8);
                 out.extend_from_slice(connection_id);
                 out.extend_from_slice(stateless_reset_token);
             }
             Self::RetireConnectionId { sequence_number } => {
                 out.push(TYPE_RETIRE_CONNECTION_ID);
-                VarInt::encode(*sequence_number, out)?;
+                sequence_number.encode(out);
             }
             Self::PathChallenge { data } => {
                 out.push(TYPE_PATH_CHALLENGE);
@@ -422,41 +434,41 @@ impl Frame {
                 final_size,
             } => {
                 out.push(TYPE_RESET_STREAM);
-                VarInt::encode(*stream_id, out)?;
-                VarInt::encode(*error_code, out)?;
-                VarInt::encode(*final_size, out)?;
+                stream_id.encode(out);
+                error_code.encode(out);
+                final_size.encode(out);
             }
             Self::StopSending {
                 stream_id,
                 error_code,
             } => {
                 out.push(TYPE_STOP_SENDING);
-                VarInt::encode(*stream_id, out)?;
-                VarInt::encode(*error_code, out)?;
+                stream_id.encode(out);
+                error_code.encode(out);
             }
             Self::MaxData { maximum_data } => {
                 out.push(TYPE_MAX_DATA);
-                VarInt::encode(*maximum_data, out)?;
+                maximum_data.encode(out);
             }
             Self::MaxStreamData {
                 stream_id,
                 maximum_stream_data,
             } => {
                 out.push(TYPE_MAX_STREAM_DATA);
-                VarInt::encode(*stream_id, out)?;
-                VarInt::encode(*maximum_stream_data, out)?;
+                stream_id.encode(out);
+                maximum_stream_data.encode(out);
             }
             Self::DataBlocked { maximum_data } => {
                 out.push(TYPE_DATA_BLOCKED);
-                VarInt::encode(*maximum_data, out)?;
+                maximum_data.encode(out);
             }
             Self::StreamDataBlocked {
                 stream_id,
                 maximum_stream_data,
             } => {
                 out.push(TYPE_STREAM_DATA_BLOCKED);
-                VarInt::encode(*stream_id, out)?;
-                VarInt::encode(*maximum_stream_data, out)?;
+                stream_id.encode(out);
+                maximum_stream_data.encode(out);
             }
             Self::MaxStreams {
                 is_uni,
@@ -467,7 +479,7 @@ impl Frame {
                 } else {
                     TYPE_MAX_STREAMS_BIDI
                 });
-                VarInt::encode(*max_streams, out)?;
+                max_streams.encode(out);
             }
             Self::StreamsBlocked {
                 is_uni,
@@ -478,7 +490,7 @@ impl Frame {
                 } else {
                     TYPE_STREAMS_BLOCKED_BIDI
                 });
-                VarInt::encode(*max_streams, out)?;
+                max_streams.encode(out);
             }
             Self::ConnectionClose {
                 is_application,
@@ -491,11 +503,13 @@ impl Frame {
                 } else {
                     TYPE_CONNECTION_CLOSE
                 });
-                VarInt::encode(*error_code, out)?;
+                error_code.encode(out);
                 if !*is_application {
-                    VarInt::encode(*frame_type, out)?;
+                    frame_type.encode(out);
                 }
-                VarInt::encode(reason.len() as u64, out)?;
+                VarInt::from_usize(reason.len())
+                    .ok_or(FrameError::BadVarInt)?
+                    .encode(out);
                 out.extend_from_slice(reason);
             }
         }

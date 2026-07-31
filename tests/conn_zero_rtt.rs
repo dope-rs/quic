@@ -5,8 +5,8 @@ use std::time::Instant;
 use dope_quic::conn::PacketBatch;
 use dope_quic::early_data::EarlyDataReplayCache;
 use dope_quic::{Conn, SessionTicket, conn, transport_params};
-use shin::client::Resumption;
-use shin::sig::SigningKey;
+use shin::client::config::Resumption;
+use shin::crypto::sig::SigningKey;
 
 const HS_CID: [u8; 8] = [0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7];
 const TICKET_SECRET: [u8; 32] = [0xCAu8; 32];

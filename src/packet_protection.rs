@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use shin::aead::AeadKey;
+use shin::crypto::aead::AeadKey;
 
 use crate::hp::HeaderProtectionKey;
 use crate::qkdf::PacketKeys;
@@ -146,6 +146,59 @@ impl PacketProtection {
             pn_offset..pn_end,
             SHORT_HEADER_MASK,
         )
+    }
+
+    pub fn protect_short_in_place(
+        &self,
+        dst: &mut Vec<u8>,
+        packet_start: usize,
+        payload_start: usize,
+        packet_number: u64,
+        pn_offset: usize,
+        pn_len: usize,
+    ) -> Result<usize, PacketProtectionError> {
+        let pn_end = pn_offset
+            .checked_add(pn_len)
+            .ok_or(PacketProtectionError::InvalidPacket)?;
+        if packet_start >= payload_start
+            || payload_start > dst.len()
+            || pn_len == 0
+            || pn_len > 4
+            || pn_offset < packet_start
+            || pn_end > payload_start
+        {
+            return Err(PacketProtectionError::InvalidPacket);
+        }
+
+        let tag = {
+            let (header, payload) = dst.split_at_mut(payload_start);
+            self.aead
+                .seal_detached(packet_number, &header[packet_start..payload_start], payload)
+                .map_err(|_| PacketProtectionError::Encrypt)?
+        };
+        dst.extend_from_slice(&tag);
+
+        let sample_start = pn_offset
+            .checked_add(4)
+            .ok_or(PacketProtectionError::InvalidPacket)?;
+        let sample_end = sample_start
+            .checked_add(16)
+            .ok_or(PacketProtectionError::InvalidPacket)?;
+        let mut sample = [0u8; 16];
+        sample.copy_from_slice(
+            dst.get(sample_start..sample_end)
+                .ok_or(PacketProtectionError::InvalidPacket)?,
+        );
+        let mask = self
+            .hp
+            .mask(&sample)
+            .map_err(|_| PacketProtectionError::HeaderProtection)?;
+
+        dst[packet_start] ^= mask[0] & SHORT_HEADER_MASK;
+        for (index, byte) in dst[pn_offset..pn_end].iter_mut().enumerate() {
+            *byte ^= mask[1 + index];
+        }
+        Ok(dst.len() - packet_start)
     }
 
     fn encrypt_into(

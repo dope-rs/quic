@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use dope_quic::mux::Outgoing;
 use dope_quic::{Conn, ConnHandle, Handler, Mux, StreamEvent, transport_params};
-use shin::sig::SigningKey;
+use shin::crypto::sig::SigningKey;
 
 const CID: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
@@ -37,12 +37,9 @@ fn deliver(dst: &mut Mux<CapturingHandler>, src_addr: SocketAddr, burst: Vec<Out
             Outgoing::Plain(_, payload) => {
                 dst.recv(src_addr, &payload, now).expect("recv");
             }
-            Outgoing::Batch(_, payload, segments) => {
-                let mut offset = 0;
-                for segment in segments {
-                    let end = offset + segment as usize;
-                    dst.recv(src_addr, &payload[offset..end], now).unwrap();
-                    offset = end;
+            Outgoing::Batch(_, payload, segment_size) => {
+                for segment in payload.chunks(usize::from(segment_size.get())) {
+                    dst.recv(src_addr, segment, now).unwrap();
                 }
                 gso_runs += 1;
             }
@@ -67,7 +64,7 @@ fn gso_burst_reassembles_to_full_stream() {
     let server_handler = CapturingHandler::default();
     let server_events = server_handler.events.clone();
     let mut server =
-        Mux::server_with_outgoing_capacity(server_handler, signing, tp.clone().into(), 2).unwrap();
+        Mux::server_with_outgoing_capacity(server_handler, signing, tp.clone().into(), 64).unwrap();
     server.set_gso(true);
 
     let client_handler = CapturingHandler::default();

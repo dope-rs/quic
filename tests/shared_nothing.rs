@@ -1,8 +1,9 @@
 use dope_quic::client_auth::{ClientAuth, ClientCertVerifier, ClientIdentity};
 use dope_quic::early_data::EarlyDataReplayCache;
-use dope_quic::{Handler, MutualAuthentication, Mux};
-use shin::sig::SigningKey;
-use shin::ticket::TicketKeys;
+use dope_quic::{Conn, Handler, Mutual, MutualAuthentication, Mux, ServerConnectionIds, Standard};
+use shin::server::config::NoGuard;
+use shin::crypto::sig::SigningKey;
+use shin::crypto::ticket::TicketKeys;
 
 struct Noop;
 
@@ -58,4 +59,27 @@ fn lane_owned_security_policies_are_concrete() {
 fn clients_have_no_ticket_shard() {
     let mut client = Mux::client(Noop).unwrap();
     assert!(!client.replace_ticket_keys(Some(TicketKeys::single([0x42; 32]))));
+}
+
+#[test]
+fn generic_policy_paths_cover_conn_and_mux() {
+    let cid = vec![0x71; 8];
+    let ids = ServerConnectionIds::initial(cid.clone(), cid.clone(), cid);
+    let _server =
+        Conn::new_server_with_policy::<Standard>(ids, signing(), Default::default(), NoGuard)
+            .unwrap();
+
+    let authentication = MutualAuthentication::with_early_data_guard(
+        EarlyDataReplayCache::new(),
+        ClientAuth::Required,
+        Accept,
+    );
+    let mut mux = Mux::<_, Mutual<EarlyDataReplayCache, Accept>>::server_with_policy(
+        Noop,
+        signing(),
+        Default::default(),
+        authentication,
+    )
+    .unwrap();
+    assert!(mux.replace_ticket_keys(Some(TicketKeys::single([0x44; 32]))));
 }

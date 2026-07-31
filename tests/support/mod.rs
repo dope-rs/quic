@@ -2,8 +2,8 @@ use dope_quic::packet::{InitialHeader, QUIC_V1};
 use dope_quic::packet_protection::PacketProtection;
 use dope_quic::qkdf::{InitialSecrets, PacketKeys};
 use dope_quic::{Conn, ServerConn, conn, transport_params};
-use shin::server::{ClientCertVerifier, EarlyDataGuard};
-use shin::sig::SigningKey;
+use shin::server::{config::ClientCertVerifier, config::EarlyDataGuard};
+use shin::crypto::sig::SigningKey;
 use std::time::Instant;
 
 pub fn signing_key(seed: u8) -> SigningKey {

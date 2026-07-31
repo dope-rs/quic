@@ -14,7 +14,7 @@ use crate::TrySendError;
 use crate::conn::{self, Conn, ConnHandle};
 use crate::endpoint::{self, Endpoint};
 use crate::mux::Handler;
-use dope::runtime::Idle;
+use dope::runtime::dispatcher::Idle;
 use std::io::Error;
 use std::io::ErrorKind;
 

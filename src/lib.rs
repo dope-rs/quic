@@ -41,15 +41,17 @@ pub use client::{
 };
 pub use conn::{
     Conn, ConnError, ConnHandle, DatagramCongestionControl, Mutual, MutualAuthentication,
-    ServerConn, ServerPolicy, SessionTicket, Standard, State as ConnState, StreamError,
-    StreamEvent,
+    ServerConn, ServerConnectionIds, ServerPolicy, SessionTicket, Standard, State as ConnState,
+    StreamError, StreamEvent,
 };
 pub use endpoint::Endpoint;
 pub use errors::{ConnectError, TrySendError};
 pub use mux::{Handler, Mux};
+pub use o3::buffer::{CapacityError, InlineBytes};
+pub use stream::{INLINE_SEND_CAPACITY, SendBuffer};
 pub use transport_params::TransportParameterError;
 
 pub mod client_auth {
-    pub use shin::client::ClientCertSource;
-    pub use shin::server::{ClientAuth, ClientCertVerifier, ClientIdentity};
+    pub use shin::client::config::ClientCertSource;
+    pub use shin::server::{config::ClientAuth, config::ClientCertVerifier, config::ClientIdentity};
 }

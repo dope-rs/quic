@@ -1,20 +1,20 @@
 use super::*;
 
-fn data_end(input: &[u8], pos: usize, length: u64) -> Result<usize, FrameError> {
-    let length = usize::try_from(length).map_err(|_| FrameError::Underflow)?;
+fn data_end(input: &[u8], pos: usize, length: VarInt) -> Result<usize, FrameError> {
+    let length = usize::try_from(length.get()).map_err(|_| FrameError::Underflow)?;
     pos.checked_add(length)
         .filter(|&end| end <= input.len())
         .ok_or(FrameError::Underflow)
 }
 
-pub(super) struct FrameDecoder<'a, DataMap, RangeMap> {
+pub(crate) struct FrameDecoder<'a, DataMap, RangeMap> {
     input: &'a [u8],
     data: DataMap,
     ranges: RangeMap,
 }
 
 impl<'a, DataMap, RangeMap> FrameDecoder<'a, DataMap, RangeMap> {
-    pub(super) fn new(input: &'a [u8], data: DataMap, ranges: RangeMap) -> Self {
+    pub(crate) fn new(input: &'a [u8], data: DataMap, ranges: RangeMap) -> Self {
         Self {
             input,
             data,
@@ -22,10 +22,10 @@ impl<'a, DataMap, RangeMap> FrameDecoder<'a, DataMap, RangeMap> {
         }
     }
 
-    pub(super) fn decode<Data, Ranges>(self) -> Result<(Frame<Data, Ranges>, usize), FrameError>
+    pub(crate) fn decode<Data, Ranges>(self) -> Result<(Frame<Data, Ranges>, usize), FrameError>
     where
         DataMap: Copy + Fn(&'a [u8]) -> Data,
-        RangeMap: Fn(&'a [u8], u64) -> Ranges,
+        RangeMap: Fn(&'a [u8], usize) -> Ranges,
     {
         let Self {
             input,
@@ -135,7 +135,7 @@ impl<'a, DataMap, RangeMap> FrameDecoder<'a, DataMap, RangeMap> {
                     pos += n;
                     o
                 } else {
-                    0
+                    VarInt::ZERO
                 };
                 let data = if has_len {
                     let (length, n) = VarInt::decode(&input[pos..])?;
@@ -167,16 +167,19 @@ impl<'a, DataMap, RangeMap> FrameDecoder<'a, DataMap, RangeMap> {
                 pos += n;
                 let (range_count, n) = VarInt::decode(&input[pos..])?;
                 pos += n;
-                if range_count > MAX_ACK_RANGES as u64 {
+                let range_count =
+                    usize::try_from(range_count.get()).map_err(|_| FrameError::InvalidAckRange)?;
+                if range_count > MAX_ACK_RANGES {
                     return Err(FrameError::InvalidAckRange);
                 }
                 let (first_range, n) = VarInt::decode(&input[pos..])?;
                 pos += n;
                 let mut previous_smallest = largest
-                    .checked_sub(first_range)
+                    .get()
+                    .checked_sub(first_range.get())
                     .ok_or(FrameError::InvalidAckRange)?;
                 let remaining = input.len().saturating_sub(pos);
-                if range_count > remaining as u64 {
+                if range_count > remaining {
                     return Err(FrameError::Underflow);
                 }
                 let ranges_start = pos;
@@ -185,12 +188,15 @@ impl<'a, DataMap, RangeMap> FrameDecoder<'a, DataMap, RangeMap> {
                     pos += n;
                     let (range_len, n) = VarInt::decode(&input[pos..])?;
                     pos += n;
-                    let skip = gap.checked_add(2).ok_or(FrameError::InvalidAckRange)?;
+                    let skip = gap
+                        .get()
+                        .checked_add(2)
+                        .ok_or(FrameError::InvalidAckRange)?;
                     let next_largest = previous_smallest
                         .checked_sub(skip)
                         .ok_or(FrameError::InvalidAckRange)?;
                     previous_smallest = next_largest
-                        .checked_sub(range_len)
+                        .checked_sub(range_len.get())
                         .ok_or(FrameError::InvalidAckRange)?;
                 }
                 let additional_ranges = ranges(&input[ranges_start..pos], range_count);
@@ -297,7 +303,7 @@ impl<'a, DataMap, RangeMap> FrameDecoder<'a, DataMap, RangeMap> {
                 let (error_code, n) = VarInt::decode(&input[pos..])?;
                 pos += n;
                 let frame_type = if is_application {
-                    0
+                    VarInt::ZERO
                 } else {
                     let (ft, n) = VarInt::decode(&input[pos..])?;
                     pos += n;

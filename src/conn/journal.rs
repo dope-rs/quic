@@ -210,8 +210,8 @@ impl PacketJournalTable {
         ring.drain_range(first_smallest, largest, &mut emit);
         let mut previous_smallest = first_smallest;
         for (gap, range) in additional {
-            let next_largest = previous_smallest - gap - 2;
-            let next_smallest = next_largest - range;
+            let next_largest = previous_smallest - gap.get() - 2;
+            let next_smallest = next_largest - range.get();
             ring.drain_range(next_smallest, next_largest, &mut emit);
             previous_smallest = next_smallest;
         }

@@ -1,6 +1,13 @@
 use std::collections::BTreeMap;
 
+use o3::buffer::{
+    Bytes, CapacityError, INLINE_BYTES_CAPACITY, InlineBytes, Retained, RetainedSegmentQueue,
+};
+
 use crate::range_buffer::{InsertError, MAX_RANGES, RangeBuffer};
+
+const MAX_SEND_SEGMENTS: usize = 4096;
+pub const INLINE_SEND_CAPACITY: usize = INLINE_BYTES_CAPACITY;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvError {
@@ -98,10 +105,57 @@ impl RecvStream {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SendBuffer {
+    Inline(InlineBytes),
+    Owned(Vec<u8>),
+    Retained(Bytes<Retained>),
+}
+
+impl SendBuffer {
+    pub fn inline(bytes: &[u8]) -> Result<Self, CapacityError> {
+        InlineBytes::from_slice(bytes).map(Self::Inline)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline(bytes) => bytes.as_slice(),
+            Self::Owned(bytes) => bytes,
+            Self::Retained(bytes) => bytes.as_slice(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+}
+
+impl AsRef<[u8]> for SendBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for SendBuffer {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Owned(bytes)
+    }
+}
+
+impl From<Bytes<Retained>> for SendBuffer {
+    fn from(bytes: Bytes<Retained>) -> Self {
+        Self::Retained(bytes)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SendStream {
-    buf: Vec<u8>,
-    start: usize,
+    chunks: RetainedSegmentQueue<SendBuffer>,
+    spare: Vec<u8>,
     base_offset: u64,
     sent_rel: usize,
     acked: BTreeMap<u64, u64>,
@@ -113,9 +167,38 @@ pub struct SendStream {
 }
 
 impl SendStream {
-    pub fn write(&mut self, data: &[u8]) {
-        self.compact();
-        self.buf.extend_from_slice(data);
+    pub fn write(&mut self, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return true;
+        }
+        if matches!(self.chunks.back(), Some(SendBuffer::Owned(_))) {
+            return self
+                .chunks
+                .try_mutate_back(data.len(), |tail| {
+                    let SendBuffer::Owned(tail) = tail else {
+                        return false;
+                    };
+                    tail.extend_from_slice(data);
+                    true
+                })
+                .unwrap_or(false);
+        }
+        let mut owned = std::mem::take(&mut self.spare);
+        owned.extend_from_slice(data);
+        self.write_buffer(owned.into())
+    }
+
+    pub fn write_buffer(&mut self, data: SendBuffer) -> bool {
+        if data.is_empty() {
+            return true;
+        }
+        if self.chunks.len().checked_add(data.len()).is_none() {
+            return false;
+        }
+        if self.chunks.segment_count() >= MAX_SEND_SEGMENTS {
+            self.coalesce();
+        }
+        self.chunks.try_push_back(data).is_ok()
     }
 
     pub fn mark_fin(&mut self) {
@@ -130,11 +213,8 @@ impl SendStream {
         self.base_offset.saturating_add(self.sent_rel as u64)
     }
 
-    pub fn unsent(&self) -> (u64, &[u8]) {
-        (
-            self.base_offset.saturating_add(self.sent_rel as u64),
-            &self.buf[self.start + self.sent_rel..],
-        )
+    pub fn unsent_len(&self) -> usize {
+        self.chunks.len().saturating_sub(self.sent_rel)
     }
 
     pub fn would_fin(&self, take: usize) -> bool {
@@ -145,17 +225,30 @@ impl SendStream {
         self.fin_sent || self.reset_sent
     }
 
-    pub fn chunk_at(&self, offset: u64, len: u64) -> Option<&[u8]> {
+    pub fn range_available(&self, offset: u64, len: u64) -> bool {
         if offset < self.base_offset {
-            return None;
+            return false;
         }
-        let start = usize::try_from(offset - self.base_offset).ok()?;
-        let len = usize::try_from(len).ok()?;
-        let end = start.checked_add(len)?;
-        if end > self.len() {
-            return None;
+        let Some(start) = usize::try_from(offset - self.base_offset).ok() else {
+            return false;
+        };
+        let Some(len) = usize::try_from(len).ok() else {
+            return false;
+        };
+        self.chunks.range_available(start, len)
+    }
+
+    pub fn append_range(&self, out: &mut Vec<u8>, offset: u64, len: usize) -> bool {
+        if u64::try_from(len).is_err() || offset < self.base_offset {
+            return false;
         }
-        Some(&self.buf[self.start + start..self.start + end])
+        let Ok(offset) = usize::try_from(offset - self.base_offset) else {
+            return false;
+        };
+        if len == 0 {
+            return offset < self.chunks.len();
+        }
+        self.chunks.extend_range(offset, len, out)
     }
 
     pub fn advance_sent(&mut self, n: usize, fin_now: bool) {
@@ -197,11 +290,10 @@ impl SendStream {
             let drain_n = usize::try_from(e0 - self.base_offset)
                 .unwrap_or(usize::MAX)
                 .min(self.len());
-            self.start += drain_n;
+            self.discard_prefix(drain_n);
             self.base_offset += drain_n as u64;
             self.sent_rel = self.sent_rel.saturating_sub(drain_n);
             self.acked.remove(&s0);
-            self.compact();
         }
     }
 
@@ -211,8 +303,7 @@ impl SendStream {
 
     pub fn stop(&mut self, error_code: u64) {
         self.stop_sending_error = Some(error_code);
-        self.buf.clear();
-        self.start = 0;
+        self.chunks.clear();
         self.sent_rel = 0;
     }
 
@@ -222,8 +313,7 @@ impl SendStream {
 
     pub fn mark_reset_sent(&mut self) {
         self.reset_sent = true;
-        self.buf.clear();
-        self.start = 0;
+        self.chunks.clear();
         self.sent_rel = 0;
     }
 
@@ -232,28 +322,44 @@ impl SendStream {
     }
 
     fn len(&self) -> usize {
-        self.buf.len() - self.start
+        self.chunks.len()
     }
 
-    fn compact(&mut self) {
-        if self.start == 0 {
+    fn discard_prefix(&mut self, len: usize) {
+        let Self { chunks, spare, .. } = self;
+        chunks.consume_prefix_up_to(len, |segment| {
+            if let SendBuffer::Owned(mut bytes) = segment {
+                bytes.clear();
+                if bytes.capacity() > spare.capacity() {
+                    *spare = bytes;
+                }
+            }
+        });
+    }
+
+    fn coalesce(&mut self) {
+        let mut bytes = std::mem::take(&mut self.spare);
+        let buffered_len = self.chunks.len();
+        bytes.reserve(buffered_len);
+        let appended = self.append_range(&mut bytes, self.base_offset, buffered_len);
+        debug_assert!(appended);
+        if !appended {
+            bytes.clear();
+            self.spare = bytes;
             return;
         }
-        if self.start == self.buf.len() {
-            self.buf.clear();
-            self.start = 0;
-        } else if self.start >= self.buf.len() / 2 {
-            let len = self.len();
-            self.buf.copy_within(self.start.., 0);
-            self.buf.truncate(len);
-            self.start = 0;
-        }
+        self.chunks.clear();
+        self.chunks
+            .try_push_back(SendBuffer::Owned(bytes))
+            .unwrap_or_else(|_| unreachable!("coalesced length was already represented"));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RecvStream;
+    use std::mem::size_of;
+
+    use super::{INLINE_SEND_CAPACITY, MAX_SEND_SEGMENTS, RecvStream, SendBuffer, SendStream};
 
     #[test]
     fn owned_read_moves_the_assembled_allocation() {
@@ -301,5 +407,86 @@ mod tests {
 
         assert_eq!(stream.read_owned().unwrap(), b"abcXYZ");
         assert!(stream.is_eof());
+    }
+
+    #[test]
+    fn send_stream_appends_across_owned_segments() {
+        let first = b"frame".to_vec();
+        let second = b"-body".to_vec();
+        let mut stream = SendStream::default();
+        assert!(stream.write_buffer(SendBuffer::Owned(first)));
+        assert!(stream.write_buffer(SendBuffer::Owned(second)));
+
+        let mut out = Vec::new();
+        assert!(stream.append_range(&mut out, 0, 10));
+        assert_eq!(out, b"frame-body");
+        assert_eq!(stream.unsent_len(), 10);
+    }
+
+    #[test]
+    fn empty_send_ranges_keep_the_existing_boundary_semantics() {
+        let mut stream = SendStream::default();
+        let mut out = Vec::new();
+        assert!(!stream.append_range(&mut out, 0, 0));
+
+        assert!(stream.write(b"body"));
+        assert!(stream.append_range(&mut out, 0, 0));
+        assert!(!stream.append_range(&mut out, 4, 0));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn inline_send_buffer_stays_within_the_existing_segment_footprint() {
+        let bytes = [b'x'; INLINE_SEND_CAPACITY];
+        let inline = SendBuffer::inline(&bytes).unwrap();
+
+        assert_eq!(inline.as_slice(), bytes);
+        assert_eq!(size_of::<SendBuffer>(), 32);
+        assert!(SendBuffer::inline(&[0; INLINE_SEND_CAPACITY + 1]).is_err());
+        assert_eq!(size_of::<SendStream>(), 136);
+    }
+
+    #[test]
+    fn send_stream_releases_acked_prefix_segments() {
+        let mut stream = SendStream::default();
+        assert!(stream.write_buffer(SendBuffer::Owned(b"head".to_vec())));
+        assert!(stream.write_buffer(SendBuffer::Owned(b"payload".to_vec())));
+        stream.advance_sent(11, false);
+
+        stream.ack(0, 6);
+
+        let mut out = Vec::new();
+        assert!(stream.append_range(&mut out, 6, 5));
+        assert_eq!(out, b"yload");
+        assert_eq!(stream.next_offset(), 11);
+    }
+
+    #[test]
+    fn borrowed_writes_reuse_the_acked_allocation() {
+        let mut stream = SendStream::default();
+        assert!(stream.write(b"first"));
+        let first_ptr = stream.chunks.front().unwrap().as_slice().as_ptr();
+        stream.advance_sent(5, false);
+        stream.ack(0, 5);
+
+        assert!(stream.write(b"next"));
+
+        assert_eq!(
+            stream.chunks.front().unwrap().as_slice().as_ptr(),
+            first_ptr
+        );
+    }
+
+    #[test]
+    fn excessive_segments_are_coalesced() {
+        let mut stream = SendStream::default();
+        for _ in 0..=MAX_SEND_SEGMENTS {
+            assert!(stream.write_buffer(SendBuffer::Owned(vec![b'x'])));
+        }
+
+        assert!(stream.chunks.segment_count() <= 2);
+        let mut out = Vec::new();
+        assert!(stream.append_range(&mut out, 0, MAX_SEND_SEGMENTS + 1));
+        assert!(out.iter().all(|byte| *byte == b'x'));
     }
 }

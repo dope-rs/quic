@@ -1,8 +1,14 @@
+use std::num::NonZeroU16;
+
 pub(super) trait PacketSink {
+    fn reset(&mut self, max_packets: usize, max_packet_bytes: usize) {
+        let _ = (max_packets, max_packet_bytes);
+    }
+
     fn emit<T>(
         &mut self,
         max_packet_bytes: usize,
-        build: impl FnOnce(&mut Vec<u8>) -> Option<(usize, T)>,
+        build: impl FnOnce(&mut Vec<u8>, usize) -> Option<(usize, T)>,
     ) -> Option<T>;
     fn is_empty(&self) -> bool;
 }
@@ -41,13 +47,20 @@ impl PacketBatch {
 }
 
 impl PacketSink for PacketBatch {
+    fn reset(&mut self, max_packets: usize, max_packet_bytes: usize) {
+        self.clear();
+        self.buf
+            .reserve(max_packets.saturating_mul(max_packet_bytes));
+        self.segs.reserve(max_packets);
+    }
+
     fn emit<T>(
         &mut self,
         max_packet_bytes: usize,
-        build: impl FnOnce(&mut Vec<u8>) -> Option<(usize, T)>,
+        build: impl FnOnce(&mut Vec<u8>, usize) -> Option<(usize, T)>,
     ) -> Option<T> {
         let start = self.buf.len();
-        match build(&mut self.buf) {
+        match build(&mut self.buf, max_packet_bytes) {
             Some((n, commit))
                 if n <= max_packet_bytes
                     && self.buf.len().saturating_sub(start) == n
@@ -68,14 +81,102 @@ impl PacketSink for PacketBatch {
     }
 }
 
+pub(crate) struct GsoBatch {
+    pub(crate) buf: Vec<u8>,
+    segment_size: Option<NonZeroU16>,
+    packets: u8,
+    sealed: bool,
+}
+
+impl GsoBatch {
+    pub(crate) const fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            segment_size: None,
+            packets: 0,
+            sealed: false,
+        }
+    }
+
+    pub(crate) fn take(&mut self) -> Option<(Vec<u8>, NonZeroU16, usize)> {
+        let segment_size = self.segment_size.take()?;
+        let packets = usize::from(self.packets);
+        self.packets = 0;
+        self.sealed = false;
+        Some((core::mem::take(&mut self.buf), segment_size, packets))
+    }
+}
+
+impl Default for GsoBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PacketSink for GsoBatch {
+    fn reset(&mut self, max_packets: usize, max_packet_bytes: usize) {
+        self.buf.clear();
+        self.segment_size = None;
+        self.packets = 0;
+        self.sealed = false;
+        self.buf
+            .reserve(max_packets.saturating_mul(max_packet_bytes));
+    }
+
+    fn emit<T>(
+        &mut self,
+        max_packet_bytes: usize,
+        build: impl FnOnce(&mut Vec<u8>, usize) -> Option<(usize, T)>,
+    ) -> Option<T> {
+        if self.sealed || usize::from(self.packets) >= dope::manifold::datagram::MAX_GSO_SEGMENTS {
+            return None;
+        }
+        let remaining = dope::manifold::datagram::MAX_GSO_BYTES.saturating_sub(self.buf.len());
+        let limit = self
+            .segment_size
+            .map_or(max_packet_bytes, |size| {
+                max_packet_bytes.min(usize::from(size.get()))
+            })
+            .min(remaining);
+        if limit == 0 {
+            return None;
+        }
+        let start = self.buf.len();
+        let Some((bytes, commit)) = build(&mut self.buf, limit) else {
+            self.buf.truncate(start);
+            return None;
+        };
+        let segment_size = self
+            .segment_size
+            .or_else(|| u16::try_from(bytes).ok().and_then(NonZeroU16::new));
+        let valid = bytes != 0
+            && bytes <= limit
+            && self.buf.len().saturating_sub(start) == bytes
+            && segment_size.is_some();
+        if !valid {
+            self.buf.truncate(start);
+            return None;
+        }
+        let segment_size = segment_size.unwrap_or_else(|| unreachable!());
+        self.segment_size = Some(segment_size);
+        self.packets += 1;
+        self.sealed = bytes < usize::from(segment_size.get());
+        Some(commit)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.packets == 0
+    }
+}
+
 impl PacketSink for Vec<Vec<u8>> {
     fn emit<T>(
         &mut self,
         max_packet_bytes: usize,
-        build: impl FnOnce(&mut Vec<u8>) -> Option<(usize, T)>,
+        build: impl FnOnce(&mut Vec<u8>, usize) -> Option<(usize, T)>,
     ) -> Option<T> {
         let mut pkt = Vec::new();
-        if let Some((n, commit)) = build(&mut pkt) {
+        if let Some((n, commit)) = build(&mut pkt, max_packet_bytes) {
             if n <= max_packet_bytes && pkt.len() == n {
                 self.push(pkt);
                 Some(commit)
@@ -101,10 +202,13 @@ impl PacketSink for PacketSlot<'_> {
     fn emit<T>(
         &mut self,
         max_packet_bytes: usize,
-        build: impl FnOnce(&mut Vec<u8>) -> Option<(usize, T)>,
+        build: impl FnOnce(&mut Vec<u8>, usize) -> Option<(usize, T)>,
     ) -> Option<T> {
         self.packet.clear();
-        let (bytes, commit) = build(self.packet)?;
+        let Some((bytes, commit)) = build(self.packet, max_packet_bytes) else {
+            self.packet.clear();
+            return None;
+        };
         if bytes > max_packet_bytes || self.packet.len() != bytes {
             self.packet.clear();
             return None;

@@ -112,7 +112,7 @@ fn decode_long_prefix(input: &[u8], packet_type: u8) -> Result<LongPrefix<'_>, D
 fn decode_length(input: &[u8], pos: &mut usize) -> Result<usize, DecodeError> {
     let (length, consumed) = VarInt::decode(&input[*pos..]).map_err(|_| DecodeError::BadVarInt)?;
     *pos += consumed;
-    usize::try_from(length).map_err(|_| DecodeError::BadVarInt)
+    usize::try_from(length.get()).map_err(|_| DecodeError::BadVarInt)
 }
 
 fn decode_non_initial_prefix(
@@ -141,48 +141,56 @@ pub(crate) struct LongHeader<'a> {
     pub(crate) packet_number_len: u8,
 }
 
-pub(crate) fn encode_long_header_into(
-    out: &mut Vec<u8>,
-    header: LongHeader<'_>,
-    body_len_after_pn: usize,
-) -> Result<usize, EncodeError> {
-    validate_header_fields(header.packet_number_len, header.dcid, header.scid)?;
-    let body_len = u64::try_from(body_len_after_pn).map_err(|_| EncodeError::ValueOutOfRange)?;
-    let length = u64::from(header.packet_number_len)
-        .checked_add(body_len)
-        .filter(|&length| length <= VarInt::MAX)
-        .ok_or(EncodeError::ValueOutOfRange)?;
-    out.push(FORM_LONG | FIXED_BIT | header.packet_type | (header.packet_number_len - 1));
-    out.extend_from_slice(&header.version.to_be_bytes());
-    out.push(header.dcid.len() as u8);
-    out.extend_from_slice(header.dcid);
-    out.push(header.scid.len() as u8);
-    out.extend_from_slice(header.scid);
-    if let Some(token) = header.token {
-        let token_len = u64::try_from(token.len()).map_err(|_| EncodeError::ValueOutOfRange)?;
-        VarInt::encode(token_len, out).map_err(|_| EncodeError::ValueOutOfRange)?;
-        out.extend_from_slice(token);
+impl LongHeader<'_> {
+    pub(crate) fn encode_into(
+        self,
+        out: &mut Vec<u8>,
+        body_len_after_pn: usize,
+    ) -> Result<usize, EncodeError> {
+        validate_header_fields(self.packet_number_len, self.dcid, self.scid)?;
+        let body_len =
+            u64::try_from(body_len_after_pn).map_err(|_| EncodeError::ValueOutOfRange)?;
+        let length = u64::from(self.packet_number_len)
+            .checked_add(body_len)
+            .filter(|&length| length <= VarInt::MAX)
+            .ok_or(EncodeError::ValueOutOfRange)?;
+        out.push(FORM_LONG | FIXED_BIT | self.packet_type | (self.packet_number_len - 1));
+        out.extend_from_slice(&self.version.to_be_bytes());
+        out.push(self.dcid.len() as u8);
+        out.extend_from_slice(self.dcid);
+        out.push(self.scid.len() as u8);
+        out.extend_from_slice(self.scid);
+        if let Some(token) = self.token {
+            let token_len = VarInt::from_usize(token.len()).ok_or(EncodeError::ValueOutOfRange)?;
+            token_len.encode(out);
+            out.extend_from_slice(token);
+        }
+        VarInt::new(length)
+            .ok_or(EncodeError::ValueOutOfRange)?
+            .encode(out);
+        let pn_offset = out.len();
+        out.extend_from_slice(
+            &self.packet_number.to_be_bytes()[8 - usize::from(self.packet_number_len)..],
+        );
+        Ok(pn_offset)
     }
-    VarInt::encode(length, out).map_err(|_| EncodeError::ValueOutOfRange)?;
-    let pn_offset = out.len();
-    out.extend_from_slice(
-        &header.packet_number.to_be_bytes()[8 - usize::from(header.packet_number_len)..],
-    );
-    Ok(pn_offset)
 }
 
-pub(crate) fn encode_short_header_into(
-    out: &mut Vec<u8>,
-    dcid: &[u8],
-    packet_number: u64,
-    pn_len: u8,
-) -> Result<usize, EncodeError> {
-    validate_header_fields(pn_len, dcid, &[])?;
-    out.push(FIXED_BIT | (pn_len - 1));
-    out.extend_from_slice(dcid);
-    let pn_offset = out.len();
-    out.extend_from_slice(&packet_number.to_be_bytes()[8 - pn_len as usize..]);
-    Ok(pn_offset)
+pub(crate) struct ShortHeaderRef<'a> {
+    pub(crate) dcid: &'a [u8],
+    pub(crate) packet_number: u64,
+    pub(crate) pn_len: u8,
+}
+
+impl ShortHeaderRef<'_> {
+    pub(crate) fn encode_into(self, out: &mut Vec<u8>) -> Result<usize, EncodeError> {
+        validate_header_fields(self.pn_len, self.dcid, &[])?;
+        out.push(FIXED_BIT | (self.pn_len - 1));
+        out.extend_from_slice(self.dcid);
+        let pn_offset = out.len();
+        out.extend_from_slice(&self.packet_number.to_be_bytes()[8 - usize::from(self.pn_len)..]);
+        Ok(pn_offset)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,19 +209,16 @@ impl InitialHeader {
         body_len_after_pn: usize,
     ) -> Result<(Vec<u8>, usize), EncodeError> {
         let mut out = Vec::with_capacity(64 + self.dcid.len() + self.scid.len() + self.token.len());
-        let pn_offset = encode_long_header_into(
-            &mut out,
-            LongHeader {
-                version: self.version,
-                packet_type: LONG_INITIAL,
-                dcid: &self.dcid,
-                scid: &self.scid,
-                token: Some(&self.token),
-                packet_number: self.packet_number,
-                packet_number_len: self.pn_len,
-            },
-            body_len_after_pn,
-        )?;
+        let pn_offset = LongHeader {
+            version: self.version,
+            packet_type: LONG_INITIAL,
+            dcid: &self.dcid,
+            scid: &self.scid,
+            token: Some(&self.token),
+            packet_number: self.packet_number,
+            packet_number_len: self.pn_len,
+        }
+        .encode_into(&mut out, body_len_after_pn)?;
         Ok((out, pn_offset))
     }
 
@@ -282,19 +287,16 @@ impl HandshakeHeader {
         body_len_after_pn: usize,
     ) -> Result<(Vec<u8>, usize), EncodeError> {
         let mut out = Vec::with_capacity(32 + self.dcid.len() + self.scid.len());
-        let pn_offset = encode_long_header_into(
-            &mut out,
-            LongHeader {
-                version: self.version,
-                packet_type: LONG_HANDSHAKE,
-                dcid: &self.dcid,
-                scid: &self.scid,
-                token: None,
-                packet_number: self.packet_number,
-                packet_number_len: self.pn_len,
-            },
-            body_len_after_pn,
-        )?;
+        let pn_offset = LongHeader {
+            version: self.version,
+            packet_type: LONG_HANDSHAKE,
+            dcid: &self.dcid,
+            scid: &self.scid,
+            token: None,
+            packet_number: self.packet_number,
+            packet_number_len: self.pn_len,
+        }
+        .encode_into(&mut out, body_len_after_pn)?;
         Ok((out, pn_offset))
     }
 
@@ -327,19 +329,16 @@ impl ZeroRttHeader {
         body_len_after_pn: usize,
     ) -> Result<(Vec<u8>, usize), EncodeError> {
         let mut out = Vec::with_capacity(32 + self.dcid.len() + self.scid.len());
-        let pn_offset = encode_long_header_into(
-            &mut out,
-            LongHeader {
-                version: self.version,
-                packet_type: LONG_ZERO_RTT,
-                dcid: &self.dcid,
-                scid: &self.scid,
-                token: None,
-                packet_number: self.packet_number,
-                packet_number_len: self.pn_len,
-            },
-            body_len_after_pn,
-        )?;
+        let pn_offset = LongHeader {
+            version: self.version,
+            packet_type: LONG_ZERO_RTT,
+            dcid: &self.dcid,
+            scid: &self.scid,
+            token: None,
+            packet_number: self.packet_number,
+            packet_number_len: self.pn_len,
+        }
+        .encode_into(&mut out, body_len_after_pn)?;
         Ok((out, pn_offset))
     }
 
@@ -358,8 +357,12 @@ pub struct ShortHeader {
 impl ShortHeader {
     pub fn encode_with_pn(&self) -> Result<(Vec<u8>, usize), EncodeError> {
         let mut out = Vec::with_capacity(1 + self.dcid.len() + self.pn_len as usize);
-        let pn_offset =
-            encode_short_header_into(&mut out, &self.dcid, self.packet_number, self.pn_len)?;
+        let pn_offset = ShortHeaderRef {
+            dcid: &self.dcid,
+            packet_number: self.packet_number,
+            pn_len: self.pn_len,
+        }
+        .encode_into(&mut out)?;
         Ok((out, pn_offset))
     }
 

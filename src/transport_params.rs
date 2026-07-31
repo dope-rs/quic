@@ -134,23 +134,35 @@ impl Params {
     }
 
     fn put_varint(out: &mut Vec<u8>, id: u64, value: u64) -> Result<(), TransportParameterError> {
-        VarInt::encode(id, out)?;
+        VarInt::new(id)
+            .ok_or(TransportParameterError::OutOfRange)?
+            .encode(out);
         let mut value_buf = Vec::with_capacity(8);
-        VarInt::encode(value, &mut value_buf)?;
-        VarInt::encode(value_buf.len() as u64, out)?;
+        VarInt::new(value)
+            .ok_or(TransportParameterError::OutOfRange)?
+            .encode(&mut value_buf);
+        VarInt::from_usize(value_buf.len())
+            .ok_or(TransportParameterError::OutOfRange)?
+            .encode(out);
         out.extend_from_slice(&value_buf);
         Ok(())
     }
 
     fn put_bytes(out: &mut Vec<u8>, id: u64, value: &[u8]) -> Result<(), TransportParameterError> {
-        VarInt::encode(id, out)?;
-        VarInt::encode(value.len() as u64, out)?;
+        VarInt::new(id)
+            .ok_or(TransportParameterError::OutOfRange)?
+            .encode(out);
+        VarInt::from_usize(value.len())
+            .ok_or(TransportParameterError::OutOfRange)?
+            .encode(out);
         out.extend_from_slice(value);
         Ok(())
     }
 
     fn put_empty(out: &mut Vec<u8>, id: u64) -> Result<(), TransportParameterError> {
-        VarInt::encode(id, out)?;
+        VarInt::new(id)
+            .ok_or(TransportParameterError::OutOfRange)?
+            .encode(out);
         out.push(0);
         Ok(())
     }
@@ -160,7 +172,7 @@ impl Params {
         if n != value.len() {
             return Err(TransportParameterError::BadValueLength);
         }
-        Ok(v)
+        Ok(v.get())
     }
 
     fn is_reserved(id: u64) -> bool {
@@ -234,8 +246,9 @@ impl Params {
             pos += n;
             let (length, n) = VarInt::decode(&input[pos..])?;
             pos += n;
+            let id = id.get();
             let length =
-                usize::try_from(length).map_err(|_| TransportParameterError::OutOfRange)?;
+                usize::try_from(length.get()).map_err(|_| TransportParameterError::OutOfRange)?;
             let end = pos
                 .checked_add(length)
                 .filter(|&end| end <= input.len())
