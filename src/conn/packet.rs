@@ -1,6 +1,60 @@
 use std::num::NonZeroU16;
+use std::ops::{Deref, DerefMut};
 
-pub(super) trait PacketSink {
+pub(super) struct Payload<'a> {
+    out: &'a mut Vec<u8>,
+    start: usize,
+}
+
+impl<'a> Payload<'a> {
+    pub(super) fn new(out: &'a mut Vec<u8>, start: usize) -> Self {
+        Self { out, start }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.out.len() == self.start
+    }
+
+    pub(super) fn out_mut(&mut self) -> &mut Vec<u8> {
+        self.out
+    }
+}
+
+impl Deref for Payload<'_> {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        self.out
+    }
+}
+
+impl DerefMut for Payload<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.out
+    }
+}
+
+impl Extend<u8> for Payload<'_> {
+    fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
+        self.out.extend(iter);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Cargo {
+    CryptoOrAck,
+    DatagramOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CryptoMode {
+    Regular,
+    PtoProbe,
+}
+
+pub(super) trait Sink {
+    const FRESH_PACKETS: bool = false;
+
     fn reset(&mut self, max_packets: usize, max_packet_bytes: usize) {
         let _ = (max_packets, max_packet_bytes);
     }
@@ -14,12 +68,12 @@ pub(super) trait PacketSink {
 }
 
 #[derive(Default)]
-pub struct PacketBatch {
+pub struct Batch {
     pub(crate) buf: Vec<u8>,
     pub(crate) segs: Vec<u32>,
 }
 
-impl PacketBatch {
+impl Batch {
     pub(crate) fn clear(&mut self) {
         self.buf.clear();
         self.segs.clear();
@@ -44,9 +98,19 @@ impl PacketBatch {
             Some(&self.buf[start..*offset])
         })
     }
+
+    /// Iterates over packet storage for in-place delivery to a receiver.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut [u8]> {
+        let mut rest = self.buf.as_mut_slice();
+        self.segs.iter().map(move |&length| {
+            let (packet, tail) = core::mem::take(&mut rest).split_at_mut(length as usize);
+            rest = tail;
+            packet
+        })
+    }
 }
 
-impl PacketSink for PacketBatch {
+impl Sink for Batch {
     fn reset(&mut self, max_packets: usize, max_packet_bytes: usize) {
         self.clear();
         self.buf
@@ -81,14 +145,14 @@ impl PacketSink for PacketBatch {
     }
 }
 
-pub(crate) struct GsoBatch {
+pub(crate) struct Gso {
     pub(crate) buf: Vec<u8>,
     segment_size: Option<NonZeroU16>,
     packets: u8,
     sealed: bool,
 }
 
-impl GsoBatch {
+impl Gso {
     pub(crate) const fn new() -> Self {
         Self {
             buf: Vec::new(),
@@ -107,13 +171,13 @@ impl GsoBatch {
     }
 }
 
-impl Default for GsoBatch {
+impl Default for Gso {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl PacketSink for GsoBatch {
+impl Sink for Gso {
     fn reset(&mut self, max_packets: usize, max_packet_bytes: usize) {
         self.buf.clear();
         self.segment_size = None;
@@ -169,7 +233,9 @@ impl PacketSink for GsoBatch {
     }
 }
 
-impl PacketSink for Vec<Vec<u8>> {
+impl Sink for Vec<Vec<u8>> {
+    const FRESH_PACKETS: bool = true;
+
     fn emit<T>(
         &mut self,
         max_packet_bytes: usize,
@@ -193,12 +259,12 @@ impl PacketSink for Vec<Vec<u8>> {
     }
 }
 
-pub(super) struct PacketSlot<'a> {
+pub(super) struct Slot<'a> {
     pub(super) packet: &'a mut Vec<u8>,
     pub(super) emitted: bool,
 }
 
-impl PacketSink for PacketSlot<'_> {
+impl Sink for Slot<'_> {
     fn emit<T>(
         &mut self,
         max_packet_bytes: usize,

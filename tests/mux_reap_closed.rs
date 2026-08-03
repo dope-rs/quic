@@ -5,15 +5,16 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use dope_quic::{Conn, ConnHandle, Handler, Mux, TrySendError, conn, transport_params};
+use dope_quic::conn::Handle;
+use dope_quic::{Connection, Handler, Mux, TrySendError, conn, transport_params};
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
 #[derive(Default)]
 struct Events {
-    established: Vec<ConnHandle>,
-    datagrams: Vec<(ConnHandle, Vec<u8>)>,
-    closed: Vec<ConnHandle>,
+    established: Vec<Handle>,
+    datagrams: Vec<(Handle, Vec<u8>)>,
+    closed: Vec<Handle>,
 }
 
 #[derive(Clone, Default)]
@@ -22,13 +23,17 @@ struct CapturingHandler {
 }
 
 impl Handler for CapturingHandler {
-    fn established(&mut self, _conn: &mut Conn, h: ConnHandle) {
+    type Connection = ();
+
+    fn create_connection(&mut self, _conn: &mut Connection, _handle: Handle) {}
+
+    fn established(&mut self, _connection: &mut (), _conn: &mut Connection, h: Handle) {
         self.events.borrow_mut().established.push(h);
     }
-    fn datagram(&mut self, _conn: &mut Conn, h: ConnHandle, data: Vec<u8>) {
+    fn datagram(&mut self, _connection: &mut (), _conn: &mut Connection, h: Handle, data: Vec<u8>) {
         self.events.borrow_mut().datagrams.push((h, data.to_vec()));
     }
-    fn close(&mut self, h: ConnHandle) {
+    fn close(&mut self, _connection: (), h: Handle) {
         self.events.borrow_mut().closed.push(h);
     }
 }
@@ -41,8 +46,8 @@ fn relay_once(
 ) -> usize {
     let pkts: Vec<_> = src.drain_outgoing().collect();
     let n = pkts.len();
-    for out in pkts {
-        dst.recv(src_addr, out.payload(), now).expect("recv");
+    for mut out in pkts {
+        dst.recv(src_addr, out.payload_mut(), now).expect("recv");
     }
     n
 }
@@ -93,7 +98,7 @@ fn complete_handshake(
     server_addr: SocketAddr,
     client_addr: SocketAddr,
     now: Instant,
-) -> ConnHandle {
+) -> Handle {
     let client_handle = client
         .connect(server_addr, server_pubkey, tp.into(), CID.to_vec(), now)
         .unwrap();
@@ -176,7 +181,7 @@ fn unknown_dcid_stateless_reset_closes_matching_mux_connection() {
     );
     let token = client
         .conn(handle)
-        .and_then(Conn::peer_transport_params)
+        .and_then(Connection::peer_transport_params)
         .and_then(|params| params.stateless_reset_token)
         .expect("server stateless reset token");
     let mut reset = vec![0x40; 30];
@@ -184,18 +189,20 @@ fn unknown_dcid_stateless_reset_closes_matching_mux_connection() {
     let tail = reset.len() - 16;
     reset[tail..].copy_from_slice(&token);
 
-    client.recv(wrong_addr, &reset, now).unwrap();
+    client.recv(wrong_addr, &mut reset, now).unwrap();
     assert!(
-        client.conn(handle).is_some_and(Conn::is_established),
+        client.conn(handle).is_some_and(Connection::is_established),
         "a token received from an unrelated address must be ignored",
     );
 
-    client.recv(server_addr, &reset, now).unwrap();
+    client.recv(server_addr, &mut reset, now).unwrap();
     assert!(
-        client.conn(handle).is_some_and(Conn::was_stateless_reset),
+        client
+            .conn(handle)
+            .is_some_and(Connection::was_stateless_reset),
         "the mux must route an unknown-DCID reset to the matching connection",
     );
-    assert!(client.conn(handle).is_some_and(Conn::is_closed));
+    assert!(client.conn(handle).is_some_and(Connection::is_closed));
 
     client.reap_closed(now);
     assert!(client.conn(handle).is_none());
@@ -332,7 +339,7 @@ fn peer_connection_close_makes_reap_fire_close() {
         t0,
     );
 
-    let h0 = ConnHandle(0);
+    let h0 = Handle(0);
     if let Some(conn) = client.conn_mut(h0) {
         conn.close(0, b"client-side close".to_vec());
     }

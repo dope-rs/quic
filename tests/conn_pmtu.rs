@@ -2,7 +2,8 @@ pub mod support;
 
 use std::time::Instant;
 
-use dope_quic::{Conn, ServerConn, TrySendError, transport_params};
+use dope_quic::conn::server;
+use dope_quic::{Connection, TrySendError, transport_params};
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
@@ -15,10 +16,10 @@ fn user_tp(max_datagram: u64) -> dope_quic::conn::Config {
     .into()
 }
 
-fn pair(client_max: u64, server_max: u64) -> (ServerConn, Conn) {
+fn pair(client_max: u64, server_max: u64) -> (server::Connection, Connection) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
-    let server = Conn::new_server(
+    let server = Connection::new_server(
         CID.to_vec(),
         CID.to_vec(),
         CID.to_vec(),
@@ -26,7 +27,7 @@ fn pair(client_max: u64, server_max: u64) -> (ServerConn, Conn) {
         user_tp(server_max),
     )
     .unwrap();
-    let client = Conn::new_client(
+    let client = Connection::new_client(
         CID.to_vec(),
         CID.to_vec(),
         server_pubkey,
@@ -36,7 +37,7 @@ fn pair(client_max: u64, server_max: u64) -> (ServerConn, Conn) {
     (server, client)
 }
 
-fn complete_handshake(server: &mut ServerConn, client: &mut Conn, now: Instant) {
+fn complete_handshake(server: &mut server::Connection, client: &mut Connection, now: Instant) {
     support::transfer(client, server, now);
     support::transfer(server, client, now);
     support::transfer(client, server, now);
@@ -87,13 +88,13 @@ fn cwnd_tracks_bytes_in_flight_during_handshake() {
     let (mut server, mut client) = pair(65535, 65535);
     let t0 = Instant::now();
 
-    for p in client.send_packets(t0) {
-        server.recv_packet(&p, t0).unwrap();
+    for mut p in client.send_packets(t0) {
+        server.recv_packet(&mut p, t0).unwrap();
     }
     assert!(client.bytes_in_flight() >= 1200, "Initial in flight");
 
-    for p in server.send_packets(t0) {
-        client.recv_packet(&p, t0).unwrap();
+    for mut p in server.send_packets(t0) {
+        client.recv_packet(&mut p, t0).unwrap();
     }
     assert_eq!(
         client.unacked_count(0),

@@ -2,9 +2,9 @@ pub mod support;
 
 use std::time::Instant;
 
-use dope_quic::conn::PacketBatch;
+use dope_quic::conn::{packet::Batch, session::Ticket};
 use dope_quic::early_data::EarlyDataReplayCache;
-use dope_quic::{Conn, SessionTicket, conn, transport_params};
+use dope_quic::{Connection, conn, transport_params};
 use shin::client::config::Resumption;
 use shin::crypto::sig::SigningKey;
 
@@ -29,7 +29,7 @@ fn signing() -> SigningKey {
     SigningKey::from_seed(&[0x77u8; 32]).unwrap()
 }
 
-fn first_session_ticket() -> SessionTicket {
+fn first_session_ticket() -> Ticket {
     let server_cfg = conn::Config {
         transport_params: user_tp(),
         ticket_secret: Some(TICKET_SECRET),
@@ -39,7 +39,7 @@ fn first_session_ticket() -> SessionTicket {
         transport_params: user_tp(),
         ..Default::default()
     };
-    let mut server = Conn::new_server(
+    let mut server = Connection::new_server(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         HS_CID.to_vec(),
@@ -47,7 +47,7 @@ fn first_session_ticket() -> SessionTicket {
         server_cfg,
     )
     .unwrap();
-    let mut client = Conn::new_client(
+    let mut client = Connection::new_client(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         *signing().pubkey().unwrap(),
@@ -56,11 +56,11 @@ fn first_session_ticket() -> SessionTicket {
     .unwrap();
     let now = Instant::now();
     for _ in 0..4 {
-        for pkt in client.send_packets(now) {
-            server.recv_packet(&pkt, now).expect("server recv");
+        for mut pkt in client.send_packets(now) {
+            server.recv_packet(&mut pkt, now).expect("server recv");
         }
-        for pkt in server.send_packets(now) {
-            client.recv_packet(&pkt, now).expect("client recv");
+        for mut pkt in server.send_packets(now) {
+            client.recv_packet(&mut pkt, now).expect("client recv");
         }
     }
     assert!(client.is_established() && server.is_established());
@@ -91,7 +91,7 @@ fn zero_rtt_followed_by_one_rtt_full_round_trip() {
         ..Default::default()
     };
 
-    let mut server = Conn::new_server_with_early_data_guard(
+    let mut server = Connection::new_server_with_early_data_guard(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         HS_CID.to_vec(),
@@ -100,7 +100,7 @@ fn zero_rtt_followed_by_one_rtt_full_round_trip() {
         EarlyDataReplayCache::new(),
     )
     .unwrap();
-    let mut client = Conn::new_client(
+    let mut client = Connection::new_client(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         *signing().pubkey().unwrap(),
@@ -152,7 +152,7 @@ fn server_rejects_early_data_drops_zero_rtt_but_handshake_completes() {
         ..Default::default()
     };
 
-    let mut server = Conn::new_server(
+    let mut server = Connection::new_server(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         HS_CID.to_vec(),
@@ -160,7 +160,7 @@ fn server_rejects_early_data_drops_zero_rtt_but_handshake_completes() {
         server_cfg,
     )
     .unwrap();
-    let mut client = Conn::new_client(
+    let mut client = Connection::new_client(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         *signing().pubkey().unwrap(),
@@ -216,7 +216,7 @@ fn cached_peer_tp_caps_zero_rtt_stream_emission() {
         ..Default::default()
     };
 
-    let mut server = Conn::new_server_with_early_data_guard(
+    let mut server = Connection::new_server_with_early_data_guard(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         HS_CID.to_vec(),
@@ -225,7 +225,7 @@ fn cached_peer_tp_caps_zero_rtt_stream_emission() {
         EarlyDataReplayCache::new(),
     )
     .unwrap();
-    let mut client = Conn::new_client(
+    let mut client = Connection::new_client(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         *signing().pubkey().unwrap(),
@@ -236,8 +236,8 @@ fn cached_peer_tp_caps_zero_rtt_stream_emission() {
     let now = Instant::now();
     let stream = client.open_bidi_stream().unwrap();
     client.stream_send(stream, b"abcdefghij").unwrap();
-    for pkt in client.send_packets(now) {
-        server.recv_packet(&pkt, now).expect("server recv");
+    for mut pkt in client.send_packets(now) {
+        server.recv_packet(&mut pkt, now).expect("server recv");
     }
     let mut got = Vec::new();
     server.stream_recv(stream, &mut got);
@@ -269,7 +269,7 @@ fn zero_rtt_stream_data_arrives_before_handshake_completes() {
         ..Default::default()
     };
 
-    let mut server = Conn::new_server_with_early_data_guard(
+    let mut server = Connection::new_server_with_early_data_guard(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         HS_CID.to_vec(),
@@ -278,7 +278,7 @@ fn zero_rtt_stream_data_arrives_before_handshake_completes() {
         EarlyDataReplayCache::new(),
     )
     .unwrap();
-    let mut client = Conn::new_client(
+    let mut client = Connection::new_client(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         *signing().pubkey().unwrap(),
@@ -290,7 +290,7 @@ fn zero_rtt_stream_data_arrives_before_handshake_completes() {
     let stream = client.open_bidi_stream().unwrap();
     client.stream_send(stream, b"early-bytes").unwrap();
 
-    let first_flight = client.send_packets(now);
+    let mut first_flight = client.send_packets(now);
     let saw_zero_rtt = first_flight
         .iter()
         .any(|w| w.first().map(|b| b & 0xF0 == 0xD0).unwrap_or(false));
@@ -299,7 +299,7 @@ fn zero_rtt_stream_data_arrives_before_handshake_completes() {
         "client first flight must contain a 0-RTT packet"
     );
 
-    for pkt in &first_flight {
+    for pkt in &mut first_flight {
         server.recv_packet(pkt, now).expect("server recv 0-RTT");
     }
 
@@ -327,7 +327,7 @@ fn oversized_zero_rtt_stream_is_split_below_the_byte_ceiling() {
         resumption_peer_tp: Some(user_tp()),
         ..Default::default()
     };
-    let mut client = Conn::new_client(
+    let mut client = Connection::new_client(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         *signing().pubkey().unwrap(),
@@ -336,7 +336,7 @@ fn oversized_zero_rtt_stream_is_split_below_the_byte_ceiling() {
     .unwrap();
     let stream = client.open_bidi_stream().unwrap();
     client.stream_send(stream, &vec![0x33; 64 * 1024]).unwrap();
-    let mut packets = PacketBatch::default();
+    let mut packets = Batch::default();
     client.send_batch(&mut packets, Instant::now(), 64, 1200);
     let zero_rtt = packets
         .iter()

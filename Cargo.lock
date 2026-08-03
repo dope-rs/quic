@@ -91,9 +91,9 @@ dependencies = [
 
 [[package]]
 name = "dope"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28defc423ccbaf6baeede03274d25726fb466a84e446ce7525a3cd54f9e1debb"
+checksum = "484e254e672b2787a02485496fe629d853e2b5d0cc0bddf46958e5530d4c0108"
 dependencies = [
  "dope-core",
  "dope-net",
@@ -106,20 +106,21 @@ dependencies = [
 
 [[package]]
 name = "dope-core"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb93c75b459003cddd253bee6d0a98dd1c3b6740d9653894b09ea100a5490af8"
+checksum = "c601c9e665a201c51c8a3cf0fea0b81ec38b9385f9486e0ec4f43877c7e13766"
 dependencies = [
  "io-uring",
  "libc",
  "o3",
+ "pin-project",
 ]
 
 [[package]]
 name = "dope-gen"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d48daa4db57f0e4b3470c0414daaace9998fe95878c4601190bf241c03347095"
+checksum = "c2caf90f27418d5ef7db7d7ed9f9e43910cd37c500e58b228c7535904ba17977"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -128,9 +129,9 @@ dependencies = [
 
 [[package]]
 name = "dope-net"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2a80ab56a229ec8d64237445000d37097a26ec9b3864aade9b4026b3e8c2f6c"
+checksum = "ac20e20c340db9e601687d6e66538422915c195abff54b08a6d4ce5fce3a4421"
 dependencies = [
  "dope-core",
  "libc",
@@ -139,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "dope-quic"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "dope",
  "dope-gen",
@@ -252,9 +253,9 @@ dependencies = [
 
 [[package]]
 name = "o3"
-version = "0.9.0"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b739579dc53a5903547ee059d485888c023f6245e3a85dfc36a338173a071d1f"
+checksum = "1888848366cbb326c774de989191096788eed2a9cabbe36dec31de29d6dd29b4"
 
 [[package]]
 name = "pin-project"
@@ -326,9 +327,9 @@ dependencies = [
 
 [[package]]
 name = "shin"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8475b3d012b1d723c333092261b2daaa415c7050549cfdbe3208c661ee631772"
+checksum = "be70dec38f1eaed3e59c5e418e6b59c7b48a0fca9e6141571355128eb1862119"
 dependencies = [
  "arrayvec",
  "ml-kem",

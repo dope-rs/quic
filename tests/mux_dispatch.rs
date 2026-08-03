@@ -5,16 +5,17 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use dope_quic::{Conn, ConnHandle, Handler, Mux, StreamEvent, transport_params};
+use dope_quic::conn::{Handle, stream::Event};
+use dope_quic::{Connection, Handler, Mux, transport_params};
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
 #[derive(Default)]
 struct Events {
-    established: Vec<ConnHandle>,
-    datagrams: Vec<(ConnHandle, Vec<u8>)>,
-    streams: Vec<(ConnHandle, StreamEvent)>,
-    closed: Vec<ConnHandle>,
+    established: Vec<Handle>,
+    datagrams: Vec<(Handle, Vec<u8>)>,
+    streams: Vec<(Handle, Event)>,
+    closed: Vec<Handle>,
 }
 
 #[derive(Clone, Default)]
@@ -23,16 +24,38 @@ struct CapturingHandler {
 }
 
 impl Handler for CapturingHandler {
-    fn established(&mut self, _conn: &mut Conn, h: ConnHandle) {
+    type Connection = Handle;
+
+    fn create_connection(&mut self, _conn: &mut Connection, handle: Handle) -> Handle {
+        handle
+    }
+
+    fn established(&mut self, connection: &mut Handle, _conn: &mut Connection, h: Handle) {
+        assert_eq!(*connection, h);
         self.events.borrow_mut().established.push(h);
     }
-    fn datagram(&mut self, _conn: &mut Conn, h: ConnHandle, data: Vec<u8>) {
+    fn datagram(
+        &mut self,
+        connection: &mut Handle,
+        _conn: &mut Connection,
+        h: Handle,
+        data: Vec<u8>,
+    ) {
+        assert_eq!(*connection, h);
         self.events.borrow_mut().datagrams.push((h, data.to_vec()));
     }
-    fn stream_event(&mut self, _conn: &mut Conn, h: ConnHandle, event: StreamEvent) {
+    fn stream_event(
+        &mut self,
+        connection: &mut Handle,
+        _conn: &mut Connection,
+        h: Handle,
+        event: Event,
+    ) {
+        assert_eq!(*connection, h);
         self.events.borrow_mut().streams.push((h, event));
     }
-    fn close(&mut self, h: ConnHandle) {
+    fn close(&mut self, connection: Handle, h: Handle) {
+        assert_eq!(connection, h);
         self.events.borrow_mut().closed.push(h);
     }
 }
@@ -45,8 +68,8 @@ fn relay_once(
     let now = Instant::now();
     let pkts: Vec<_> = src.drain_outgoing().collect();
     let n = pkts.len();
-    for out in pkts {
-        dst.recv(src_addr, out.payload(), now).expect("recv");
+    for mut out in pkts {
+        dst.recv(src_addr, out.payload_mut(), now).expect("recv");
     }
     n
 }
@@ -141,7 +164,7 @@ fn quic_datagram_handshake_and_app_traffic() {
         let evs = server_events.borrow();
         assert!(
             evs.streams
-                .contains(&(server_handle, StreamEvent::Data { stream_id })),
+                .contains(&(server_handle, Event::Data { stream_id })),
             "streams={:?} expected handle={:?} stream_id={}",
             evs.streams,
             server_handle,
@@ -149,7 +172,7 @@ fn quic_datagram_handshake_and_app_traffic() {
         );
         assert!(
             evs.streams
-                .contains(&(server_handle, StreamEvent::Finished { stream_id }))
+                .contains(&(server_handle, Event::Finished { stream_id }))
         );
     }
 
@@ -202,11 +225,11 @@ fn accept_flood_is_bounded_by_max_conns() {
             pn_len,
         };
         let (hdr, pn_off) = h.encode_with_pn(payload.len() + 16).unwrap();
-        let wire = prot
+        let mut wire = prot
             .encrypt_long(&hdr, &payload, 0, pn_off, pn_len as usize)
             .unwrap();
         let from: SocketAddr = format!("10.0.0.{}:5000", (i % 250) + 1).parse().unwrap();
-        let _ = server.recv(from, &wire, now);
+        let _ = server.recv(from, &mut wire, now);
     }
 
     assert_eq!(server.active_conns(), 4, "accept-flood capped at max_conns");
@@ -392,17 +415,25 @@ fn reap_shares_global_packet_budget_between_connections() {
         .connect(server_addr, server_pubkey, params.into(), vec![2; 8], now)
         .unwrap();
     for _ in 0..12 {
-        for outgoing in first.drain_outgoing().collect::<Vec<_>>() {
-            server.recv(first_addr, outgoing.payload(), now).unwrap();
+        for mut outgoing in first.drain_outgoing().collect::<Vec<_>>() {
+            server
+                .recv(first_addr, outgoing.payload_mut(), now)
+                .unwrap();
         }
-        for outgoing in second.drain_outgoing().collect::<Vec<_>>() {
-            server.recv(second_addr, outgoing.payload(), now).unwrap();
+        for mut outgoing in second.drain_outgoing().collect::<Vec<_>>() {
+            server
+                .recv(second_addr, outgoing.payload_mut(), now)
+                .unwrap();
         }
-        for outgoing in server.drain_outgoing().collect::<Vec<_>>() {
+        for mut outgoing in server.drain_outgoing().collect::<Vec<_>>() {
             if outgoing.addr() == first_addr {
-                first.recv(server_addr, outgoing.payload(), now).unwrap();
+                first
+                    .recv(server_addr, outgoing.payload_mut(), now)
+                    .unwrap();
             } else {
-                second.recv(server_addr, outgoing.payload(), now).unwrap();
+                second
+                    .recv(server_addr, outgoing.payload_mut(), now)
+                    .unwrap();
             }
         }
         now += Duration::from_millis(10);

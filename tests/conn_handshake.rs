@@ -2,14 +2,14 @@ pub mod support;
 
 use std::time::Instant;
 
-use dope_quic::{Conn, transport_params};
+use dope_quic::{Connection, transport_params};
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
-fn drain<R: support::Receiver>(from: &mut Conn, into: &mut R) {
+fn drain<R: support::Receiver>(from: &mut Connection, into: &mut R) {
     let now = Instant::now();
-    for pkt in from.send_packets(now) {
-        into.receive(&pkt, now);
+    for mut pkt in from.send_packets(now) {
+        into.receive(&mut pkt, now);
     }
 }
 
@@ -28,9 +28,10 @@ fn conn_handshake_and_datagram_round_trip() {
     let server_pubkey = *signing.pubkey().unwrap();
 
     let mut server =
-        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+        Connection::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp())
+            .unwrap();
     let mut client =
-        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
     assert!(client.is_handshaking());
     assert!(server.is_handshaking());
@@ -70,9 +71,10 @@ fn conn_buffers_multiple_outgoing_datagrams() {
     let server_pubkey = *signing.pubkey().unwrap();
 
     let mut server =
-        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+        Connection::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp())
+            .unwrap();
     let mut client =
-        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
     drain(&mut client, &mut server);
     drain(&mut server, &mut client);

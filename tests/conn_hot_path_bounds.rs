@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
-use dope_quic::{Conn, ServerConn, conn, transport_params};
+use dope_quic::conn::server;
+use dope_quic::{Connection, conn, transport_params};
 use shin::crypto::sig::SigningKey;
 
 const CID: [u8; 8] = [0x8b; 8];
@@ -19,20 +20,22 @@ fn config() -> conn::Config {
     }
 }
 
-fn established() -> (Conn, ServerConn, Instant) {
+fn established() -> (Connection, server::Connection, Instant) {
     let signing = SigningKey::from_seed(&[0x7d; 32]).unwrap();
     let public_key = *signing.pubkey().unwrap();
     let mut server =
-        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, config()).unwrap();
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), public_key, config()).unwrap();
+        Connection::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, config())
+            .unwrap();
+    let mut client =
+        Connection::new_client(CID.to_vec(), CID.to_vec(), public_key, config()).unwrap();
     let now = Instant::now();
     for round in 0..8 {
         let at = now + Duration::from_millis(round);
-        for packet in client.send_packets(at) {
-            server.recv_packet(&packet, at).unwrap();
+        for mut packet in client.send_packets(at) {
+            server.recv_packet(&mut packet, at).unwrap();
         }
-        for packet in server.send_packets(at) {
-            client.recv_packet(&packet, at).unwrap();
+        for mut packet in server.send_packets(at) {
+            client.recv_packet(&mut packet, at).unwrap();
         }
     }
     assert!(client.is_established() && server.is_established());
@@ -54,16 +57,16 @@ fn busy_first_snapshot_does_not_starve_later_streams() {
         }
     }
 
-    for packet in client.send_packets(now) {
-        server.recv_packet(&packet, now).unwrap();
+    for mut packet in client.send_packets(now) {
+        server.recv_packet(&mut packet, now).unwrap();
     }
     let ack_at = now + Duration::from_millis(20);
-    for packet in server.send_packets(ack_at) {
-        client.recv_packet(&packet, ack_at).unwrap();
+    for mut packet in server.send_packets(ack_at) {
+        client.recv_packet(&mut packet, ack_at).unwrap();
     }
     let second_send = ack_at + Duration::from_millis(20);
-    for packet in client.send_packets(second_send) {
-        server.recv_packet(&packet, second_send).unwrap();
+    for mut packet in client.send_packets(second_send) {
+        server.recv_packet(&mut packet, second_send).unwrap();
     }
 
     let mut received = Vec::new();

@@ -110,7 +110,6 @@ pub struct PnSpace {
     pub crypto_inflight: BTreeMap<u64, (Vec<u8>, u64)>,
     pub crypto_retransmit: Vec<(u64, Vec<u8>)>,
     pub crypto_next_offset: u64,
-    pub stream_inflight: BTreeMap<(u64, u64), (u64, bool, u64)>,
     pub stream_retransmit: Vec<(u64, u64, u64, bool)>,
     pub time_of_last_ack_eliciting: Option<Instant>,
     pub ack_eliciting_in_flight: usize,
@@ -248,9 +247,6 @@ impl PnSpace {
         let acked_pns: HashSet<u64> = acked.iter().map(|p| p.pn).collect();
         self.crypto_inflight
             .retain(|_, (_, pn)| !acked_pns.contains(pn));
-        self.stream_inflight
-            .retain(|_, (_, _, pn)| !acked_pns.contains(pn));
-
         acked
     }
 

@@ -1,7 +1,8 @@
 use std::time::Instant;
 
 use dope_quic::client_auth::{ClientAuth, ClientCertSource, ClientCertVerifier, ClientIdentity};
-use dope_quic::{Conn, MutualAuthentication, conn, transport_params};
+use dope_quic::conn::server;
+use dope_quic::{Connection, conn, transport_params};
 use shin::crypto::sig::SigningKey;
 
 const CID: [u8; 8] = [0x42; 8];
@@ -35,25 +36,25 @@ fn run(client_cert: Option<ClientCertSource>, mode: ClientAuth, accept: bool) ->
     let mut client_cfg = base_cfg();
     client_cfg.client_cert = client_cert;
 
-    let mut server = Conn::new_server_mutual(
+    let mut server = Connection::new_server_mutual(
         CID.to_vec(),
         CID.to_vec(),
         CID.to_vec(),
         server_key,
         base_cfg(),
-        MutualAuthentication::new(mode, PinVerifier { accept }),
+        server::Authentication::new(mode, PinVerifier { accept }),
     )
     .unwrap();
     let mut client =
-        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, client_cfg).unwrap();
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, client_cfg).unwrap();
 
     for _ in 0..6 {
         let now = Instant::now();
-        for packet in client.send_packets(now) {
-            let _ = server.recv_packet(&packet, now);
+        for mut packet in client.send_packets(now) {
+            let _ = server.recv_packet(&mut packet, now);
         }
-        for packet in server.send_packets(now) {
-            let _ = client.recv_packet(&packet, now);
+        for mut packet in server.send_packets(now) {
+            let _ = client.recv_packet(&mut packet, now);
         }
     }
     (client.is_established(), server.is_established())

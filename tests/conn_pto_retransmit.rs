@@ -2,7 +2,7 @@ pub mod support;
 
 use std::time::{Duration, Instant};
 
-use dope_quic::{Conn, transport_params};
+use dope_quic::{Connection, transport_params};
 use shin::crypto::sig::SigningKey;
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
@@ -29,9 +29,10 @@ fn pto_probes_dropped_client_initial() {
     let t0 = Instant::now();
 
     let mut server =
-        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+        Connection::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp())
+            .unwrap();
     let mut client =
-        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
     let dropped = client.send_packets(t0);
     assert_eq!(dropped.len(), 1);
@@ -42,7 +43,7 @@ fn pto_probes_dropped_client_initial() {
 
     let t1 = pto_deadline + Duration::from_millis(1);
     client.check_loss(t1);
-    let retransmit = client.send_packets(t1);
+    let mut retransmit = client.send_packets(t1);
     assert_eq!(retransmit.len(), 2, "PTO produced two probes");
     assert_eq!(
         client.unacked_count(0),
@@ -51,14 +52,14 @@ fn pto_probes_dropped_client_initial() {
     );
 
     server
-        .recv_packet(&retransmit[0], t1)
+        .recv_packet(&mut retransmit[0], t1)
         .expect("server processes retransmitted Initial");
-    let s_pkts = server.send_packets(t1);
-    for p in &s_pkts {
+    let mut s_pkts = server.send_packets(t1);
+    for p in &mut s_pkts {
         client.recv_packet(p, t1).expect("client recv");
     }
-    let c_pkts = client.send_packets(t1);
-    for p in &c_pkts {
+    let mut c_pkts = client.send_packets(t1);
+    for p in &mut c_pkts {
         server.recv_packet(p, t1).expect("server recv");
     }
 
@@ -78,7 +79,7 @@ fn pto_backs_off_on_consecutive_fires() {
 
     let t0 = Instant::now();
     let mut client =
-        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
     let _ = client.send_packets(t0);
     let pto1 = client.next_timer().expect("first PTO");
@@ -111,16 +112,17 @@ fn ack_clears_pto_timer() {
 
     let t0 = Instant::now();
     let mut server =
-        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+        Connection::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp())
+            .unwrap();
     let mut client =
-        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
-    let pkts = client.send_packets(t0);
-    for p in &pkts {
+    let mut pkts = client.send_packets(t0);
+    for p in &mut pkts {
         server.recv_packet(p, t0).expect("server recv");
     }
-    let s_pkts = server.send_packets(t0 + Duration::from_micros(100));
-    for p in &s_pkts {
+    let mut s_pkts = server.send_packets(t0 + Duration::from_micros(100));
+    for p in &mut s_pkts {
         client
             .recv_packet(p, t0 + Duration::from_micros(200))
             .expect("client recv");

@@ -35,15 +35,8 @@ mod stream;
 pub mod transport_params;
 pub mod varint;
 
-pub use client::{
-    BackoffPolicy, Client, ClientConfigProvider, EndpointSpec, PathStats, Protocol, SlotId,
-    StaticClientConfig,
-};
-pub use conn::{
-    Conn, ConnError, ConnHandle, DatagramCongestionControl, Mutual, MutualAuthentication,
-    ServerConn, ServerConnectionIds, ServerPolicy, SessionTicket, Standard, State as ConnState,
-    StreamError, StreamEvent,
-};
+pub use client::{BackoffPolicy, Client, EndpointSpec, PathStats, Protocol, SlotId};
+pub use conn::Connection;
 pub use endpoint::Endpoint;
 pub use errors::{ConnectError, TrySendError};
 pub use mux::{Handler, Mux};
@@ -53,5 +46,7 @@ pub use transport_params::TransportParameterError;
 
 pub mod client_auth {
     pub use shin::client::config::ClientCertSource;
-    pub use shin::server::{config::ClientAuth, config::ClientCertVerifier, config::ClientIdentity};
+    pub use shin::server::{
+        config::ClientAuth, config::ClientCertVerifier, config::ClientIdentity,
+    };
 }

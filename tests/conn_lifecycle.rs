@@ -2,7 +2,8 @@ pub mod support;
 
 use std::time::{Duration, Instant};
 
-use dope_quic::{Conn, ServerConn, transport_params};
+use dope_quic::conn::server;
+use dope_quic::{Connection, transport_params};
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
@@ -15,10 +16,10 @@ fn user_tp(idle_ms: u64) -> dope_quic::conn::Config {
     .into()
 }
 
-fn build_pair(idle_ms: u64) -> (ServerConn, Conn) {
+fn build_pair(idle_ms: u64) -> (server::Connection, Connection) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
-    let server = Conn::new_server(
+    let server = Connection::new_server(
         CID.to_vec(),
         CID.to_vec(),
         CID.to_vec(),
@@ -27,17 +28,18 @@ fn build_pair(idle_ms: u64) -> (ServerConn, Conn) {
     )
     .unwrap();
     let client =
-        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp(idle_ms)).unwrap();
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp(idle_ms))
+            .unwrap();
     (server, client)
 }
 
-fn drain<R: support::Receiver>(from: &mut Conn, into: &mut R, now: Instant) {
-    for pkt in from.send_packets(now) {
-        into.receive(&pkt, now);
+fn drain<R: support::Receiver>(from: &mut Connection, into: &mut R, now: Instant) {
+    for mut pkt in from.send_packets(now) {
+        into.receive(&mut pkt, now);
     }
 }
 
-fn complete_handshake(server: &mut ServerConn, client: &mut Conn, now: Instant) {
+fn complete_handshake(server: &mut server::Connection, client: &mut Connection, now: Instant) {
     drain(client, server, now);
     drain(server, client, now);
     drain(client, server, now);

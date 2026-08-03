@@ -17,10 +17,7 @@ use shin::server::{Shard, config::ClientCertVerifier, config::EarlyDataGuard, co
 use crate::ConnectError;
 use crate::TrySendError;
 use crate::clock::WallClock;
-use crate::conn::{
-    self, Conn, ConnError, ConnHandle, GsoBatch, Mutual, MutualAuthentication, ServerConnectionIds,
-    ServerPolicy, Standard, StreamEvent, ValidatedConfig,
-};
+use crate::conn::{self, Connection, Error, Handle, ValidatedConfig};
 use crate::packet::InitialHeader;
 use crate::packet::QUIC_V1;
 use crate::packet::RetryPacket;
@@ -31,15 +28,50 @@ use std::array::from_fn;
 use std::iter;
 
 pub trait Handler {
-    fn established(&mut self, _conn: &mut Conn, _handle: ConnHandle) {}
-    fn datagram(&mut self, _conn: &mut Conn, _handle: ConnHandle, _data: Vec<u8>) {}
-    fn stream_event(&mut self, _conn: &mut Conn, _handle: ConnHandle, _event: StreamEvent) {}
-    fn close(&mut self, _handle: ConnHandle) {}
-    fn packet_error(&mut self, _from: SocketAddr, _err: &ConnError, _len: usize) {}
+    /// Protocol state owned by one connection slot.
+    type Connection;
+
+    /// Creates the slot-local state before the first connection event is delivered.
+    fn create_connection(&mut self, conn: &mut Connection, handle: Handle) -> Self::Connection;
+    fn established(
+        &mut self,
+        _connection: &mut Self::Connection,
+        _conn: &mut Connection,
+        _handle: Handle,
+    ) {
+    }
+    fn datagram(
+        &mut self,
+        _connection: &mut Self::Connection,
+        _conn: &mut Connection,
+        _handle: Handle,
+        _data: Vec<u8>,
+    ) {
+    }
+    fn stream_event(
+        &mut self,
+        _connection: &mut Self::Connection,
+        _conn: &mut Connection,
+        _handle: Handle,
+        _event: conn::stream::Event,
+    ) {
+    }
+    fn early_stream_event(
+        &mut self,
+        connection: &mut Self::Connection,
+        conn: &mut Connection,
+        handle: Handle,
+        event: conn::stream::Event,
+    ) {
+        self.stream_event(connection, conn, handle, event);
+    }
+    fn close(&mut self, _connection: Self::Connection, _handle: Handle) {}
+    fn packet_error(&mut self, _from: SocketAddr, _err: &Error, _len: usize) {}
 }
 
-struct Slot {
-    conn: Conn,
+struct Slot<C> {
+    conn: Connection,
+    connection: C,
     peer_addr: SocketAddr,
     notified_established: bool,
     max_packet_bytes: usize,
@@ -47,10 +79,16 @@ struct Slot {
     cids: [CidRecord; MAX_CIDS_PER_CONN],
 }
 
-impl Slot {
-    fn new(conn: Conn, peer_addr: SocketAddr, max_packet_bytes: usize) -> Self {
+impl<C> Slot<C> {
+    fn new(
+        conn: Connection,
+        connection: C,
+        peer_addr: SocketAddr,
+        max_packet_bytes: usize,
+    ) -> Self {
         Self {
             conn,
+            connection,
             peer_addr,
             notified_established: false,
             max_packet_bytes,
@@ -60,8 +98,8 @@ impl Slot {
     }
 }
 
-struct Entry {
-    slot: Option<Slot>,
+struct Entry<C> {
+    slot: Option<Slot<C>>,
     generation: u32,
     used: bool,
     free_next: u32,
@@ -69,23 +107,23 @@ struct Entry {
     reap: QueueLinks,
 }
 
-impl Entry {
-    fn slot(&self) -> Option<&Slot> {
+impl<C> Entry<C> {
+    fn slot(&self) -> Option<&Slot<C>> {
         self.slot.as_ref()
     }
 
-    fn slot_mut(&mut self) -> Option<&mut Slot> {
+    fn slot_mut(&mut self) -> Option<&mut Slot<C>> {
         self.slot.as_mut()
     }
 
-    fn insert(&mut self, slot: Slot) {
+    fn insert(&mut self, slot: Slot<C>) {
         debug_assert!(self.slot.is_none());
         self.flush = QueueLinks::default();
         self.reap = QueueLinks::default();
         self.slot = Some(slot);
     }
 
-    fn take(&mut self) -> Option<Slot> {
+    fn take(&mut self) -> Option<Slot<C>> {
         self.slot.take()
     }
 }
@@ -94,13 +132,13 @@ impl Entry {
 struct CidLink(NonZeroU128);
 
 impl CidLink {
-    fn new(handle: ConnHandle, ordinal: usize) -> Option<Self> {
+    fn new(handle: Handle, ordinal: usize) -> Option<Self> {
         let value = ((u128::from(handle.0) << 4) | ordinal as u128) + 1;
         NonZeroU128::new(value).map(Self)
     }
 
-    fn handle(self) -> ConnHandle {
-        ConnHandle(((self.0.get() - 1) >> 4) as u64)
+    fn handle(self) -> Handle {
+        Handle(((self.0.get() - 1) >> 4) as u64)
     }
 
     fn ordinal(self) -> usize {
@@ -190,6 +228,13 @@ impl Outgoing {
         }
     }
 
+    /// Borrows the encoded packet storage for in-place delivery.
+    pub fn payload_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Plain(_, payload) | Self::Batch(_, payload, _) => payload,
+        }
+    }
+
     fn packets(&self) -> usize {
         match self {
             Self::Plain(_, _) => 1,
@@ -204,13 +249,13 @@ impl Outgoing {
     }
 }
 
-struct ServerRuntime<P: ServerPolicy> {
+struct ServerRuntime<P: conn::server::Policy> {
     config: ValidatedConfig,
     shard: Shard<P::Guard, P::Verifier>,
     _policy: PhantomData<fn() -> P>,
 }
 
-impl<P: ServerPolicy> ServerRuntime<P> {
+impl<P: conn::server::Policy> ServerRuntime<P> {
     fn new(config: ValidatedConfig, shard: Shard<P::Guard, P::Verifier>) -> Self {
         Self {
             config,
@@ -220,8 +265,8 @@ impl<P: ServerPolicy> ServerRuntime<P> {
     }
 }
 
-pub struct Mux<H: Handler, P: ServerPolicy = Standard> {
-    entries: Vec<Entry>,
+pub struct Mux<H: Handler, P: conn::server::Policy = conn::server::Standard> {
+    entries: Vec<Entry<H::Connection>>,
     free_head: u32,
     cid_buckets: Box<[Option<CidLink>]>,
     cid_hasher: RandomState,
@@ -231,7 +276,7 @@ pub struct Mux<H: Handler, P: ServerPolicy = Standard> {
     pending_outgoing_packets: usize,
     pending_outgoing_bytes: usize,
     pending_outgoing_bytes_capacity: usize,
-    out_batch: GsoBatch,
+    out_batch: conn::packet::Gso,
     recycled_packets: Vec<Vec<u8>>,
     flush: QueueState,
     reap: QueueState,
@@ -242,7 +287,7 @@ pub struct Mux<H: Handler, P: ServerPolicy = Standard> {
     gso: bool,
 }
 
-impl<H: Handler> Mux<H, Standard> {
+impl<H: Handler> Mux<H, conn::server::Standard> {
     pub fn server(
         handler: H,
         signing_key: SigningKey,
@@ -347,7 +392,7 @@ impl<H: Handler> Mux<H, Standard> {
     }
 }
 
-impl<H, G> Mux<H, Standard<G>>
+impl<H, G> Mux<H, conn::server::Standard<G>>
 where
     H: Handler,
     G: EarlyDataGuard + 'static,
@@ -390,7 +435,7 @@ where
     }
 }
 
-impl<H, V> Mux<H, Mutual<NoGuard, V>>
+impl<H, V> Mux<H, conn::server::Mutual<NoGuard, V>>
 where
     H: Handler,
     V: ClientCertVerifier + 'static,
@@ -399,7 +444,7 @@ where
         handler: H,
         signing_key: SigningKey,
         server_config: conn::Config,
-        authentication: MutualAuthentication<V>,
+        authentication: conn::server::Authentication<V>,
     ) -> Result<Self, ConnectError> {
         Self::server_mutual_with_limits(
             handler,
@@ -416,7 +461,7 @@ where
         handler: H,
         signing_key: SigningKey,
         server_config: conn::Config,
-        authentication: MutualAuthentication<V>,
+        authentication: conn::server::Authentication<V>,
         max_conns: usize,
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
@@ -433,7 +478,7 @@ where
     }
 }
 
-impl<H, G, V> Mux<H, Mutual<G, V>>
+impl<H, G, V> Mux<H, conn::server::Mutual<G, V>>
 where
     H: Handler,
     G: EarlyDataGuard + 'static,
@@ -443,7 +488,7 @@ where
         handler: H,
         signing_key: SigningKey,
         server_config: conn::Config,
-        authentication: MutualAuthentication<V, G>,
+        authentication: conn::server::Authentication<V, G>,
     ) -> Result<Self, ConnectError> {
         Self::server_mutual_with_early_data_guard_and_limits(
             handler,
@@ -460,7 +505,7 @@ where
         handler: H,
         signing_key: SigningKey,
         server_config: conn::Config,
-        authentication: MutualAuthentication<V, G>,
+        authentication: conn::server::Authentication<V, G>,
         max_conns: usize,
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
@@ -477,7 +522,7 @@ where
     }
 }
 
-impl<H: Handler, P: ServerPolicy> Mux<H, P> {
+impl<H: Handler, P: conn::server::Policy> Mux<H, P> {
     pub fn server_with_policy(
         handler: H,
         signing_key: SigningKey,
@@ -525,7 +570,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
     ) -> Result<Self, ConnectError> {
-        let shard_config = Conn::take_server_config(signing_key, &mut server_config)?;
+        let shard_config = Connection::take_server_config(signing_key, &mut server_config)?;
         let server = ServerRuntime::new(server_config, (P::BUILD_SHARD)(shard_config, setup));
         Self::with_limits(
             handler,
@@ -597,7 +642,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
             pending_outgoing_packets: 0,
             pending_outgoing_bytes: 0,
             pending_outgoing_bytes_capacity: outgoing_bytes_capacity,
-            out_batch: GsoBatch::default(),
+            out_batch: conn::packet::Gso::default(),
             recycled_packets: Vec::with_capacity(outgoing_capacity),
             flush: QueueState::default(),
             reap: QueueState::default(),
@@ -625,7 +670,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
             .unwrap_or(1usize << (usize::BITS - 1))
     }
 
-    fn entry_arena(capacity: usize) -> Vec<Entry> {
+    fn entry_arena(capacity: usize) -> Vec<Entry<H::Connection>> {
         (0..capacity)
             .map(|index| Entry {
                 slot: None,
@@ -719,7 +764,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         client_config: conn::Config,
         initial_dcid: Vec<u8>,
         now: Instant,
-    ) -> Result<ConnHandle, ConnectError> {
+    ) -> Result<Handle, ConnectError> {
         if self.active_conns >= self.max_conns {
             return Err(ConnectError::Capacity);
         }
@@ -729,14 +774,14 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
             return Err(ConnectError::InvalidConfig);
         }
         let local_cid = self.gen_cid(initial_dcid.len(), client_config.cid_prefix);
-        let conn = Conn::new_client(
+        let conn = Connection::new_client(
             initial_dcid,
             local_cid.clone(),
             server_pubkey,
             client_config,
         )?;
         let handle = self
-            .insert_slot(Slot::new(conn, peer_addr, max_packet_bytes))
+            .insert_connection(conn, peer_addr, max_packet_bytes)
             .ok_or(ConnectError::Capacity)?;
         let registered = self.register_cid(handle, local_cid);
         debug_assert!(registered);
@@ -746,7 +791,10 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         Ok(handle)
     }
 
-    pub fn recv(&mut self, from: SocketAddr, data: &[u8], now: Instant) -> Result<(), ConnError> {
+    /// Receives and decrypts one datagram in place.
+    ///
+    /// The contents of `data` are unspecified after this call.
+    pub fn recv(&mut self, from: SocketAddr, data: &mut [u8], now: Instant) -> Result<(), Error> {
         let dcid = Self::parse_dcid(data, 8);
         let handle = match dcid.and_then(|value| self.find_cid(value)) {
             Some(h) => h,
@@ -767,16 +815,14 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
                 return Ok(());
             }
         };
-        let index = self.handle_index(handle).ok_or(ConnError::HeaderDecode)?;
+        let index = self.handle_index(handle).ok_or(Error::HeaderDecode)?;
         let new_cids = {
             let server = &mut self.server;
-            let slot = self.entries[index]
-                .slot_mut()
-                .ok_or(ConnError::HeaderDecode)?;
+            let slot = self.entries[index].slot_mut().ok_or(Error::HeaderDecode)?;
             if slot.conn.is_client() {
                 slot.conn.recv_packet(data, now)?;
             } else {
-                let server = server.as_mut().ok_or(ConnError::HeaderDecode)?;
+                let server = server.as_mut().ok_or(Error::HeaderDecode)?;
                 slot.conn.recv_packet_server(data, now, &mut server.shard)?;
             }
             slot.conn.take_cids_to_register()
@@ -784,7 +830,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         for cid in new_cids {
             if !self.register_cid(handle, cid) {
                 self.remove_slot(handle);
-                return Err(ConnError::HeaderDecode);
+                return Err(Error::HeaderDecode);
             }
         }
         self.notify(handle);
@@ -834,18 +880,18 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         self.flush_ready(now);
     }
 
-    pub fn conn_mut(&mut self, handle: ConnHandle) -> Option<&mut Conn> {
+    pub fn conn_mut(&mut self, handle: Handle) -> Option<&mut Connection> {
         let index = self.handle_index(handle)?;
         self.queue_push_back(QueueKind::Reap, index);
         self.entries[index].slot_mut().map(|slot| &mut slot.conn)
     }
 
-    pub fn conn(&self, handle: ConnHandle) -> Option<&Conn> {
+    pub fn conn(&self, handle: Handle) -> Option<&Connection> {
         let index = self.handle_index(handle)?;
         self.entries[index].slot().map(|slot| &slot.conn)
     }
 
-    pub fn flush(&mut self, handle: ConnHandle, now: Instant) {
+    pub fn flush(&mut self, handle: Handle, now: Instant) {
         self.schedule_flush(handle);
         self.flush_ready(now);
         self.refresh_deadline(handle, now);
@@ -853,7 +899,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
 
     pub fn try_send_datagram(
         &mut self,
-        handle: ConnHandle,
+        handle: Handle,
         data: Vec<u8>,
         now: Instant,
     ) -> Result<(), crate::TrySendError<Vec<u8>>> {
@@ -871,7 +917,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         result
     }
 
-    pub fn close(&mut self, handle: ConnHandle) {
+    pub fn close(&mut self, handle: Handle) {
         self.remove_slot(handle);
     }
 
@@ -921,57 +967,57 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
     fn try_accept(
         &mut self,
         from: SocketAddr,
-        data: &[u8],
+        data: &mut [u8],
         retry_odcid: Option<Vec<u8>>,
-    ) -> Result<ConnHandle, ConnError> {
+    ) -> Result<Handle, Error> {
         let server_config = self
             .server
             .as_ref()
-            .ok_or(ConnError::HeaderDecode)?
+            .ok_or(Error::HeaderDecode)?
             .config
             .duplicate_connection()
-            .map_err(|_| ConnError::Tls)?;
+            .map_err(|_| Error::Tls)?;
         if !matches!(data.first(), Some(&b) if b & 0xb0 == 0x80) {
-            return Err(ConnError::HeaderDecode);
+            return Err(Error::HeaderDecode);
         }
         let cid_prefix = server_config.cid_prefix;
-        let prefix = InitialHeader::decode_pre_hp(data).map_err(|_| ConnError::HeaderDecode)?;
+        let prefix = InitialHeader::decode_pre_hp(data).map_err(|_| Error::HeaderDecode)?;
         let initial_dcid = prefix.dcid;
         let peer_cid = prefix.scid;
         let local_cid = self.gen_cid(initial_dcid.len(), cid_prefix);
         let client_initial_dcid = initial_dcid.clone();
         let max_packet_bytes = self.connection_packet_ceiling(&server_config);
         if max_packet_bytes < BASE_PMTU as usize {
-            return Err(ConnError::PacketCeiling);
+            return Err(Error::PacketCeiling);
         }
         let ids = match retry_odcid {
-            Some(odcid) => ServerConnectionIds::retry(
+            Some(odcid) => conn::server::Ids::retry(
                 initial_dcid.clone(),
                 local_cid.clone(),
                 peer_cid,
                 odcid,
                 initial_dcid,
             ),
-            None => ServerConnectionIds::initial(initial_dcid, local_cid.clone(), peer_cid),
+            None => conn::server::Ids::initial(initial_dcid, local_cid.clone(), peer_cid),
         };
-        let conn = Conn::new_server_connection(ids, server_config).map_err(|_| ConnError::Tls)?;
+        let conn = Connection::new_server_connection(ids, server_config).map_err(|_| Error::Tls)?;
         let handle = self
-            .insert_slot(Slot::new(conn, from, max_packet_bytes))
-            .ok_or(ConnError::EventCapacity)?;
+            .insert_connection(conn, from, max_packet_bytes)
+            .ok_or(Error::EventCapacity)?;
         if !self.register_cid(handle, local_cid) {
             self.remove_slot(handle);
-            return Err(ConnError::HeaderDecode);
+            return Err(Error::HeaderDecode);
         }
         if self.find_cid(&client_initial_dcid).is_none()
             && !self.register_cid(handle, client_initial_dcid)
         {
             self.remove_slot(handle);
-            return Err(ConnError::HeaderDecode);
+            return Err(Error::HeaderDecode);
         }
         Ok(handle)
     }
 
-    fn flush_conn_round(&mut self, handle: ConnHandle, now: Instant) -> FlushRound {
+    fn flush_conn_round(&mut self, handle: Handle, now: Instant) -> FlushRound {
         let packet_room = self
             .pending_outgoing
             .capacity()
@@ -1099,7 +1145,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         }
     }
 
-    fn coalesce_gso(addr: SocketAddr, batch: &mut GsoBatch) -> Option<Outgoing> {
+    fn coalesce_gso(addr: SocketAddr, batch: &mut conn::packet::Gso) -> Option<Outgoing> {
         let (payload, segment_size, packets) = batch.take()?;
         if packets == 1 {
             Some(Outgoing::Plain(addr, payload))
@@ -1108,19 +1154,19 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         }
     }
 
-    fn schedule_flush(&mut self, handle: ConnHandle) {
+    fn schedule_flush(&mut self, handle: Handle) {
         let Some(idx) = self.handle_index(handle) else {
             return;
         };
         self.queue_push_back(QueueKind::Flush, idx);
     }
 
-    fn pop_flush(&mut self) -> Option<ConnHandle> {
+    fn pop_flush(&mut self) -> Option<Handle> {
         let index = self.queue_pop_front(QueueKind::Flush)?;
         Some(self.handle_for_index(index))
     }
 
-    fn unschedule_flush(&mut self, handle: ConnHandle) {
+    fn unschedule_flush(&mut self, handle: Handle) {
         let Some(idx) = self.handle_index(handle) else {
             return;
         };
@@ -1303,7 +1349,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         self.entries[index].slot_mut()?.cids.get_mut(link.ordinal())
     }
 
-    fn find_cid(&self, value: &[u8]) -> Option<ConnHandle> {
+    fn find_cid(&self, value: &[u8]) -> Option<Handle> {
         let mut current = self.cid_buckets[self.cid_bucket(value)];
         while let Some(link) = current {
             let record = self.cid_record(link)?;
@@ -1315,7 +1361,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         None
     }
 
-    fn register_cid(&mut self, handle: ConnHandle, value: Vec<u8>) -> bool {
+    fn register_cid(&mut self, handle: Handle, value: Vec<u8>) -> bool {
         if self.find_cid(&value).is_some() {
             return true;
         }
@@ -1350,7 +1396,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         true
     }
 
-    fn unregister_cids(&mut self, handle: ConnHandle) {
+    fn unregister_cids(&mut self, handle: Handle) {
         let Some(index) = self.handle_index(handle) else {
             return;
         };
@@ -1408,7 +1454,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         self.deadlines.insert(index, deadline).is_ok()
     }
 
-    fn refresh_deadline(&mut self, handle: ConnHandle, now: Instant) {
+    fn refresh_deadline(&mut self, handle: Handle, now: Instant) {
         let Some(index) = self.handle_index(handle) else {
             return;
         };
@@ -1433,7 +1479,11 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         }
     }
 
-    fn slot_deadline(slot: &Slot, flush_linked: bool, now: Instant) -> Option<Instant> {
+    fn slot_deadline(
+        slot: &Slot<H::Connection>,
+        flush_linked: bool,
+        now: Instant,
+    ) -> Option<Instant> {
         if slot.conn.is_closed() {
             return Some(now);
         }
@@ -1444,7 +1494,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         deadline
     }
 
-    fn notify(&mut self, handle: ConnHandle) {
+    fn notify(&mut self, handle: Handle) {
         let Some(index) = self.handle_index(handle) else {
             return;
         };
@@ -1454,18 +1504,32 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         };
         if slot.conn.is_established() && !slot.notified_established {
             slot.notified_established = true;
-            self.handler.established(&mut slot.conn, handle);
+            self.handler
+                .established(&mut slot.connection, &mut slot.conn, handle);
         }
         while let Some(dg) = slot.conn.recv_datagram() {
-            self.handler.datagram(&mut slot.conn, handle, dg);
+            self.handler
+                .datagram(&mut slot.connection, &mut slot.conn, handle, dg);
         }
-        while let Some(ev) = slot.conn.poll_stream_event() {
-            self.handler.stream_event(&mut slot.conn, handle, ev);
+        if slot.notified_established {
+            while let Some(ev) = slot.conn.poll_stream_event() {
+                self.handler
+                    .stream_event(&mut slot.connection, &mut slot.conn, handle, ev);
+            }
+        } else {
+            while let Some(ev) = slot.conn.poll_stream_event() {
+                self.handler
+                    .early_stream_event(&mut slot.connection, &mut slot.conn, handle, ev);
+            }
         }
     }
 
-    fn insert_slot(&mut self, slot: Slot) -> Option<ConnHandle> {
-        let mut slot = Some(slot);
+    fn insert_connection(
+        &mut self,
+        mut conn: Connection,
+        peer_addr: SocketAddr,
+        max_packet_bytes: usize,
+    ) -> Option<Handle> {
         while self.free_head != NONE {
             let index = self.free_head as usize;
             let entry = &mut self.entries[index];
@@ -1481,15 +1545,16 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
             };
             entry.generation = generation;
             entry.free_next = NONE;
-            let value = slot.take()?;
-            entry.insert(value);
+            let handle = Handle::from_parts(index as u32, generation);
+            let connection = self.handler.create_connection(&mut conn, handle);
+            self.entries[index].insert(Slot::new(conn, connection, peer_addr, max_packet_bytes));
             self.active_conns = self.active_conns.saturating_add(1);
-            return Some(ConnHandle::from_parts(index as u32, generation));
+            return Some(handle);
         }
         None
     }
 
-    fn remove_slot(&mut self, handle: ConnHandle) -> bool {
+    fn remove_slot(&mut self, handle: Handle) -> bool {
         let Some(idx) = self.handle_index(handle) else {
             return false;
         };
@@ -1503,16 +1568,15 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         self.active_conns = self.active_conns.saturating_sub(1);
         self.entries[idx].free_next = self.free_head;
         self.free_head = idx as u32;
-        drop(slot);
-        self.handler.close(handle);
+        self.handler.close(slot.connection, handle);
         true
     }
 
-    fn handle_for_index(&self, index: usize) -> ConnHandle {
-        ConnHandle::from_parts(index as u32, self.entries[index].generation)
+    fn handle_for_index(&self, index: usize) -> Handle {
+        Handle::from_parts(index as u32, self.entries[index].generation)
     }
 
-    fn handle_index(&self, handle: ConnHandle) -> Option<usize> {
+    fn handle_index(&self, handle: Handle) -> Option<usize> {
         let index = handle.index() as usize;
         self.entries
             .get(index)
@@ -1524,9 +1588,9 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
         &mut self,
         from: SocketAddr,
         data: &[u8],
-    ) -> Result<RetryGate, ConnError> {
+    ) -> Result<RetryGate, Error> {
         let (require_address_validation, retry_token_secret, cid_prefix, configured_ceiling) = {
-            let server_config = &self.server.as_ref().ok_or(ConnError::HeaderDecode)?.config;
+            let server_config = &self.server.as_ref().ok_or(Error::HeaderDecode)?.config;
             (
                 server_config.require_address_validation,
                 server_config.retry_token_secret,
@@ -1541,7 +1605,7 @@ impl<H: Handler, P: ServerPolicy> Mux<H, P> {
             Some(s) => RetryTokenSecret(s),
             None => return Ok(RetryGate::Accept(None)),
         };
-        let prefix = InitialHeader::decode_pre_hp(data).map_err(|_| ConnError::HeaderDecode)?;
+        let prefix = InitialHeader::decode_pre_hp(data).map_err(|_| Error::HeaderDecode)?;
         if prefix.token.is_empty() {
             let now_secs = WallClock::now().unix_seconds();
             let expiry = now_secs.saturating_add(10);
@@ -1660,18 +1724,20 @@ enum RetryGate {
     Drop,
 }
 
-impl<'d, const ID: u8, H: Handler, P: ServerPolicy> datagram::Handler<'d, ID> for Mux<H, P> {
+impl<'d, const ID: u8, H: Handler, P: conn::server::Policy> datagram::Handler<'d, ID>
+    for Mux<H, P>
+{
     fn packet(
         &mut self,
         addr: SocketAddr,
-        packet: datagram::Packet<'d>,
+        mut packet: datagram::Packet<'d>,
         _socket: Pin<&mut datagram::Socket<'d, ID>>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
         let now = Instant::now();
-        let data = packet.as_ref();
-        if let Err(error) = self.recv(addr, data, now) {
-            self.handler_mut().packet_error(addr, &error, data.len());
+        let len = packet.as_ref().len();
+        if let Err(error) = self.recv(addr, packet.as_mut(), now) {
+            self.handler_mut().packet_error(addr, &error, len);
         }
         packet.release(driver);
     }

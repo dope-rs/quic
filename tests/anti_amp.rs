@@ -2,7 +2,7 @@ pub mod support;
 
 use std::time::Instant;
 
-use dope_quic::{Conn, transport_params};
+use dope_quic::{Connection, transport_params};
 use shin::crypto::sig::SigningKey;
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
@@ -26,14 +26,16 @@ fn signed_keys() -> ([u8; 32], SigningKey) {
 fn server_starts_unvalidated() {
     let (_, signing) = signed_keys();
     let server =
-        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+        Connection::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp())
+            .unwrap();
     assert!(!server.peer_address_validated());
 }
 
 #[test]
 fn client_starts_validated_no_anti_amp_for_client() {
     let (server_pubkey, _) = signed_keys();
-    let client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
+    let client =
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
     assert!(client.peer_address_validated());
 }
 
@@ -42,13 +44,14 @@ fn server_first_response_under_3x_client_initial() {
     let (server_pubkey, signing) = signed_keys();
     let t0 = Instant::now();
     let mut server =
-        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+        Connection::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp())
+            .unwrap();
     let mut client =
-        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
-    let received_bytes: u64 = client
-        .send_packets(t0)
-        .iter()
+    let mut client_initial = client.send_packets(t0);
+    let received_bytes: u64 = client_initial
+        .iter_mut()
         .map(|p| {
             server.recv_packet(p, t0).expect("recv");
             p.len() as u64
@@ -72,20 +75,21 @@ fn server_validates_on_handshake_packet_from_client() {
     let (server_pubkey, signing) = signed_keys();
     let t0 = Instant::now();
     let mut server =
-        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+        Connection::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp())
+            .unwrap();
     let mut client =
-        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
-    for p in client.send_packets(t0) {
-        server.recv_packet(&p, t0).expect("recv");
+    for mut p in client.send_packets(t0) {
+        server.recv_packet(&mut p, t0).expect("recv");
     }
     assert!(!server.peer_address_validated());
 
-    for p in server.send_packets(t0) {
-        client.recv_packet(&p, t0).expect("recv");
+    for mut p in server.send_packets(t0) {
+        client.recv_packet(&mut p, t0).expect("recv");
     }
-    for p in client.send_packets(t0) {
-        server.recv_packet(&p, t0).expect("recv");
+    for mut p in client.send_packets(t0) {
+        server.recv_packet(&mut p, t0).expect("recv");
     }
 
     assert!(server.peer_address_validated());
@@ -96,16 +100,17 @@ fn validated_server_no_longer_capped() {
     let (server_pubkey, signing) = signed_keys();
     let t0 = Instant::now();
     let mut server =
-        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp()).unwrap();
+        Connection::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, user_tp())
+            .unwrap();
     let mut client =
-        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, user_tp()).unwrap();
 
     for _ in 0..4 {
-        for p in client.send_packets(t0) {
-            server.recv_packet(&p, t0).expect("recv");
+        for mut p in client.send_packets(t0) {
+            server.recv_packet(&mut p, t0).expect("recv");
         }
-        for p in server.send_packets(t0) {
-            client.recv_packet(&p, t0).expect("recv");
+        for mut p in server.send_packets(t0) {
+            client.recv_packet(&mut p, t0).expect("recv");
         }
     }
     assert!(server.is_established());

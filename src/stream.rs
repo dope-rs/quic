@@ -164,6 +164,8 @@ pub struct SendStream {
     fin_acked: bool,
     stop_sending_error: Option<u64>,
     reset_sent: bool,
+    scheduled: bool,
+    schedule_generation: bool,
 }
 
 impl SendStream {
@@ -209,6 +211,23 @@ impl SendStream {
         self.sent_rel < self.len() || (self.fin_marked && !self.fin_sent)
     }
 
+    pub(crate) fn schedule(&mut self) -> Option<bool> {
+        if self.scheduled || !self.has_pending() {
+            return None;
+        }
+        self.scheduled = true;
+        self.schedule_generation = !self.schedule_generation;
+        Some(self.schedule_generation)
+    }
+
+    pub(crate) fn is_scheduled(&self, generation: bool) -> bool {
+        self.scheduled && self.schedule_generation == generation
+    }
+
+    pub(crate) fn unschedule(&mut self) -> bool {
+        std::mem::replace(&mut self.scheduled, false)
+    }
+
     pub fn next_offset(&self) -> u64 {
         self.base_offset.saturating_add(self.sent_rel as u64)
     }
@@ -226,6 +245,9 @@ impl SendStream {
     }
 
     pub fn range_available(&self, offset: u64, len: u64) -> bool {
+        if len == 0 {
+            return offset == self.next_offset();
+        }
         if offset < self.base_offset {
             return false;
         }
@@ -270,6 +292,9 @@ impl SendStream {
         let Some(mut end) = offset.checked_add(len) else {
             return;
         };
+        if end <= self.base_offset {
+            return;
+        }
         let mut overlapping: Vec<u64> = Vec::new();
         for (&s, &e) in self.acked.range(..=end) {
             if e >= start {
@@ -281,24 +306,34 @@ impl SendStream {
         for s in overlapping {
             self.acked.remove(&s);
         }
-        self.acked.insert(start, end);
-
-        if let Some((&s0, &e0)) = self.acked.iter().next()
-            && s0 <= self.base_offset
-            && e0 > self.base_offset
-        {
-            let drain_n = usize::try_from(e0 - self.base_offset)
+        if start <= self.base_offset {
+            let drain_n = usize::try_from(end - self.base_offset)
                 .unwrap_or(usize::MAX)
                 .min(self.len());
             self.discard_prefix(drain_n);
             self.base_offset += drain_n as u64;
             self.sent_rel = self.sent_rel.saturating_sub(drain_n);
-            self.acked.remove(&s0);
+        } else {
+            self.acked.insert(start, end);
         }
     }
 
     pub fn is_fully_acked(&self) -> bool {
         self.fin_acked && self.len() == 0
+    }
+
+    pub(crate) fn recycle(&mut self) {
+        self.chunks.clear();
+        self.base_offset = 0;
+        self.sent_rel = 0;
+        self.acked.clear();
+        self.fin_marked = false;
+        self.fin_sent = false;
+        self.fin_acked = false;
+        self.stop_sending_error = None;
+        self.reset_sent = false;
+        self.scheduled = false;
+        self.schedule_generation = false;
     }
 
     pub fn stop(&mut self, error_code: u64) {
@@ -462,6 +497,22 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_ack_joins_the_prefix_without_losing_credit() {
+        let mut stream = SendStream::default();
+        assert!(stream.write(b"abcdefgh"));
+        stream.advance_sent(8, false);
+
+        stream.ack(4, 4);
+        assert_eq!(stream.base_offset, 0);
+        assert_eq!(stream.acked.get(&4), Some(&8));
+
+        stream.ack(0, 4);
+        assert_eq!(stream.base_offset, 8);
+        assert!(stream.acked.is_empty());
+        assert_eq!(stream.unsent_len(), 0);
+    }
+
+    #[test]
     fn borrowed_writes_reuse_the_acked_allocation() {
         let mut stream = SendStream::default();
         assert!(stream.write(b"first"));
@@ -475,6 +526,18 @@ mod tests {
             stream.chunks.front().unwrap().as_slice().as_ptr(),
             first_ptr
         );
+    }
+
+    #[test]
+    fn recycled_stream_reuses_its_segment_storage() {
+        let mut stream = SendStream::default();
+        assert!(stream.write_buffer(SendBuffer::inline(b"first").unwrap()));
+        let first = stream.chunks.front().unwrap() as *const SendBuffer;
+
+        stream.recycle();
+        assert!(stream.write_buffer(SendBuffer::inline(b"next").unwrap()));
+
+        assert_eq!(stream.chunks.front().unwrap() as *const SendBuffer, first);
     }
 
     #[test]

@@ -3,16 +3,17 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use dope_quic::conn::{Handle, stream::Event};
 use dope_quic::mux::Outgoing;
-use dope_quic::{Conn, ConnHandle, Handler, Mux, StreamEvent, transport_params};
+use dope_quic::{Connection, Handler, Mux, transport_params};
 use shin::crypto::sig::SigningKey;
 
 const CID: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
 #[derive(Default)]
 struct Events {
-    established: Vec<ConnHandle>,
-    streams: Vec<(ConnHandle, StreamEvent)>,
+    established: Vec<Handle>,
+    streams: Vec<(Handle, Event)>,
 }
 
 #[derive(Clone, Default)]
@@ -21,10 +22,20 @@ struct CapturingHandler {
 }
 
 impl Handler for CapturingHandler {
-    fn established(&mut self, _conn: &mut Conn, h: ConnHandle) {
+    type Connection = ();
+
+    fn create_connection(&mut self, _conn: &mut Connection, _handle: Handle) {}
+
+    fn established(&mut self, _connection: &mut (), _conn: &mut Connection, h: Handle) {
         self.events.borrow_mut().established.push(h);
     }
-    fn stream_event(&mut self, _conn: &mut Conn, h: ConnHandle, event: StreamEvent) {
+    fn stream_event(
+        &mut self,
+        _connection: &mut (),
+        _conn: &mut Connection,
+        h: Handle,
+        event: Event,
+    ) {
         self.events.borrow_mut().streams.push((h, event));
     }
 }
@@ -34,11 +45,11 @@ fn deliver(dst: &mut Mux<CapturingHandler>, src_addr: SocketAddr, burst: Vec<Out
     let mut gso_runs = 0;
     for out in burst {
         match out {
-            Outgoing::Plain(_, payload) => {
-                dst.recv(src_addr, &payload, now).expect("recv");
+            Outgoing::Plain(_, mut payload) => {
+                dst.recv(src_addr, &mut payload, now).expect("recv");
             }
-            Outgoing::Batch(_, payload, segment_size) => {
-                for segment in payload.chunks(usize::from(segment_size.get())) {
+            Outgoing::Batch(_, mut payload, segment_size) => {
+                for segment in payload.chunks_mut(usize::from(segment_size.get())) {
                     dst.recv(src_addr, segment, now).unwrap();
                 }
                 gso_runs += 1;
@@ -115,7 +126,7 @@ fn gso_burst_reassembles_to_full_stream() {
         client_events
             .borrow()
             .streams
-            .contains(&(client_handle, StreamEvent::Data { stream_id })),
+            .contains(&(client_handle, Event::Data { stream_id })),
         "client saw stream data"
     );
 

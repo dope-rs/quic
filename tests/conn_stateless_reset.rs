@@ -3,14 +3,15 @@ pub mod support;
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use dope_quic::{Conn, Handler, Mux, ServerConn, conn, transport_params};
+use dope_quic::conn::server;
+use dope_quic::{Connection, Handler, Mux, conn, transport_params};
 
 const CID: [u8; 8] = [0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55];
 
-fn drain<R: support::Receiver>(from: &mut Conn, into: &mut R) {
+fn drain<R: support::Receiver>(from: &mut Connection, into: &mut R) {
     let now = Instant::now();
-    for pkt in from.send_packets(now) {
-        into.receive(&pkt, now);
+    for mut pkt in from.send_packets(now) {
+        into.receive(&mut pkt, now);
     }
 }
 
@@ -27,11 +28,14 @@ fn cfg(secret: Option<[u8; 32]>) -> conn::Config {
     }
 }
 
-fn handshake(server_cfg: conn::Config, client_cfg: conn::Config) -> (ServerConn, Conn) {
+fn handshake(
+    server_cfg: conn::Config,
+    client_cfg: conn::Config,
+) -> (server::Connection, Connection) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
 
-    let mut server = Conn::new_server(
+    let mut server = Connection::new_server(
         CID.to_vec(),
         CID.to_vec(),
         CID.to_vec(),
@@ -40,7 +44,7 @@ fn handshake(server_cfg: conn::Config, client_cfg: conn::Config) -> (ServerConn,
     )
     .unwrap();
     let mut client =
-        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, client_cfg).unwrap();
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, client_cfg).unwrap();
 
     drain(&mut client, &mut server);
     drain(&mut server, &mut client);
@@ -51,7 +55,7 @@ fn handshake(server_cfg: conn::Config, client_cfg: conn::Config) -> (ServerConn,
     (server, client)
 }
 
-fn peer_cid(conn: &mut Conn) -> Vec<u8> {
+fn peer_cid(conn: &mut Connection) -> Vec<u8> {
     conn.try_send_datagram(vec![0]).unwrap();
     let packet = conn
         .send_packets(Instant::now())
@@ -121,12 +125,12 @@ fn matching_srt_in_tail_closes_conn_and_surfaces_flag() {
         .and_then(|params| params.stateless_reset_token)
         .expect("peer stateless reset token");
 
-    let reset = craft_stateless_reset(token);
+    let mut reset = craft_stateless_reset(token);
     let now = Instant::now();
 
     client
-        .recv_packet(&reset, now)
-        .expect("reset must not surface as ConnError");
+        .recv_packet(&mut reset, now)
+        .expect("reset must not surface as Error");
     assert!(
         client.was_stateless_reset(),
         "client should mark stateless_reset_received",
@@ -146,7 +150,7 @@ fn minimum_length_reset_is_accepted_regardless_of_header_form() {
     let tail = reset.len() - 16;
     reset[tail..].copy_from_slice(&token);
 
-    client.recv_packet(&reset, Instant::now()).unwrap();
+    client.recv_packet(&mut reset, Instant::now()).unwrap();
 
     assert!(client.was_stateless_reset());
     assert!(client.is_closed());
@@ -161,10 +165,10 @@ fn unrecognised_tail_does_not_trigger_reset() {
     for (i, b) in bogus.iter_mut().enumerate() {
         *b = (i as u8) ^ 0xAA;
     }
-    let reset = craft_stateless_reset(bogus);
+    let mut reset = craft_stateless_reset(bogus);
     let now = Instant::now();
 
-    let _ = client.recv_packet(&reset, now);
+    let _ = client.recv_packet(&mut reset, now);
     assert!(
         !client.was_stateless_reset(),
         "random tail must not trigger reset",
@@ -178,17 +182,17 @@ fn pre_handshake_reset_is_ignored() {
     let server_pubkey = *signing.pubkey().unwrap();
 
     let mut client =
-        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, cfg(None)).unwrap();
-    let reset = craft_stateless_reset([0xFFu8; 16]);
-    let _ = client.recv_packet(&reset, Instant::now());
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, cfg(None)).unwrap();
+    let mut reset = craft_stateless_reset([0xFFu8; 16]);
+    let _ = client.recv_packet(&mut reset, Instant::now());
     assert!(!client.was_stateless_reset());
 }
 
 struct NoopHandler;
 impl Handler for NoopHandler {
-    fn established(&mut self, _conn: &mut Conn, _h: dope_quic::ConnHandle) {}
-    fn datagram(&mut self, _conn: &mut Conn, _h: dope_quic::ConnHandle, _data: Vec<u8>) {}
-    fn close(&mut self, _h: dope_quic::ConnHandle) {}
+    type Connection = ();
+
+    fn create_connection(&mut self, _conn: &mut Connection, _handle: dope_quic::conn::Handle) {}
 }
 
 fn server_mux(secret: [u8; 32]) -> Mux<NoopHandler> {
@@ -210,7 +214,7 @@ fn server_emits_reset_for_unknown_dcid() {
     wire[1..9].copy_from_slice(&dcid);
 
     let from: SocketAddr = "127.0.0.1:55555".parse().unwrap();
-    mux.recv(from, &wire, Instant::now()).unwrap();
+    mux.recv(from, &mut wire, Instant::now()).unwrap();
 
     let outgoing: Vec<_> = mux.drain_outgoing().collect();
     assert_eq!(outgoing.len(), 1, "exactly one reset should be emitted");
@@ -227,7 +231,7 @@ fn server_emits_reset_for_unknown_dcid() {
 
     let expected = {
         let signing = support::signing_key(0x39);
-        let server = Conn::new_server(
+        let server = Connection::new_server(
             CID.to_vec(),
             dcid.to_vec(),
             CID.to_vec(),
@@ -248,7 +252,7 @@ fn server_emits_reset_for_unknown_dcid() {
 
     let mut wire2 = vec![0x40u8; 30];
     wire2[1..9].copy_from_slice(&dcid);
-    mux.recv(from, &wire2, Instant::now()).unwrap();
+    mux.recv(from, &mut wire2, Instant::now()).unwrap();
     let outgoing2: Vec<_> = mux.drain_outgoing().collect();
     let mut tail2 = [0u8; 16];
     let p2 = outgoing2[0].payload();
@@ -266,7 +270,7 @@ fn stateless_reset_obeys_checked_packet_ceiling() {
     let mut mux = Mux::server_with_outgoing_limits(NoopHandler, signing, config, 1, 22).unwrap();
     let mut wire = vec![0x40; 64];
     wire[1..9].copy_from_slice(&[0x99; 8]);
-    mux.recv("127.0.0.1:4444".parse().unwrap(), &wire, Instant::now())
+    mux.recv("127.0.0.1:4444".parse().unwrap(), &mut wire, Instant::now())
         .unwrap();
     let reset = mux.drain_outgoing().next().unwrap();
     assert_eq!(reset.payload().len(), 22);
@@ -283,7 +287,7 @@ fn server_without_secret_does_not_emit_reset() {
     wire[1..9].copy_from_slice(&dcid);
 
     let from: SocketAddr = "127.0.0.1:1".parse().unwrap();
-    mux.recv(from, &wire, Instant::now()).unwrap();
+    mux.recv(from, &mut wire, Instant::now()).unwrap();
     assert!(
         mux.drain_outgoing().next().is_none(),
         "no secret ⇒ no reset"
@@ -295,9 +299,9 @@ fn server_does_not_emit_reset_for_initial_packet() {
     let secret = [0xD2u8; 32];
     let mut mux = server_mux(secret);
 
-    let wire = vec![0xC0u8; 30];
+    let mut wire = vec![0xC0u8; 30];
     let from: SocketAddr = "127.0.0.1:2".parse().unwrap();
-    let _ = mux.recv(from, &wire, Instant::now());
+    let _ = mux.recv(from, &mut wire, Instant::now());
     assert!(
         mux.drain_outgoing().next().is_none(),
         "Initial path must not emit reset"
@@ -314,10 +318,10 @@ fn end_to_end_server_restart_recovery() {
     let mut wire = vec![0x40u8; 30];
     wire[1..9].copy_from_slice(&peer_dcid);
     let from: SocketAddr = "127.0.0.1:33333".parse().unwrap();
-    server_b.recv(from, &wire, Instant::now()).unwrap();
-    let outgoing: Vec<_> = server_b.drain_outgoing().collect();
+    server_b.recv(from, &mut wire, Instant::now()).unwrap();
+    let mut outgoing: Vec<_> = server_b.drain_outgoing().collect();
     assert_eq!(outgoing.len(), 1);
-    let reset = outgoing[0].payload();
+    let reset = outgoing[0].payload_mut();
 
     client.recv_packet(reset, Instant::now()).unwrap();
     assert!(

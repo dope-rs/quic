@@ -2,8 +2,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use dope_quic::conn::PacketBatch;
-use dope_quic::{Conn, ServerConn, conn, transport_params};
+use dope_quic::conn::packet::Batch;
+use dope_quic::conn::server;
+use dope_quic::{Connection, conn, transport_params};
 use shin::crypto::sig::SigningKey;
 
 struct CountingAllocator;
@@ -51,20 +52,20 @@ fn config() -> conn::Config {
     }
 }
 
-fn established() -> (Conn, ServerConn) {
+fn established() -> (Connection, server::Connection) {
     let cid = vec![0x71; 8];
     let signing = SigningKey::from_seed(&[0x39; 32]).unwrap();
     let public_key = *signing.pubkey().unwrap();
     let mut server =
-        Conn::new_server(cid.clone(), cid.clone(), cid.clone(), signing, config()).unwrap();
-    let mut client = Conn::new_client(cid.clone(), cid, public_key, config()).unwrap();
+        Connection::new_server(cid.clone(), cid.clone(), cid.clone(), signing, config()).unwrap();
+    let mut client = Connection::new_client(cid.clone(), cid, public_key, config()).unwrap();
     let now = Instant::now();
     for _ in 0..6 {
-        for packet in client.send_packets(now) {
-            server.recv_packet(&packet, now).unwrap();
+        for mut packet in client.send_packets(now) {
+            server.recv_packet(&mut packet, now).unwrap();
         }
-        for packet in server.send_packets(now) {
-            client.recv_packet(&packet, now).unwrap();
+        for mut packet in server.send_packets(now) {
+            client.recv_packet(&mut packet, now).unwrap();
         }
     }
     assert!(client.is_established() && server.is_established());
@@ -77,7 +78,7 @@ fn warmed_one_rtt_send_and_decrypt_do_not_allocate() {
     let payload = vec![0x5a; 4096];
     let stream = client.open_bidi_stream().unwrap();
     client.stream_send(stream, &payload).unwrap();
-    let mut batch = PacketBatch::default();
+    let mut batch = Batch::default();
     let now = Instant::now() + Duration::from_secs(1);
     client.send_batch(&mut batch, now, 1, 1200);
     assert_eq!(batch.packets(), 1);
@@ -96,12 +97,13 @@ fn warmed_one_rtt_send_and_decrypt_do_not_allocate() {
     );
 
     let packet_now = now + Duration::from_secs(2);
-    let packet = client.send_packets(packet_now).into_iter().next().unwrap();
-    server.recv_packet(&packet, packet_now).unwrap();
+    let mut packet = client.send_packets(packet_now).into_iter().next().unwrap();
+    let mut duplicate = packet.clone();
+    server.recv_packet(&mut packet, packet_now).unwrap();
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
     COUNTING.store(true, Ordering::Relaxed);
-    server.recv_packet(&packet, packet_now).unwrap();
+    server.recv_packet(&mut duplicate, packet_now).unwrap();
     COUNTING.store(false, Ordering::Relaxed);
 
     assert_eq!(

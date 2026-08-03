@@ -2,14 +2,15 @@ pub mod support;
 
 use std::time::Instant;
 
-use dope_quic::{Conn, ServerConn, conn, transport_params};
+use dope_quic::conn::server;
+use dope_quic::{Connection, conn, transport_params};
 
 const CID: [u8; 8] = [0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33];
 
-fn drain<R: support::Receiver>(from: &mut Conn, into: &mut R) {
+fn drain<R: support::Receiver>(from: &mut Connection, into: &mut R) {
     let now = Instant::now();
-    for pkt in from.send_packets(now) {
-        into.receive(&pkt, now);
+    for mut pkt in from.send_packets(now) {
+        into.receive(&mut pkt, now);
     }
 }
 
@@ -26,11 +27,14 @@ fn cfg(cid_prefix: Option<u8>) -> conn::Config {
     }
 }
 
-fn make_pair(server_prefix: Option<u8>, client_prefix: Option<u8>) -> (ServerConn, Conn) {
+fn make_pair(
+    server_prefix: Option<u8>,
+    client_prefix: Option<u8>,
+) -> (server::Connection, Connection) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
 
-    let mut server = Conn::new_server(
+    let mut server = Connection::new_server(
         CID.to_vec(),
         CID.to_vec(),
         CID.to_vec(),
@@ -38,7 +42,7 @@ fn make_pair(server_prefix: Option<u8>, client_prefix: Option<u8>) -> (ServerCon
         cfg(server_prefix),
     )
     .unwrap();
-    let mut client = Conn::new_client(
+    let mut client = Connection::new_client(
         CID.to_vec(),
         CID.to_vec(),
         server_pubkey,
@@ -54,7 +58,7 @@ fn make_pair(server_prefix: Option<u8>, client_prefix: Option<u8>) -> (ServerCon
     (server, client)
 }
 
-fn issued_cids(conn: &Conn) -> Vec<&Vec<u8>> {
+fn issued_cids(conn: &Connection) -> Vec<&Vec<u8>> {
     conn.local_cids()
         .iter()
         .filter(|(seq, _)| **seq > 0)

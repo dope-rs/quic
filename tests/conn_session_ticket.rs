@@ -2,11 +2,12 @@ pub mod support;
 
 use std::time::Instant;
 
-use dope_quic::{Conn, ServerConn, conn, transport_params};
+use dope_quic::conn::server;
+use dope_quic::{Connection, conn, transport_params};
 
 const HS_CID: [u8; 8] = [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8];
 
-fn handshake_pair() -> (ServerConn, Conn) {
+fn handshake_pair() -> (server::Connection, Connection) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
     let cfg = || conn::Config {
@@ -23,7 +24,7 @@ fn handshake_pair() -> (ServerConn, Conn) {
         ticket_secret: Some([0x77u8; 32]),
         ..Default::default()
     };
-    let mut server = Conn::new_server(
+    let mut server = Connection::new_server(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         HS_CID.to_vec(),
@@ -32,14 +33,14 @@ fn handshake_pair() -> (ServerConn, Conn) {
     )
     .unwrap();
     let mut client =
-        Conn::new_client(HS_CID.to_vec(), HS_CID.to_vec(), server_pubkey, cfg()).unwrap();
+        Connection::new_client(HS_CID.to_vec(), HS_CID.to_vec(), server_pubkey, cfg()).unwrap();
     let now = Instant::now();
     for _ in 0..3 {
-        for pkt in client.send_packets(now) {
-            server.recv_packet(&pkt, now).expect("server recv");
+        for mut pkt in client.send_packets(now) {
+            server.recv_packet(&mut pkt, now).expect("server recv");
         }
-        for pkt in server.send_packets(now) {
-            client.recv_packet(&pkt, now).expect("client recv");
+        for mut pkt in server.send_packets(now) {
+            client.recv_packet(&mut pkt, now).expect("client recv");
         }
     }
     assert!(client.is_established() && server.is_established());
@@ -50,9 +51,9 @@ fn handshake_pair() -> (ServerConn, Conn) {
 fn server_emits_session_ticket_after_handshake() {
     let (mut server, mut client) = handshake_pair();
     let now = Instant::now();
-    for pkt in server.send_packets(now) {
+    for mut pkt in server.send_packets(now) {
         client
-            .recv_packet(&pkt, now)
+            .recv_packet(&mut pkt, now)
             .expect("client recv app crypto");
     }
     let tickets = client.take_session_tickets();
@@ -79,8 +80,8 @@ fn server_emits_session_ticket_after_handshake() {
 fn client_takes_tickets_drains_buffer() {
     let (mut server, mut client) = handshake_pair();
     let now = Instant::now();
-    for pkt in server.send_packets(now) {
-        client.recv_packet(&pkt, now).expect("client recv");
+    for mut pkt in server.send_packets(now) {
+        client.recv_packet(&mut pkt, now).expect("client recv");
     }
     let _ = client.take_session_tickets();
     assert!(

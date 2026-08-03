@@ -2,7 +2,9 @@ pub mod support;
 
 use std::time::{Duration, Instant};
 
-use dope_quic::{Conn, DatagramCongestionControl, ServerConn, conn, transport_params};
+use dope_quic::conn::server;
+use dope_quic::conn::{self, datagram::CongestionControl};
+use dope_quic::{Connection, transport_params};
 
 const CID: [u8; 8] = [0x88; 8];
 
@@ -17,7 +19,7 @@ impl Lcg {
     }
 }
 
-fn cfg(mode: DatagramCongestionControl) -> conn::Config {
+fn cfg(mode: CongestionControl) -> conn::Config {
     conn::Config {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 60_000,
@@ -30,10 +32,13 @@ fn cfg(mode: DatagramCongestionControl) -> conn::Config {
     }
 }
 
-fn handshake_pair(client_cfg: conn::Config, server_cfg: conn::Config) -> (Conn, ServerConn) {
+fn handshake_pair(
+    client_cfg: conn::Config,
+    server_cfg: conn::Config,
+) -> (Connection, server::Connection) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
-    let mut server = Conn::new_server(
+    let mut server = Connection::new_server(
         CID.to_vec(),
         CID.to_vec(),
         CID.to_vec(),
@@ -42,14 +47,14 @@ fn handshake_pair(client_cfg: conn::Config, server_cfg: conn::Config) -> (Conn, 
     )
     .unwrap();
     let mut client =
-        Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, client_cfg).unwrap();
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, client_cfg).unwrap();
     let now = Instant::now();
     for _ in 0..6 {
-        for pkt in client.send_packets(now) {
-            let _ = server.recv_packet(&pkt, now);
+        for mut pkt in client.send_packets(now) {
+            let _ = server.recv_packet(&mut pkt, now);
         }
-        for pkt in server.send_packets(now) {
-            let _ = client.recv_packet(&pkt, now);
+        for mut pkt in server.send_packets(now) {
+            let _ = client.recv_packet(&mut pkt, now);
         }
         if client.is_established() && server.is_established() {
             break;
@@ -61,7 +66,7 @@ fn handshake_pair(client_cfg: conn::Config, server_cfg: conn::Config) -> (Conn, 
 }
 
 fn blast_drain(
-    mode: DatagramCongestionControl,
+    mode: CongestionControl,
     drop_per_million: u32,
     n: usize,
 ) -> (usize, usize, Duration) {
@@ -83,18 +88,18 @@ fn blast_drain(
     while received < n && iterations < max_iter {
         let mut any_progress = false;
 
-        for pkt in client.send_packets(now) {
+        for mut pkt in client.send_packets(now) {
             if rng.next() % 1_000_000 >= drop_per_million {
-                let _ = server.recv_packet(&pkt, now);
+                let _ = server.recv_packet(&mut pkt, now);
                 any_progress = true;
             }
         }
         while let Some(_dg) = server.recv_datagram() {
             received += 1;
         }
-        for pkt in server.send_packets(now) {
+        for mut pkt in server.send_packets(now) {
             if rng.next() % 1_000_000 >= drop_per_million {
-                let _ = client.recv_packet(&pkt, now);
+                let _ = client.recv_packet(&mut pkt, now);
                 any_progress = true;
             }
         }
@@ -117,7 +122,7 @@ fn blast_drain(
 
 #[test]
 fn baseline_uncongested_drains_all() {
-    let (recv, iters, sim) = blast_drain(DatagramCongestionControl::Uncongested, 0, 1000);
+    let (recv, iters, sim) = blast_drain(CongestionControl::Uncongested, 0, 1000);
     eprintln!(
         "uncongested 0% loss: recv={} iters={} sim={:?}",
         recv, iters, sim
@@ -130,7 +135,7 @@ fn baseline_uncongested_drains_all() {
 
 #[test]
 fn uncongested_under_30pct_loss() {
-    let (recv, iters, sim) = blast_drain(DatagramCongestionControl::Uncongested, 300_000, 1000);
+    let (recv, iters, sim) = blast_drain(CongestionControl::Uncongested, 300_000, 1000);
     eprintln!(
         "uncongested 30% loss: recv={} iters={} sim={:?}",
         recv, iters, sim
@@ -145,7 +150,7 @@ fn uncongested_under_30pct_loss() {
 
 #[test]
 fn standard_under_30pct_loss() {
-    let (recv, iters, sim) = blast_drain(DatagramCongestionControl::Standard, 300_000, 1000);
+    let (recv, iters, sim) = blast_drain(CongestionControl::Standard, 300_000, 1000);
     eprintln!(
         "standard 30% loss: recv={} iters={} sim={:?}",
         recv, iters, sim
@@ -155,8 +160,8 @@ fn standard_under_30pct_loss() {
 #[test]
 fn uncongested_bursts_are_bounded_without_dropping_the_queue() {
     let (mut client, _server) = handshake_pair(
-        cfg(DatagramCongestionControl::Uncongested),
-        cfg(DatagramCongestionControl::Uncongested),
+        cfg(CongestionControl::Uncongested),
+        cfg(CongestionControl::Uncongested),
     );
     for i in 0..1000usize {
         client

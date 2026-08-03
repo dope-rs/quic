@@ -6,8 +6,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use dope::runtime::executor::Executor;
-use dope::{Completion as _, DriverContext, driver};
-use dope_quic::{Conn, ConnHandle, Endpoint, Handler, Standard, conn, endpoint, transport_params};
+use dope::{Completion, DriverContext, driver};
+use dope_quic::conn::Handle;
+use dope_quic::conn::server;
+use dope_quic::{Connection, Endpoint, Handler, conn, endpoint, transport_params};
 use shin::server::config::NoGuard;
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
@@ -26,8 +28,8 @@ const ENDPOINT: endpoint::Config = endpoint::Config {
 
 #[derive(Default)]
 struct Events {
-    established: Vec<ConnHandle>,
-    datagrams: Vec<(ConnHandle, Vec<u8>)>,
+    established: Vec<Handle>,
+    datagrams: Vec<(Handle, Vec<u8>)>,
 }
 
 #[derive(Clone, Default)]
@@ -36,10 +38,14 @@ struct CapturingHandler {
 }
 
 impl Handler for CapturingHandler {
-    fn established(&mut self, _conn: &mut Conn, h: ConnHandle) {
+    type Connection = ();
+
+    fn create_connection(&mut self, _conn: &mut Connection, _handle: Handle) {}
+
+    fn established(&mut self, _connection: &mut (), _conn: &mut Connection, h: Handle) {
         self.events.borrow_mut().established.push(h);
     }
-    fn datagram(&mut self, _conn: &mut Conn, h: ConnHandle, data: Vec<u8>) {
+    fn datagram(&mut self, _connection: &mut (), _conn: &mut Connection, h: Handle, data: Vec<u8>) {
         self.events.borrow_mut().datagrams.push((h, data.to_vec()));
     }
 }
@@ -85,7 +91,7 @@ fn quic_datagram_handshake_completes_on_loopback() {
             let server_handler = CapturingHandler::default();
             let server_events = server_handler.events.clone();
             let mut server = std::pin::pin!(
-                Endpoint::<'_, 0, CapturingHandler, Standard>::build_server_with_policy(
+                Endpoint::<'_, 0, CapturingHandler, server::Standard>::build_server_with_policy(
                     "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
                     signing,
                     conn::Config::from(user_tp.clone()),

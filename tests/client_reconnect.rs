@@ -8,12 +8,13 @@ use std::time::{Duration, Instant};
 
 use dope::runtime::dispatcher::Dispatcher;
 use dope::runtime::executor::Executor;
-use dope::{Completion as _, DriverContext, driver};
+use dope::{Completion, DriverContext, driver};
+use dope_quic::conn::Handle;
 use dope_quic::{
-    BackoffPolicy, Client, Conn, ConnHandle, Endpoint, EndpointSpec, Handler, Protocol, SlotId,
-    client, conn, endpoint, transport_params,
+    BackoffPolicy, Client, Connection, Endpoint, EndpointSpec, Handler, Protocol, SlotId, client,
+    conn, endpoint, transport_params,
 };
-use o3::cell::BrandCell as Branded;
+use o3::cell;
 
 const ENDPOINT: endpoint::Config = endpoint::Config {
     max_conns: 1,
@@ -28,7 +29,11 @@ const ENDPOINT: endpoint::Config = endpoint::Config {
 struct CloseImmediately;
 
 impl Handler for CloseImmediately {
-    fn established(&mut self, conn: &mut Conn, _handle: ConnHandle) {
+    type Connection = ();
+
+    fn create_connection(&mut self, _conn: &mut Connection, _handle: Handle) {}
+
+    fn established(&mut self, _connection: &mut (), conn: &mut Connection, _handle: Handle) {
         conn.close(0, Vec::new());
     }
 }
@@ -133,7 +138,7 @@ fn immediate_reconnect_reuses_one_generation_checked_slot() {
         assert!(client.smoothed_rtt(SlotId::from_index(0)).is_none());
         assert!(client.path_stats(SlotId::from_index(0)).is_none());
         assert!(client.path_stats(SlotId::from_index(1)).is_none());
-        let runtime = pin!(Branded::new(Runtime { server, client }));
+        let runtime = pin!(cell::BrandCell::new(Runtime { server, client }));
         let mut completions = [const { None }; 64];
         let mut ready = Vec::with_capacity(64);
         for _ in 0..2_000 {

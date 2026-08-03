@@ -1,13 +1,23 @@
 use dope_quic::client_auth::{ClientAuth, ClientCertVerifier, ClientIdentity};
+use dope_quic::conn::server;
 use dope_quic::early_data::EarlyDataReplayCache;
-use dope_quic::{Conn, Handler, Mutual, MutualAuthentication, Mux, ServerConnectionIds, Standard};
-use shin::server::config::NoGuard;
+use dope_quic::{Connection, Handler, Mux};
 use shin::crypto::sig::SigningKey;
 use shin::crypto::ticket::TicketKeys;
+use shin::server::config::NoGuard;
 
 struct Noop;
 
-impl Handler for Noop {}
+impl Handler for Noop {
+    type Connection = ();
+
+    fn create_connection(
+        &mut self,
+        _conn: &mut dope_quic::Connection,
+        _handle: dope_quic::conn::Handle,
+    ) {
+    }
+}
 
 struct Accept;
 
@@ -36,7 +46,7 @@ fn lane_owned_security_policies_are_concrete() {
         Noop,
         signing(),
         Default::default(),
-        MutualAuthentication::new(ClientAuth::Required, Accept),
+        server::Authentication::new(ClientAuth::Required, Accept),
     )
     .unwrap();
     assert!(mutual.replace_ticket_keys(None));
@@ -45,7 +55,7 @@ fn lane_owned_security_policies_are_concrete() {
         Noop,
         signing(),
         Default::default(),
-        MutualAuthentication::with_early_data_guard(
+        server::Authentication::with_early_data_guard(
             EarlyDataReplayCache::new(),
             ClientAuth::Required,
             Accept,
@@ -64,17 +74,21 @@ fn clients_have_no_ticket_shard() {
 #[test]
 fn generic_policy_paths_cover_conn_and_mux() {
     let cid = vec![0x71; 8];
-    let ids = ServerConnectionIds::initial(cid.clone(), cid.clone(), cid);
-    let _server =
-        Conn::new_server_with_policy::<Standard>(ids, signing(), Default::default(), NoGuard)
-            .unwrap();
+    let ids = server::Ids::initial(cid.clone(), cid.clone(), cid);
+    let _server = Connection::new_server_with_policy::<server::Standard>(
+        ids,
+        signing(),
+        Default::default(),
+        NoGuard,
+    )
+    .unwrap();
 
-    let authentication = MutualAuthentication::with_early_data_guard(
+    let authentication = server::Authentication::with_early_data_guard(
         EarlyDataReplayCache::new(),
         ClientAuth::Required,
         Accept,
     );
-    let mut mux = Mux::<_, Mutual<EarlyDataReplayCache, Accept>>::server_with_policy(
+    let mut mux = Mux::<_, server::Mutual<EarlyDataReplayCache, Accept>>::server_with_policy(
         Noop,
         signing(),
         Default::default(),

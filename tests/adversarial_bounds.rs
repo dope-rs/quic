@@ -2,20 +2,22 @@ pub mod support;
 
 use std::time::Instant;
 
+use dope_quic::conn::Error;
+use dope_quic::conn::server;
 use dope_quic::early_data::EarlyDataReplayCache;
 use dope_quic::frame::Frame;
 use dope_quic::packet::{InitialHeader, QUIC_V1};
 use dope_quic::packet_protection::PacketProtection;
 use dope_quic::qkdf::{InitialSecrets, PacketKeys};
 use dope_quic::varint::VarInt;
-use dope_quic::{Conn, ConnError, ConnectError, Handler, Mux, ServerConn, conn};
+use dope_quic::{ConnectError, Connection, Handler, Mux, conn};
 
 const INITIAL_DCID: [u8; 8] = [0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce];
 const CLIENT_SCID: [u8; 4] = [1, 2, 3, 4];
 const SERVER_CID: [u8; 8] = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
 
-fn server() -> ServerConn {
-    Conn::new_server(
+fn server() -> server::Connection {
+    Connection::new_server(
         INITIAL_DCID.to_vec(),
         SERVER_CID.to_vec(),
         CLIENT_SCID.to_vec(),
@@ -36,7 +38,11 @@ fn invalid_allocation_limits_fail_before_construction() {
 
 struct Noop;
 
-impl Handler for Noop {}
+impl Handler for Noop {
+    type Connection = ();
+
+    fn create_connection(&mut self, _conn: &mut Connection, _handle: dope_quic::conn::Handle) {}
+}
 
 #[test]
 fn allocation_constructors_reject_unsupported_capacities() {
@@ -67,10 +73,10 @@ fn incoming_ack_ranges_are_bounded_before_iteration() {
     }
     .encode(&mut frames)
     .unwrap();
-    let packet = support::client_initial(&INITIAL_DCID, &CLIENT_SCID, 0, &frames);
+    let mut packet = support::client_initial(&INITIAL_DCID, &CLIENT_SCID, 0, &frames);
     assert_eq!(
-        server.recv_packet(&packet, Instant::now()),
-        Err(ConnError::FrameDecode)
+        server.recv_packet(&mut packet, Instant::now()),
+        Err(Error::FrameDecode)
     );
 }
 
@@ -86,12 +92,13 @@ fn fragmented_crypto_ranges_are_bounded_on_the_wire() {
         }
         .encode(&mut frames)
         .unwrap();
-        let packet = support::client_initial(&INITIAL_DCID, &CLIENT_SCID, packet_number, &frames);
-        let result = server.recv_packet(&packet, now);
+        let mut packet =
+            support::client_initial(&INITIAL_DCID, &CLIENT_SCID, packet_number, &frames);
+        let result = server.recv_packet(&mut packet, now);
         if packet_number < 256 {
             assert_eq!(result, Ok(()));
         } else {
-            assert_eq!(result, Err(ConnError::CryptoBufferExceeded));
+            assert_eq!(result, Err(Error::CryptoBufferExceeded));
         }
     }
 }

@@ -5,7 +5,21 @@ struct BorrowedHandler<'a> {
 }
 
 impl Handler for BorrowedHandler<'_> {
-    fn established(&mut self, _conn: &mut dope_quic::Conn, _handle: dope_quic::ConnHandle) {
+    type Connection = ();
+
+    fn create_connection(
+        &mut self,
+        _conn: &mut dope_quic::Connection,
+        _handle: dope_quic::conn::Handle,
+    ) {
+    }
+
+    fn established(
+        &mut self,
+        _connection: &mut (),
+        _conn: &mut dope_quic::Connection,
+        _handle: dope_quic::conn::Handle,
+    ) {
         std::hint::black_box(self.state);
     }
 }

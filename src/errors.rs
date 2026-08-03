@@ -1,10 +1,11 @@
 use std::error::Error;
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectError {
     Capacity,
     InvalidConfig,
+    InvalidTlsConfig(shin::client::config::ConfigError),
     Tls,
 }
 
@@ -13,12 +14,22 @@ impl fmt::Display for ConnectError {
         f.write_str(match self {
             Self::Capacity => "connection capacity exhausted",
             Self::InvalidConfig => "invalid connection configuration",
+            Self::InvalidTlsConfig(error) => {
+                return write!(f, "invalid TLS configuration: {error}");
+            }
             Self::Tls => "TLS connection initialization failed",
         })
     }
 }
 
-impl Error for ConnectError {}
+impl Error for ConnectError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidTlsConfig(error) => Some(error),
+            Self::Capacity | Self::InvalidConfig | Self::Tls => None,
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum TrySendError<T> {

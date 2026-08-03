@@ -1,9 +1,10 @@
+use dope_quic::conn::server;
 use dope_quic::packet::{InitialHeader, QUIC_V1};
 use dope_quic::packet_protection::PacketProtection;
 use dope_quic::qkdf::{InitialSecrets, PacketKeys};
-use dope_quic::{Conn, ServerConn, conn, transport_params};
-use shin::server::{config::ClientCertVerifier, config::EarlyDataGuard};
+use dope_quic::{Connection, conn, transport_params};
 use shin::crypto::sig::SigningKey;
+use shin::server::{config::ClientCertVerifier, config::EarlyDataGuard};
 use std::time::Instant;
 
 pub fn signing_key(seed: u8) -> SigningKey {
@@ -38,37 +39,37 @@ pub fn config_with_credit(
 }
 
 pub trait Receiver {
-    fn receive(&mut self, packet: &[u8], now: Instant);
+    fn receive(&mut self, packet: &mut [u8], now: Instant);
 }
 
-impl Receiver for Conn {
-    fn receive(&mut self, packet: &[u8], now: Instant) {
+impl Receiver for Connection {
+    fn receive(&mut self, packet: &mut [u8], now: Instant) {
         self.recv_packet(packet, now).unwrap();
     }
 }
 
-impl<G, V> Receiver for ServerConn<G, V>
+impl<G, V> Receiver for server::Connection<G, V>
 where
     G: EarlyDataGuard,
     V: ClientCertVerifier,
 {
-    fn receive(&mut self, packet: &[u8], now: Instant) {
+    fn receive(&mut self, packet: &mut [u8], now: Instant) {
         self.recv_packet(packet, now).unwrap();
     }
 }
 
-pub fn connected_pair() -> (ServerConn, Conn) {
+pub fn connected_pair() -> (server::Connection, Connection) {
     connected_pair_with(config(), config())
 }
 
 pub fn connected_pair_with(
     server_config: conn::Config,
     client_config: conn::Config,
-) -> (ServerConn, Conn) {
+) -> (server::Connection, Connection) {
     let cid = vec![0x71; 8];
     let signing = signing_key(0x39);
     let public_key = *signing.pubkey().unwrap();
-    let mut server = Conn::new_server(
+    let mut server = Connection::new_server(
         cid.clone(),
         cid.clone(),
         cid.clone(),
@@ -76,7 +77,7 @@ pub fn connected_pair_with(
         server_config,
     )
     .unwrap();
-    let mut client = Conn::new_client(cid.clone(), cid, public_key, client_config).unwrap();
+    let mut client = Connection::new_client(cid.clone(), cid, public_key, client_config).unwrap();
     let now = Instant::now();
     for _ in 0..6 {
         transfer(&mut client, &mut server, now);
@@ -86,9 +87,9 @@ pub fn connected_pair_with(
     (server, client)
 }
 
-pub fn transfer<R: Receiver>(from: &mut Conn, into: &mut R, now: Instant) {
-    for packet in from.send_packets(now) {
-        into.receive(&packet, now);
+pub fn transfer<R: Receiver>(from: &mut Connection, into: &mut R, now: Instant) {
+    for mut packet in from.send_packets(now) {
+        into.receive(&mut packet, now);
     }
 }
 

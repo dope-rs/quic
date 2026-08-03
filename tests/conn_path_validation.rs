@@ -2,14 +2,15 @@ pub mod support;
 
 use std::time::Instant;
 
-use dope_quic::{Conn, ServerConn, conn, transport_params};
+use dope_quic::conn::server;
+use dope_quic::{Connection, conn, transport_params};
 
 const CID: [u8; 8] = [0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44];
 
-fn drain<R: support::Receiver>(from: &mut Conn, into: &mut R) {
+fn drain<R: support::Receiver>(from: &mut Connection, into: &mut R) {
     let now = Instant::now();
-    for pkt in from.send_packets(now) {
-        into.receive(&pkt, now);
+    for mut pkt in from.send_packets(now) {
+        into.receive(&mut pkt, now);
     }
 }
 
@@ -25,13 +26,14 @@ fn cfg() -> conn::Config {
     }
 }
 
-fn handshake() -> (ServerConn, Conn) {
+fn handshake() -> (server::Connection, Connection) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
 
     let mut server =
-        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, cfg()).unwrap();
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, cfg()).unwrap();
+        Connection::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, cfg()).unwrap();
+    let mut client =
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, cfg()).unwrap();
 
     drain(&mut client, &mut server);
     drain(&mut server, &mut client);
@@ -107,7 +109,8 @@ fn unsolicited_path_response_does_not_falsely_validate() {
 fn pre_handshake_send_path_challenge_is_noop() {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, cfg()).unwrap();
+    let mut client =
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, cfg()).unwrap();
     assert!(client.is_handshaking());
     let token = [0x01u8; 8];
     client.send_path_challenge(token);

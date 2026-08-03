@@ -3,7 +3,8 @@ pub mod support;
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use dope_quic::{Conn, ConnHandle, Handler, Mux, transport_params};
+use dope_quic::conn::Handle;
+use dope_quic::{Connection, Handler, Mux, transport_params};
 use shin::crypto::sig::SigningKey;
 
 const CID: [u8; 8] = [0x42; 8];
@@ -14,10 +15,14 @@ struct CountHandler {
     datagrams: usize,
 }
 impl Handler for CountHandler {
-    fn established(&mut self, _conn: &mut Conn, _h: ConnHandle) {
+    type Connection = ();
+
+    fn create_connection(&mut self, _conn: &mut Connection, _handle: Handle) {}
+
+    fn established(&mut self, _connection: &mut (), _conn: &mut Connection, _h: Handle) {
         self.established += 1;
     }
-    fn datagram(&mut self, _conn: &mut Conn, _h: ConnHandle, _d: Vec<u8>) {
+    fn datagram(&mut self, _connection: &mut (), _conn: &mut Connection, _h: Handle, _d: Vec<u8>) {
         self.datagrams += 1;
     }
 }
@@ -40,8 +45,8 @@ fn signed_keys() -> ([u8; 32], SigningKey) {
 
 fn relay(src: &mut Mux<CountHandler>, dst: &mut Mux<CountHandler>, src_addr: SocketAddr) {
     let now = Instant::now();
-    for out in src.drain_outgoing() {
-        dst.recv(src_addr, out.payload(), now).expect("recv");
+    for mut out in src.drain_outgoing() {
+        dst.recv(src_addr, out.payload_mut(), now).expect("recv");
     }
 }
 
@@ -107,7 +112,7 @@ fn server_demultiplexes_two_clients_at_same_addr_via_dcid() {
 
     let mut conn_count = 0;
     for h in 0..16u32 {
-        if server.conn_mut(ConnHandle(u64::from(h))).is_some() {
+        if server.conn_mut(Handle(u64::from(h))).is_some() {
             conn_count += 1;
         }
     }

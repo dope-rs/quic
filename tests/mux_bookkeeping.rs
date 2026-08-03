@@ -43,7 +43,16 @@ static ALLOCATOR: Allocator = Allocator;
 
 struct Noop;
 
-impl Handler for Noop {}
+impl Handler for Noop {
+    type Connection = ();
+
+    fn create_connection(
+        &mut self,
+        _conn: &mut dope_quic::Connection,
+        _handle: dope_quic::conn::Handle,
+    ) {
+    }
+}
 
 #[test]
 fn deadline_and_close_bookkeeping_do_not_allocate() {

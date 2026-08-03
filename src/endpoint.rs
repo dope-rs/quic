@@ -5,17 +5,16 @@ use std::time::Instant;
 
 use dope::manifold::Manifold;
 use dope::manifold::datagram::Socket;
-use dope::{Completion as _, DriverContext, Event};
+use dope::{Completion, DriverContext, Event};
+use o3::cell::RegionToken;
 use pin_project::pin_project;
-use shin::server::{config::ClientCertVerifier, config::EarlyDataGuard, config::NoGuard};
 use shin::crypto::sig::SigningKey;
 use shin::crypto::ticket::TicketKeys;
+use shin::server::{config::ClientCertVerifier, config::EarlyDataGuard, config::NoGuard};
 
 use crate::ConnectError;
 use crate::TrySendError;
-use crate::conn::{
-    self, Conn, ConnHandle, Mutual, MutualAuthentication, ServerPolicy, Standard, ValidatedConfig,
-};
+use crate::conn::{self, Connection, Handle, ValidatedConfig};
 use crate::mux::{self, Mux};
 use crate::mux::{MAX_CONNECTIONS, MAX_OUTGOING_BYTES, MAX_OUTGOING_CAPACITY, Outgoing};
 use crate::transport_params;
@@ -24,7 +23,12 @@ use std::io::Error;
 use std::io::ErrorKind;
 
 #[pin_project]
-pub struct Endpoint<'d, const ID: u8, H: mux::Handler, P: ServerPolicy = Standard> {
+pub struct Endpoint<
+    'd,
+    const ID: u8,
+    H: mux::Handler,
+    P: conn::server::Policy = conn::server::Standard,
+> {
     #[pin]
     udp: Socket<'d, ID>,
     mux: Mux<H, P>,
@@ -70,7 +74,7 @@ impl Config {
     }
 }
 
-impl<'d, const ID: u8, H: mux::Handler> Endpoint<'d, ID, H, Standard> {
+impl<'d, const ID: u8, H: mux::Handler> Endpoint<'d, ID, H, conn::server::Standard> {
     pub fn build_server(
         bind: SocketAddr,
         signing_key: SigningKey,
@@ -126,7 +130,7 @@ impl<'d, const ID: u8, H: mux::Handler> Endpoint<'d, ID, H, Standard> {
     }
 }
 
-impl<'d, const ID: u8, H, G> Endpoint<'d, ID, H, Standard<G>>
+impl<'d, const ID: u8, H, G> Endpoint<'d, ID, H, conn::server::Standard<G>>
 where
     H: mux::Handler,
     G: EarlyDataGuard + 'static,
@@ -172,7 +176,7 @@ where
     }
 }
 
-impl<'d, const ID: u8, H, V> Endpoint<'d, ID, H, Mutual<NoGuard, V>>
+impl<'d, const ID: u8, H, V> Endpoint<'d, ID, H, conn::server::Mutual<NoGuard, V>>
 where
     H: mux::Handler,
     V: ClientCertVerifier + 'static,
@@ -181,7 +185,7 @@ where
         bind: SocketAddr,
         signing_key: SigningKey,
         server_config: conn::Config,
-        authentication: MutualAuthentication<V>,
+        authentication: conn::server::Authentication<V>,
         handler: H,
         config: Config,
         driver: &mut DriverContext<'_, 'd>,
@@ -198,7 +202,7 @@ where
     }
 }
 
-impl<'d, const ID: u8, H, G, V> Endpoint<'d, ID, H, Mutual<G, V>>
+impl<'d, const ID: u8, H, G, V> Endpoint<'d, ID, H, conn::server::Mutual<G, V>>
 where
     H: mux::Handler,
     G: EarlyDataGuard + 'static,
@@ -208,7 +212,7 @@ where
         bind: SocketAddr,
         signing_key: SigningKey,
         server_config: conn::Config,
-        authentication: MutualAuthentication<V, G>,
+        authentication: conn::server::Authentication<V, G>,
         handler: H,
         config: Config,
         driver: &mut DriverContext<'_, 'd>,
@@ -228,7 +232,7 @@ where
 impl<'d, const ID: u8, H, P> Endpoint<'d, ID, H, P>
 where
     H: mux::Handler,
-    P: ServerPolicy,
+    P: conn::server::Policy,
 {
     pub fn build_server_with_policy(
         bind: SocketAddr,
@@ -287,7 +291,7 @@ where
         server_pubkey: [u8; 32],
         client_tp: transport_params::Params,
         initial_dcid: Vec<u8>,
-    ) -> Result<ConnHandle, ConnectError> {
+    ) -> Result<Handle, ConnectError> {
         self.connect_with_config(peer_addr, server_pubkey, client_tp.into(), initial_dcid)
     }
 
@@ -297,7 +301,7 @@ where
         server_pubkey: [u8; 32],
         mut client_config: conn::Config,
         initial_dcid: Vec<u8>,
-    ) -> Result<ConnHandle, ConnectError> {
+    ) -> Result<Handle, ConnectError> {
         let now = Instant::now();
         client_config.max_pmtu = client_config
             .max_pmtu
@@ -308,24 +312,24 @@ where
             .connect(peer_addr, server_pubkey, client_config, initial_dcid, now)
     }
 
-    pub fn conn(&self, handle: ConnHandle) -> Option<&Conn> {
+    pub fn conn(&self, handle: Handle) -> Option<&Connection> {
         self.mux.conn(handle)
     }
 
-    pub fn conn_mut(self: Pin<&mut Self>, handle: ConnHandle) -> Option<&mut Conn> {
+    pub fn conn_mut(self: Pin<&mut Self>, handle: Handle) -> Option<&mut Connection> {
         self.project().mux.conn_mut(handle)
     }
 
     pub fn try_send_datagram(
         self: Pin<&mut Self>,
-        handle: ConnHandle,
+        handle: Handle,
         data: Vec<u8>,
     ) -> Result<(), TrySendError<Vec<u8>>> {
         let now = Instant::now();
         self.project().mux.try_send_datagram(handle, data, now)
     }
 
-    pub fn close(self: Pin<&mut Self>, handle: ConnHandle) {
+    pub fn close(self: Pin<&mut Self>, handle: Handle) {
         self.project().mux.close(handle);
     }
 
@@ -395,7 +399,7 @@ where
 impl<'d, const ID: u8, H, P> Manifold<'d> for Endpoint<'d, ID, H, P>
 where
     H: mux::Handler,
-    P: ServerPolicy,
+    P: conn::server::Policy,
 {
     const ID: u8 = ID;
 
@@ -407,7 +411,7 @@ where
         self.as_mut().flush_pending(driver);
     }
 
-    fn idle(self: Pin<&Self>) -> Idle {
+    fn idle(self: Pin<&Self>, _region: &RegionToken<'d>) -> Idle {
         self.as_ref().get_ref().idle()
     }
 }
@@ -419,7 +423,7 @@ fn flush<'d, const ID: u8, H, P>(
 ) -> usize
 where
     H: mux::Handler,
-    P: ServerPolicy,
+    P: conn::server::Policy,
 {
     let now = Instant::now();
     let mut flushed = 0usize;

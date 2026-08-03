@@ -5,13 +5,14 @@ use std::time::{Duration, Instant};
 
 use dope::DriverContext;
 use dope::manifold::Manifold;
+use o3::cell::RegionToken;
 use o3::collections::IndexedMinHeap;
 use o3::collections::SlotQueue;
 use pin_project::pin_project;
 use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::TrySendError;
-use crate::conn::{self, Conn, ConnHandle};
+use crate::conn::{self, Connection, Handle};
 use crate::endpoint::{self, Endpoint};
 use crate::mux::Handler;
 use dope::runtime::dispatcher::Idle;
@@ -41,13 +42,13 @@ pub trait Protocol: 'static {
     fn close(&mut self, slot: SlotId);
 }
 
-pub trait ClientConfigProvider: 'static {
+pub trait ConfigProvider: 'static {
     fn config(&mut self, slot: SlotId) -> Option<conn::Config>;
 }
 
-pub struct StaticClientConfig(conn::Config);
+pub struct StaticConfig(conn::Config);
 
-impl ClientConfigProvider for StaticClientConfig {
+impl ConfigProvider for StaticConfig {
     fn config(&mut self, _slot: SlotId) -> Option<conn::Config> {
         self.0.duplicate_connection().ok()
     }
@@ -77,13 +78,13 @@ pub struct PathStats {
 struct EndpointSlot {
     addr: SocketAddr,
     pubkey: [u8; 32],
-    handle: Option<ConnHandle>,
+    handle: Option<Handle>,
     attempt: u32,
 }
 
 #[derive(Clone, Copy)]
 struct Binding {
-    handle: ConnHandle,
+    handle: Handle,
     slot: SlotId,
 }
 
@@ -95,7 +96,7 @@ struct Bridge<P: Protocol> {
 }
 
 impl<P: Protocol> Bridge<P> {
-    fn lookup_slot(&self, handle: ConnHandle) -> Option<SlotId> {
+    fn lookup_slot(&self, handle: Handle) -> Option<SlotId> {
         self.handle_to_slot
             .get(handle.index() as usize)
             .copied()
@@ -104,7 +105,7 @@ impl<P: Protocol> Bridge<P> {
             .map(|binding| binding.slot)
     }
 
-    fn bind(&mut self, handle: ConnHandle, slot: SlotId) -> bool {
+    fn bind(&mut self, handle: Handle, slot: SlotId) -> bool {
         let Some(binding) = self.handle_to_slot.get_mut(handle.index() as usize) else {
             return false;
         };
@@ -115,7 +116,7 @@ impl<P: Protocol> Bridge<P> {
         true
     }
 
-    fn unbind(&mut self, handle: ConnHandle) -> Option<SlotId> {
+    fn unbind(&mut self, handle: Handle) -> Option<SlotId> {
         let binding = self.handle_to_slot.get_mut(handle.index() as usize)?;
         if !binding.is_some_and(|binding| binding.handle == handle) {
             return None;
@@ -125,7 +126,11 @@ impl<P: Protocol> Bridge<P> {
 }
 
 impl<P: Protocol> Handler for Bridge<P> {
-    fn established(&mut self, _conn: &mut Conn, handle: ConnHandle) {
+    type Connection = ();
+
+    fn create_connection(&mut self, _conn: &mut Connection, _handle: Handle) {}
+
+    fn established(&mut self, _connection: &mut (), _conn: &mut Connection, handle: Handle) {
         if let Some(slot) = self.lookup_slot(handle) {
             let binding = Binding { handle, slot };
             if let Some(entry) = self.pending_established.vacant_entry(slot.index() as usize) {
@@ -135,13 +140,19 @@ impl<P: Protocol> Handler for Bridge<P> {
         }
     }
 
-    fn datagram(&mut self, _conn: &mut Conn, handle: ConnHandle, data: Vec<u8>) {
+    fn datagram(
+        &mut self,
+        _connection: &mut (),
+        _conn: &mut Connection,
+        handle: Handle,
+        data: Vec<u8>,
+    ) {
         if let Some(slot) = self.lookup_slot(handle) {
             self.protocol.datagram(slot, data);
         }
     }
 
-    fn close(&mut self, handle: ConnHandle) {
+    fn close(&mut self, _connection: (), handle: Handle) {
         if let Some(slot) = self.unbind(handle) {
             self.protocol.close(slot);
             let binding = Binding { handle, slot };
@@ -153,13 +164,8 @@ impl<P: Protocol> Handler for Bridge<P> {
 }
 
 #[pin_project]
-pub struct Client<
-    'd,
-    const ID: u8,
-    P: Protocol,
-    B: BackoffPolicy,
-    C: ClientConfigProvider = StaticClientConfig,
-> {
+pub struct Client<'d, const ID: u8, P: Protocol, B: BackoffPolicy, C: ConfigProvider = StaticConfig>
+{
     #[pin]
     inner: Endpoint<'d, ID, Bridge<P>>,
     endpoints: Vec<EndpointSlot>,
@@ -171,7 +177,7 @@ pub struct Client<
     dcid_seed: u64,
 }
 
-impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Client<'d, ID, P, B, StaticClientConfig> {
+impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Client<'d, ID, P, B, StaticConfig> {
     pub fn build(
         bind: SocketAddr,
         endpoints: Vec<EndpointSpec>,
@@ -190,7 +196,7 @@ impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Client<'d, ID, P, B, Stati
         Self::build_with_config_provider(
             bind,
             endpoints,
-            StaticClientConfig(client_config),
+            StaticConfig(client_config),
             protocol,
             backoff,
             config,
@@ -203,7 +209,7 @@ impl<'d, const ID: u8, P, B, C> Client<'d, ID, P, B, C>
 where
     P: Protocol,
     B: BackoffPolicy,
-    C: ClientConfigProvider,
+    C: ConfigProvider,
 {
     pub fn build_with_config_provider(
         bind: SocketAddr,
@@ -394,7 +400,7 @@ impl<'d, const ID: u8, P, B, C> Manifold<'d> for Client<'d, ID, P, B, C>
 where
     P: Protocol,
     B: BackoffPolicy,
-    C: ClientConfigProvider,
+    C: ConfigProvider,
 {
     const ID: u8 = ID;
 
@@ -465,7 +471,7 @@ where
         }
     }
 
-    fn idle(self: Pin<&Self>) -> Idle {
+    fn idle(self: Pin<&Self>, _region: &RegionToken<'d>) -> Idle {
         let client = self.as_ref();
         let this = client.project_ref();
         if !this.inner.handler().pending_close.is_empty()
