@@ -58,7 +58,8 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> View<'conn, DOMAIN, B> {
     }
 
     pub fn next_timer(&self) -> Option<time::Instant> {
-        conn::recovery::timer::Timer::new(self.connection).next_deadline()
+        let timer = conn::recovery::timer::Timer::new(self.connection);
+        timer.next_deadline()
     }
 
     pub fn next_send_time(&self) -> time::Instant {

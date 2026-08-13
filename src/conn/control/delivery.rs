@@ -85,38 +85,4 @@ impl<'a> Delivery<'a> {
             }
         }
     }
-
-    pub(in crate::conn) fn lose(&mut self, handle: delivery::Handle<delivery::Control>) {
-        let index = handle.index();
-        let Some(entry) = self.pending.resolve(handle) else {
-            return;
-        };
-        let control::Status::InFlight {
-            epoch,
-            carriers,
-            probe_round,
-        } = entry.status
-        else {
-            return;
-        };
-        if carriers > 1 {
-            self.pending.slots[index].entry.as_mut().unwrap().status = control::Status::InFlight {
-                epoch,
-                carriers: carriers - 1,
-                probe_round,
-            };
-            return;
-        }
-        if !self.pending.bump_generation(index) {
-            return;
-        }
-        self.pending.unlink_flight(index);
-        let entry = self.pending.slots[index].entry.as_mut().unwrap();
-        entry.status = control::Status::Queued;
-        entry.flight.prev = crate::conn::control::NONE;
-        entry.flight.next = crate::conn::control::NONE;
-        if control::kind_bit(entry.record) != 0 {
-            self.pending.link_ready(index);
-        }
-    }
 }

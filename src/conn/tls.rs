@@ -138,6 +138,9 @@ impl<'pool, const DOMAIN: u8, B: crate::stream::ReceiveBuffer> Connection<'pool,
         wire: &mut [u8],
         now: time::Instant,
     ) -> Result<(), conn::Error> {
+        if wire.is_empty() {
+            return Ok(());
+        }
         conn::ingress::Ingress::new(&mut self.conn, workspace).recv_client_pooled(
             wire,
             now,

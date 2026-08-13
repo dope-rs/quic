@@ -30,7 +30,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer, C: conn::control::Write>
         }
     }
 
-    pub(in crate::conn) fn reject(&mut self) {
+    pub(in crate::conn) fn reject(mut self) {
         let mut journals = mem::take(&mut self.deliveries.egress.packet_journals);
         journals.drain_where(
             |journal| journal.early_data,

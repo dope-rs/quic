@@ -40,6 +40,10 @@ impl<B: stream::ReceiveBuffer> Incoming<B> for Copied<'_> {
         offset: u64,
         fin: bool,
     ) -> Result<(), stream::RecvError> {
+        let len = u64::try_from(self.0.len()).map_err(|_| stream::RecvError::OffsetOverflow)?;
+        offset
+            .checked_add(len)
+            .ok_or(stream::RecvError::OffsetOverflow)?;
         B::insert_copied(stream, ranges, parts, offset, self.0, fin)
     }
 }

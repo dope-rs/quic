@@ -208,19 +208,6 @@ impl<B: stream::ReceiveBuffer> Arena<B> {
         bytes
     }
 
-    fn ready_push_back(&mut self, ready: &mut ReadySegments, bytes: B) -> Result<(), B> {
-        let len = bytes.as_ref().len();
-        if len == 0 {
-            return Ok(());
-        }
-        let Some(total) = ready.bytes.checked_add(len) else {
-            return Err(bytes);
-        };
-        let index = self.allocate(0, bytes, NONE)?;
-        self.link_ready(ready, index, len, total);
-        Ok(())
-    }
-
     fn link_ready(&mut self, ready: &mut ReadySegments, index: u32, len: usize, total: usize) {
         self.node_mut(index).next = NONE;
         if ready.tail == NONE {
@@ -255,40 +242,82 @@ impl<B: stream::ReceiveBuffer> Arena<B> {
         }
         Some(bytes)
     }
+}
 
-    pub(crate) fn ready_clear(&mut self, ready: &mut ReadySegments) {
-        while let Some(bytes) = self.ready_pop_front(ready) {
+impl<'d> stream::ReadyBuffer<stream::RecvBuffer<'d>> for ReadySegments {
+    fn clear(&mut self, arena: &mut Arena<stream::RecvBuffer<'d>>) {
+        while let Some(bytes) = arena.ready_pop_front(self) {
             drop(bytes);
         }
     }
-}
 
-impl ReadySegments {
-    pub(crate) const fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.bytes
     }
 
-    pub(crate) const fn segment_count(&self) -> usize {
+    fn segment_count(&self) -> usize {
         self.segments
     }
 
-    pub(crate) fn push_back<B: stream::ReceiveBuffer>(
+    fn try_push_back(
         &mut self,
-        arena: &mut Arena<B>,
-        bytes: B,
-    ) -> Result<(), B> {
-        arena.ready_push_back(self, bytes)
+        arena: &mut Arena<stream::RecvBuffer<'d>>,
+        bytes: stream::RecvBuffer<'d>,
+    ) -> Result<(), stream::RecvBuffer<'d>> {
+        let len = bytes.as_ref().len();
+        if len == 0 {
+            return Ok(());
+        }
+        let Some(total) = self.bytes.checked_add(len) else {
+            return Err(bytes);
+        };
+        let index = arena.allocate(0, bytes, NONE)?;
+        arena.link_ready(self, index, len, total);
+        Ok(())
     }
 
-    pub(crate) fn pop_front<B: stream::ReceiveBuffer>(
+    fn read_into(
         &mut self,
-        arena: &mut Arena<B>,
-    ) -> Option<B> {
-        arena.ready_pop_front(self)
+        arena: &mut Arena<stream::RecvBuffer<'d>>,
+        destination: &mut Vec<u8>,
+    ) -> usize {
+        let count = self.bytes;
+        while let Some(segment) = arena.ready_pop_front(self) {
+            destination.extend_from_slice(segment.as_ref());
+        }
+        count
     }
 
-    pub(crate) fn clear<B: stream::ReceiveBuffer>(&mut self, arena: &mut Arena<B>) {
-        arena.ready_clear(self);
+    fn read_owned(&mut self, arena: &mut Arena<stream::RecvBuffer<'d>>) -> Option<Vec<u8>> {
+        let first = arena.ready_pop_front(self)?;
+        if self.bytes == 0 {
+            return Some(first.into_vec());
+        }
+        let mut bytes = Vec::with_capacity(first.len().saturating_add(self.bytes));
+        bytes.extend_from_slice(first.as_ref());
+        while let Some(segment) = arena.ready_pop_front(self) {
+            bytes.extend_from_slice(segment.as_ref());
+        }
+        Some(bytes)
+    }
+
+    fn pop_front(
+        &mut self,
+        arena: &mut Arena<stream::RecvBuffer<'d>>,
+    ) -> Option<stream::RecvBuffer<'d>> {
+        let index = self.head;
+        if index == NONE {
+            return None;
+        }
+        let next = arena.node(index).next;
+        let bytes = arena.release(index);
+        self.head = next;
+        self.segments -= 1;
+        self.bytes -= bytes.as_ref().len();
+        if next == NONE {
+            self.tail = NONE;
+        }
+        Some(bytes)
     }
 }
 
@@ -781,7 +810,7 @@ impl<'d> Store<stream::RecvBuffer<'d>> {
             let skip =
                 usize::try_from(self.next - offset).map_err(|_| InsertError::OffsetOverflow)?;
             output
-                .push_back(arena, data.into_suffix(skip))
+                .try_push_back(arena, data.into_suffix(skip))
                 .map_err(|_| InsertError::BufferFull)?;
             self.next = end;
         } else {
@@ -820,7 +849,7 @@ impl<'d> Store<stream::RecvBuffer<'d>> {
                 return Err(InsertError::BufferFull);
             }
             output
-                .push_back(arena, stream::RecvBuffer::compact(data))
+                .try_push_back(arena, stream::RecvBuffer::compact(data))
                 .map_err(|_| InsertError::BufferFull)?;
             self.next = end;
         } else {

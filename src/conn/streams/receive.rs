@@ -143,14 +143,14 @@ impl<'a> MaterializeContext<'a> {
     }
 }
 
-struct ReceiveControlDrain<'a, B: crate::stream::ReceiveBuffer> {
+pub(in crate::conn) struct ReceiveControlDrain<'a, B: crate::stream::ReceiveBuffer> {
     streams: &'a mut streams::State<B>,
     control: &'a mut control::Pending,
     remaining: usize,
 }
 
 impl<'a, B: crate::stream::ReceiveBuffer> ReceiveControlDrain<'a, B> {
-    fn new(
+    pub(in crate::conn) fn new(
         streams: &'a mut streams::State<B>,
         control: &'a mut control::Pending,
         remaining: usize,
@@ -162,7 +162,7 @@ impl<'a, B: crate::stream::ReceiveBuffer> ReceiveControlDrain<'a, B> {
         }
     }
 
-    fn drain(self) {
+    pub(in crate::conn) fn drain(self) {
         let Self {
             streams,
             control,
@@ -290,14 +290,6 @@ impl<B: crate::stream::ReceiveBuffer> streams::State<B> {
 
     pub(in crate::conn) fn receive_controls_sendable(&self, control: &control::Pending) -> bool {
         self.receive_controls_pending() && control.remaining_capacity() != 0
-    }
-
-    pub(in crate::conn) fn reconcile_receive_controls(
-        &mut self,
-        control: &mut control::Pending,
-        work: usize,
-    ) {
-        ReceiveControlDrain::new(self, control, work).drain();
     }
 
     fn release_connection_receive_credit<C: control::Write>(

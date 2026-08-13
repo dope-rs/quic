@@ -218,10 +218,12 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
         self.connection
             .path
             .reconcile_controls(&mut self.connection.control, control_work);
-        self.connection
-            .streams
-            .state
-            .reconcile_receive_controls(&mut self.connection.control, control_work);
+        conn::streams::receive::ReceiveControlDrain::new(
+            &mut self.connection.streams.state,
+            &mut self.connection.control,
+            control_work,
+        )
+        .drain();
         let normal_packet_bytes =
             max_packet_bytes.min(self.connection.egress.pmtud.current() as usize);
         let mut remaining = max_packets;

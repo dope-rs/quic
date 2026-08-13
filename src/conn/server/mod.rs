@@ -218,6 +218,9 @@ where
         wire: &mut [u8],
         now: time::Instant,
     ) -> Result<(), conn::Error> {
+        if wire.is_empty() {
+            return Ok(());
+        }
         super::ingress::Ingress::new(&mut self.conn, workspace).recv_server(
             wire,
             now,

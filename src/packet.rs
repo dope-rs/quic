@@ -150,7 +150,12 @@ impl<'a> ConnectionIdRef<'a> {
     }
 
     pub fn into_owned(self) -> ConnectionId {
-        ConnectionId::from_validated(self.0)
+        let mut bytes = [0; MAX_CONNECTION_ID_LEN];
+        bytes[..self.0.len()].copy_from_slice(self.0);
+        ConnectionId {
+            bytes,
+            len: self.0.len() as u8,
+        }
     }
 }
 
@@ -372,7 +377,13 @@ impl LongBuffer for &mut [u8] {
 
 impl<'turn, 'd> LongBuffer for dope::manifold::datagram::packet::Split<'turn, 'd> {
     fn split_at(self, mid: usize) -> Option<(Self, Self)> {
-        dope::manifold::datagram::packet::Split::split_at(self, mid).ok()
+        if mid > self.len() {
+            return None;
+        }
+        match dope::manifold::datagram::packet::Split::split_at(self, mid) {
+            Ok(parts) => Some(parts),
+            Err(_) => unreachable!("validated split offset remains in bounds"),
+        }
     }
 }
 

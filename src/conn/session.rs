@@ -40,6 +40,9 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Connection<DOMAIN, B> {
         wire: &mut [u8],
         now: time::Instant,
     ) -> Result<(), conn::Error> {
+        if wire.is_empty() {
+            return Ok(());
+        }
         conn::ingress::Ingress::new(self, workspace).recv_client(wire, now)
     }
 
@@ -121,15 +124,15 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> conn::handshake::Transition
     for Connection<DOMAIN, B>
 {
     fn reject_early_data(&mut self) {
-        conn::recovery::early::EarlyData::new(
+        let early_data = conn::recovery::early::EarlyData::new(
             &mut self.egress,
             &mut self.control,
             &mut self.handshake,
             &mut self.streams.state,
             &mut self.streams.events,
             self.is_client,
-        )
-        .reject();
+        );
+        early_data.reject();
     }
 
     fn establish(&mut self) -> Result<(), conn::Error> {

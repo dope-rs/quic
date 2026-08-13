@@ -3,6 +3,7 @@ use crate::varint;
 
 use crate::conn;
 use crate::conn::control;
+use crate::conn::control::Write as _;
 use crate::conn::event_queue;
 use crate::conn::send;
 use crate::conn::stream;

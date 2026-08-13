@@ -10,6 +10,7 @@ pub(super) mod encode;
 mod linkage;
 mod records;
 
+use crate::conn::control::linkage::Linkage as _;
 use crate::conn::control::records::Records as _;
 
 const HANDSHAKE_DONE: u16 = 1 << 0;
@@ -344,19 +345,27 @@ pub(in crate::conn) trait Write {
 
 impl Write for Pending {
     fn owner_is_live<Kind>(&self, owner: Option<OwnerKey<Kind>>) -> bool {
-        Pending::owner_is_live(self, owner)
+        self.resolve_owner(owner).is_some()
     }
 
     fn remove_control<Kind>(&mut self, owner: &mut Option<OwnerKey<Kind>>) {
-        Pending::remove_control(self, owner);
+        self.remove_owner(owner);
     }
 
     fn remove_signal<Kind>(&mut self, signal: &mut Signal<Kind>) {
-        Pending::remove_signal(self, signal);
+        let mut owner = signal.owner();
+        self.remove_owner(&mut owner);
+        signal.clear();
     }
 
     fn handshake_done(&mut self) {
-        Pending::handshake_done(self);
+        let mut owner = self.handshake_done.take();
+        self.queue(
+            &mut owner,
+            crate::conn::delivery::Control::HandshakeDone,
+            None,
+        );
+        self.handshake_done = owner;
     }
 
     fn queue_new_connection_id(
@@ -365,7 +374,11 @@ impl Write for Pending {
         sequence: u64,
         key: super::path::LocalCidKey,
     ) {
-        Pending::queue_new_connection_id(self, owner, sequence, key);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::NewConnectionId(sequence),
+            Some(NewConnectionId { key }),
+        );
     }
 
     fn retire_connection_id(
@@ -373,30 +386,38 @@ impl Write for Pending {
         owner: &mut Option<OwnerKey<kind::RetireConnectionId>>,
         sequence: u64,
     ) {
-        Pending::retire_connection_id(self, owner, sequence);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::RetireConnectionId(sequence),
+            None,
+        );
     }
 
     fn queue_reset_stream(
         &mut self,
         signal: &mut Signal<kind::ResetStream>,
-        stream_id: u64,
+        _stream_id: u64,
         error: u64,
-        final_size: u64,
+        _final_size: u64,
     ) {
-        Pending::queue_reset_stream(self, signal, stream_id, error, final_size);
+        self.defer_signal(signal, error);
     }
 
     fn queue_stop_sending(
         &mut self,
         signal: &mut Signal<kind::StopSending>,
-        stream_id: u64,
+        _stream_id: u64,
         error: u64,
     ) {
-        Pending::queue_stop_sending(self, signal, stream_id, error);
+        self.defer_signal(signal, error);
     }
 
     fn queue_max_data(&mut self, owner: &mut Option<OwnerKey<kind::MaxData>>, maximum: u64) {
-        Pending::queue_max_data(self, owner, maximum);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::MaxData(maximum),
+            None,
+        );
     }
 
     fn queue_max_stream_data(
@@ -405,7 +426,11 @@ impl Write for Pending {
         stream_id: u64,
         maximum: u64,
     ) {
-        Pending::queue_max_stream_data(self, owner, stream_id, maximum);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::MaxStreamData(stream_id, maximum),
+            None,
+        );
     }
 
     fn queue_max_streams(
@@ -414,7 +439,11 @@ impl Write for Pending {
         uni: bool,
         maximum: u64,
     ) {
-        Pending::queue_max_streams(self, owner, uni, maximum);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::MaxStreams(uni, maximum),
+            None,
+        );
     }
 
     fn queue_path_response(
@@ -422,7 +451,11 @@ impl Write for Pending {
         owner: &mut Option<OwnerKey<kind::PathResponse>>,
         data: [u8; 8],
     ) {
-        Pending::queue_path_response(self, owner, data);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::PathResponse(data),
+            None,
+        );
     }
 
     fn queue_path_challenge(
@@ -430,21 +463,69 @@ impl Write for Pending {
         owner: &mut Option<OwnerKey<kind::PathChallenge>>,
         data: [u8; 8],
     ) {
-        Pending::queue_path_challenge(self, owner, data);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::PathChallenge(data),
+            None,
+        );
     }
 
     fn acknowledge_control(
         &mut self,
         handle: crate::conn::delivery::Handle<crate::conn::delivery::Control>,
     ) -> Effect {
-        delivery::Delivery::new(self).acknowledge(handle)
+        let index = handle.index();
+        let Some(entry) = self.resolve(handle) else {
+            return Effect::None;
+        };
+        if !matches!(entry.status, Status::InFlight { .. }) {
+            return Effect::None;
+        }
+        let record = entry.record;
+        self.remove(index);
+        match record {
+            crate::conn::delivery::Control::ResetStream(stream_id, _, _) => {
+                Effect::RetireStream(stream_id)
+            }
+            _ => Effect::None,
+        }
     }
 
     fn lose_control(
         &mut self,
         handle: crate::conn::delivery::Handle<crate::conn::delivery::Control>,
     ) {
-        delivery::Delivery::new(self).lose(handle);
+        let index = handle.index();
+        let Some(entry) = self.resolve(handle) else {
+            return;
+        };
+        let Status::InFlight {
+            epoch,
+            carriers,
+            probe_round,
+        } = entry.status
+        else {
+            return;
+        };
+        if carriers > 1 {
+            self.slots[index].entry.as_mut().unwrap().status = Status::InFlight {
+                epoch,
+                carriers: carriers - 1,
+                probe_round,
+            };
+            return;
+        }
+        if !self.bump_generation(index) {
+            return;
+        }
+        self.unlink_flight(index);
+        let entry = self.slots[index].entry.as_mut().unwrap();
+        entry.status = Status::Queued;
+        entry.flight.prev = NONE;
+        entry.flight.next = NONE;
+        if kind_bit(entry.record) != 0 {
+            self.link_ready(index);
+        }
     }
 }
 
@@ -603,7 +684,37 @@ impl Write for Permit<'_> {
         &mut self,
         handle: crate::conn::delivery::Handle<crate::conn::delivery::Control>,
     ) {
-        delivery::Delivery::new(self.pending).lose(handle);
+        let index = handle.index();
+        let Some(entry) = self.pending.resolve(handle) else {
+            return;
+        };
+        let Status::InFlight {
+            epoch,
+            carriers,
+            probe_round,
+        } = entry.status
+        else {
+            return;
+        };
+        if carriers > 1 {
+            self.pending.slots[index].entry.as_mut().unwrap().status = Status::InFlight {
+                epoch,
+                carriers: carriers - 1,
+                probe_round,
+            };
+            return;
+        }
+        if !self.pending.bump_generation(index) {
+            return;
+        }
+        self.pending.unlink_flight(index);
+        let entry = self.pending.slots[index].entry.as_mut().unwrap();
+        entry.status = Status::Queued;
+        entry.flight.prev = NONE;
+        entry.flight.next = NONE;
+        if kind_bit(entry.record) != 0 {
+            self.pending.link_ready(index);
+        }
     }
 }
 
@@ -678,122 +789,6 @@ impl Pending {
 
     pub(super) fn has_sendable(&self) -> bool {
         self.ready_bits & (PREFIX | SUFFIX) != 0
-    }
-
-    pub(super) fn handshake_done(&mut self) {
-        let mut owner = self.handshake_done.take();
-        self.queue(
-            &mut owner,
-            crate::conn::delivery::Control::HandshakeDone,
-            None,
-        );
-        self.handshake_done = owner;
-    }
-
-    pub(super) fn queue_new_connection_id(
-        &mut self,
-        owner: &mut Option<OwnerKey<kind::NewConnectionId>>,
-        sequence: u64,
-        key: super::path::LocalCidKey,
-    ) {
-        self.queue(
-            owner,
-            crate::conn::delivery::Control::NewConnectionId(sequence),
-            Some(NewConnectionId { key }),
-        );
-    }
-
-    pub(super) fn retire_connection_id(
-        &mut self,
-        owner: &mut Option<OwnerKey<kind::RetireConnectionId>>,
-        sequence: u64,
-    ) {
-        self.queue(
-            owner,
-            crate::conn::delivery::Control::RetireConnectionId(sequence),
-            None,
-        );
-    }
-
-    pub(super) fn queue_stop_sending(
-        &mut self,
-        signal: &mut Signal<kind::StopSending>,
-        _stream_id: u64,
-        error: u64,
-    ) {
-        self.defer_signal(signal, error);
-    }
-
-    pub(super) fn queue_reset_stream(
-        &mut self,
-        signal: &mut Signal<kind::ResetStream>,
-        _stream_id: u64,
-        error: u64,
-        _final_size: u64,
-    ) {
-        self.defer_signal(signal, error);
-    }
-
-    pub(super) fn queue_max_data(
-        &mut self,
-        owner: &mut Option<OwnerKey<kind::MaxData>>,
-        maximum: u64,
-    ) {
-        self.queue(
-            owner,
-            crate::conn::delivery::Control::MaxData(maximum),
-            None,
-        );
-    }
-
-    pub(super) fn queue_max_stream_data(
-        &mut self,
-        owner: &mut Option<OwnerKey<kind::MaxStreamData>>,
-        stream_id: u64,
-        maximum: u64,
-    ) {
-        self.queue(
-            owner,
-            crate::conn::delivery::Control::MaxStreamData(stream_id, maximum),
-            None,
-        );
-    }
-
-    pub(super) fn queue_max_streams(
-        &mut self,
-        owner: &mut Option<OwnerKey<kind::MaxStreams>>,
-        uni: bool,
-        maximum: u64,
-    ) {
-        self.queue(
-            owner,
-            crate::conn::delivery::Control::MaxStreams(uni, maximum),
-            None,
-        );
-    }
-
-    pub(super) fn queue_path_response(
-        &mut self,
-        owner: &mut Option<OwnerKey<kind::PathResponse>>,
-        data: [u8; 8],
-    ) {
-        self.queue(
-            owner,
-            crate::conn::delivery::Control::PathResponse(data),
-            None,
-        );
-    }
-
-    pub(super) fn queue_path_challenge(
-        &mut self,
-        owner: &mut Option<OwnerKey<kind::PathChallenge>>,
-        data: [u8; 8],
-    ) {
-        self.queue(
-            owner,
-            crate::conn::delivery::Control::PathChallenge(data),
-            None,
-        );
     }
 
     pub(super) fn data_blocked_sendable(&self, credit: &send::Credit<kind::DataBlocked>) -> bool {
@@ -918,20 +913,6 @@ impl Pending {
         handle: crate::conn::delivery::Handle<crate::conn::delivery::Control>,
     ) -> Option<super::path::LocalCidKey> {
         Some(self.resolve(handle)?.new_connection_id.as_ref()?.key)
-    }
-
-    pub(super) fn owner_is_live<Kind>(&self, owner: Option<OwnerKey<Kind>>) -> bool {
-        self.resolve_owner(owner).is_some()
-    }
-
-    pub(super) fn remove_control<Kind>(&mut self, owner: &mut Option<OwnerKey<Kind>>) {
-        self.remove_owner(owner);
-    }
-
-    pub(super) fn remove_signal<Kind>(&mut self, signal: &mut Signal<Kind>) {
-        let mut owner = signal.owner();
-        self.remove_owner(&mut owner);
-        signal.clear();
     }
 
     fn defer_signal<Kind>(&mut self, signal: &mut Signal<Kind>, value: u64) {

@@ -108,11 +108,11 @@ impl ReceiveBuffer for Vec<u8> {
 
 impl ReadyBuffer<Vec<u8>> for Vec<u8> {
     fn clear(&mut self, _arena: &mut range_buffer::Arena<Vec<u8>>) {
-        Vec::clear(self);
+        self.truncate(0);
     }
 
     fn len(&self) -> usize {
-        Vec::len(self)
+        self.as_slice().len()
     }
 
     fn segment_count(&self) -> usize {
@@ -331,63 +331,6 @@ impl<'d> ReceiveBuffer for RecvBuffer<'d> {
 }
 
 const _: () = assert!(mem::size_of::<RecvBuffer<'static>>() <= 5 * mem::size_of::<usize>());
-
-impl<'d> ReadyBuffer<RecvBuffer<'d>> for range_buffer::ReadySegments {
-    fn clear(&mut self, arena: &mut range_buffer::Arena<RecvBuffer<'d>>) {
-        range_buffer::ReadySegments::clear(self, arena);
-    }
-
-    fn len(&self) -> usize {
-        range_buffer::ReadySegments::len(self)
-    }
-
-    fn segment_count(&self) -> usize {
-        range_buffer::ReadySegments::segment_count(self)
-    }
-
-    fn try_push_back(
-        &mut self,
-        arena: &mut range_buffer::Arena<RecvBuffer<'d>>,
-        buffer: RecvBuffer<'d>,
-    ) -> Result<(), RecvBuffer<'d>> {
-        range_buffer::ReadySegments::push_back(self, arena, buffer)
-    }
-
-    fn read_into(
-        &mut self,
-        arena: &mut range_buffer::Arena<RecvBuffer<'d>>,
-        destination: &mut Vec<u8>,
-    ) -> usize {
-        let count = self.len();
-        while let Some(segment) = self.pop_front(arena) {
-            destination.extend_from_slice(segment.as_ref());
-        }
-        count
-    }
-
-    fn read_owned(&mut self, arena: &mut range_buffer::Arena<RecvBuffer<'d>>) -> Option<Vec<u8>> {
-        if self.len() == 0 {
-            return None;
-        }
-        let first = self.pop_front(arena)?;
-        if self.len() == 0 {
-            return Some(first.into_vec());
-        }
-        let mut bytes = Vec::with_capacity(first.len().saturating_add(self.len()));
-        bytes.extend_from_slice(first.as_ref());
-        while let Some(segment) = self.pop_front(arena) {
-            bytes.extend_from_slice(segment.as_ref());
-        }
-        Some(bytes)
-    }
-
-    fn pop_front(
-        &mut self,
-        arena: &mut range_buffer::Arena<RecvBuffer<'d>>,
-    ) -> Option<RecvBuffer<'d>> {
-        range_buffer::ReadySegments::pop_front(self, arena)
-    }
-}
 
 const MAX_SEND_SEGMENTS: usize = 4096;
 pub const INLINE_SEND_CAPACITY: usize = inline::CAPACITY;
