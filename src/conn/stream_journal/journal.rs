@@ -283,7 +283,10 @@ impl Journal {
                 .record;
             self.rotate_retry_node(group_index, node_index);
             self.rotate_retry_group(group_index);
-            if excluded(handle) || usize::try_from(record.len).map_or(true, |len| len > room) {
+            let Ok(len) = usize::try_from(record.len) else {
+                continue;
+            };
+            if excluded(handle) || len > room {
                 continue;
             }
             return Some((handle, send_handle, record));

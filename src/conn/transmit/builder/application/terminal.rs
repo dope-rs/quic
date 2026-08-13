@@ -35,7 +35,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildTerminal
         if !self.packet.can_track_packet() {
             return None;
         }
-        let target_size = target_size.min(u64::try_from(max_packet_bytes).unwrap_or(u64::MAX));
+        let target_size = target_size.min(max_packet_bytes as u64);
         let pn = self.packet.connection.egress.spaces[conn::Epoch::Application as usize].next_pn;
 
         let mut frames = mem::take(&mut self.packet.connection.scratch_frames);

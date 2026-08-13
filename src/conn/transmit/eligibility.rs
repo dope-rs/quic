@@ -247,7 +247,11 @@ pub(super) fn emission_ceiling<const DOMAIN: u8, B: stream::ReceiveBuffer>(
     connection: &crate::conn::session::Connection<DOMAIN, B>,
     requested: usize,
 ) -> Option<usize> {
-    let remaining = usize::try_from(anti_amplification_remaining(connection)).unwrap_or(usize::MAX);
-    let ceiling = requested.min(remaining);
+    let remaining = anti_amplification_remaining(connection);
+    let ceiling = if remaining < requested as u64 {
+        remaining as usize
+    } else {
+        requested
+    };
     (ceiling != 0).then_some(ceiling)
 }

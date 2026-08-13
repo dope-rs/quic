@@ -203,11 +203,10 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Ingress<'a, DOMAIN, B> {
         else {
             return Ok(());
         };
-        let active_ceiling = self
-            .connection
-            .egress
-            .packet_ceiling
-            .min(usize::try_from(self.connection.egress.pmtud.current()).unwrap_or(usize::MAX));
+        let Ok(pmtu_ceiling) = usize::try_from(self.connection.egress.pmtud.current()) else {
+            unreachable!("validated PMTU remains representable as usize")
+        };
+        let active_ceiling = self.connection.egress.packet_ceiling.min(pmtu_ceiling);
         let payload_limit = transmit::builder::Builder::<'_, DOMAIN, B>::initial_payload_limit_for(
             peer_cid.len(),
             local_cid.len(),

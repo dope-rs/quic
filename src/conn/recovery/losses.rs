@@ -12,7 +12,7 @@ struct Lost {
 
 impl Lost {
     fn record(&mut self, bytes: usize, sent_time: time::Instant) {
-        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let bytes = bytes as u64;
         self.packets = self.packets.saturating_add(1);
         self.bytes = self.bytes.saturating_add(bytes);
         self.latest_sent = Some(

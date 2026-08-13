@@ -285,9 +285,10 @@ impl<'d> ReceiveBuffer for RecvBuffer<'d> {
                     .expect("receive range must remain within its compact owner"),
             ),
             RecvStorage::Retained(bytes) => {
-                Self::retained(bytes.into_range(range).unwrap_or_else(|_| {
+                let Ok(bytes) = bytes.into_range(range) else {
                     unreachable!("receive range must remain within its driver owner")
-                }))
+                };
+                Self::retained(bytes)
             }
         }
     }
@@ -312,9 +313,10 @@ impl<'d> ReceiveBuffer for RecvBuffer<'d> {
                     Self::retained(bytes)
                 } else {
                     let len = bytes.len();
-                    Self::retained(bytes.into_range(offset..len).unwrap_or_else(|_| {
+                    let Ok(bytes) = bytes.into_range(offset..len) else {
                         unreachable!("receive suffix must remain within its owner")
-                    }))
+                    };
+                    Self::retained(bytes)
                 }
             }
         }

@@ -12,16 +12,20 @@ impl WallClock {
     }
 
     pub(crate) fn millis(&self) -> u64 {
-        self.0
-            .duration_since(time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0)
+        self.saturating_epoch_duration().as_millis() as u64
     }
 
     pub(crate) fn unix_seconds(&self) -> u64 {
-        self.0
-            .duration_since(time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0)
+        self.saturating_epoch_duration().as_secs()
+    }
+
+    fn saturating_epoch_duration(&self) -> time::Duration {
+        match self.0.duration_since(time::UNIX_EPOCH) {
+            Ok(duration) => duration,
+            Err(error) => {
+                debug_assert_eq!(self.0 + error.duration(), time::UNIX_EPOCH);
+                time::Duration::ZERO
+            }
+        }
     }
 }

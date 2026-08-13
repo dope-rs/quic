@@ -123,6 +123,9 @@ pub(super) struct Egress {
 
 impl Egress {
     pub(super) fn new(setup: Setup) -> Self {
+        let Ok(packet_ceiling) = usize::try_from(setup.max_pmtu) else {
+            unreachable!("connection setup validates the PMTU against usize")
+        };
         Self {
             derived_controls: DerivedControls::default(),
             spaces: Default::default(),
@@ -141,7 +144,7 @@ impl Egress {
             cc: new_reno::NewReno::default(),
             pacer: pacer::Pacer::new(time::Instant::now()),
             pmtud: pmtud::Pmtud::new(setup.max_pmtu),
-            packet_ceiling: usize::try_from(setup.max_pmtu).unwrap_or(usize::MAX),
+            packet_ceiling,
             pmtud_probe_pn: None,
             datagram_congestion_control: setup.datagram_congestion_control,
             pending_datagrams_capacity: setup.pending_datagrams_capacity,
