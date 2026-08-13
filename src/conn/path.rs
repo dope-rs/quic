@@ -1,4 +1,4 @@
-use std::num;
+use std::{num, ops};
 
 use o3::collections::fixed::array;
 use subtle::ConstantTimeEq as _;
@@ -56,7 +56,30 @@ pub(crate) enum RouteUpdate {
 }
 
 pub(crate) const MAX_ROUTE_UPDATES: usize = conn::MAX_ACTIVE_CONNECTION_IDS * 2;
-pub(crate) type RouteUpdates = array::CopyInline<RouteUpdate, MAX_ROUTE_UPDATES>;
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub(crate) struct RouteUpdates(array::CopyInline<RouteUpdate, MAX_ROUTE_UPDATES>);
+
+impl RouteUpdates {
+    fn new() -> Self {
+        Self(array::CopyInline::new())
+    }
+}
+
+impl ops::Deref for RouteUpdates {
+    type Target = array::CopyInline<RouteUpdate, MAX_ROUTE_UPDATES>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ops::DerefMut for RouteUpdates {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 struct LocalCid {
     sequence: u64,
