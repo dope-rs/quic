@@ -1,17 +1,3 @@
-macro_rules! impl_error {
-    ($type:ty { $($pattern:pat => $message:literal),+ $(,)? }) => {
-        impl std::fmt::Display for $type {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(match self {
-                    $($pattern => $message),+
-                })
-            }
-        }
-
-        impl std::error::Error for $type {}
-    };
-}
-
 pub mod client;
 mod clock;
 pub mod conn;

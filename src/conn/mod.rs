@@ -1,3 +1,5 @@
+use std::{error, fmt};
+
 use crate::frame;
 use crate::transport_params;
 
@@ -108,27 +110,33 @@ pub enum Error {
     ProtocolViolation,
 }
 
-impl_error!(Error {
-    Self::PacketDecrypt => "packet decryption failed",
-    Self::HeaderDecode => "packet header decoding failed",
-    Self::FrameDecode => "frame decoding failed",
-    Self::FrameEncode => "frame encoding failed",
-    Self::PacketEncrypt => "packet encryption failed",
-    Self::Tls => "TLS processing failed",
-    Self::UnexpectedEpoch => "unexpected encryption epoch",
-    Self::TransportParameterMismatch => "transport parameters do not match the connection",
-    Self::TransportParameterDecode => "transport parameter decoding failed",
-    Self::PeerClosed => "peer closed the connection",
-    Self::IdleTimeout => "connection idle timeout expired",
-    Self::FlowControl => "flow control limit exceeded",
-    Self::FinalSize => "stream final size changed",
-    Self::CryptoBufferExceeded => "crypto reassembly capacity exceeded",
-    Self::StreamBufferExceeded => "stream reassembly capacity exceeded",
-    Self::PacketCeiling => "packet size exceeds the configured ceiling",
-    Self::EventCapacity => "connection event capacity exceeded",
-    Self::ConnectionIdLimit => "connection ID capacity exceeded",
-    Self::ProtocolViolation => "QUIC protocol violation",
-});
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::PacketDecrypt => "packet decryption failed",
+            Self::HeaderDecode => "packet header decoding failed",
+            Self::FrameDecode => "frame decoding failed",
+            Self::FrameEncode => "frame encoding failed",
+            Self::PacketEncrypt => "packet encryption failed",
+            Self::Tls => "TLS processing failed",
+            Self::UnexpectedEpoch => "unexpected encryption epoch",
+            Self::TransportParameterMismatch => "transport parameters do not match the connection",
+            Self::TransportParameterDecode => "transport parameter decoding failed",
+            Self::PeerClosed => "peer closed the connection",
+            Self::IdleTimeout => "connection idle timeout expired",
+            Self::FlowControl => "flow control limit exceeded",
+            Self::FinalSize => "stream final size changed",
+            Self::CryptoBufferExceeded => "crypto reassembly capacity exceeded",
+            Self::StreamBufferExceeded => "stream reassembly capacity exceeded",
+            Self::PacketCeiling => "packet size exceeds the configured ceiling",
+            Self::EventCapacity => "connection event capacity exceeded",
+            Self::ConnectionIdLimit => "connection ID capacity exceeded",
+            Self::ProtocolViolation => "QUIC protocol violation",
+        })
+    }
+}
+
+impl error::Error for Error {}
 
 impl From<transport_params::TransportParameterError> for Error {
     fn from(_: transport_params::TransportParameterError) -> Self {

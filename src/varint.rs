@@ -1,4 +1,5 @@
 use o3::num::bounded;
+use std::{error, fmt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -6,10 +7,16 @@ pub enum Error {
     Underflow,
 }
 
-impl_error!(Error {
-    Self::TooLarge => "integer exceeds the QUIC variable-length range",
-    Self::Underflow => "truncated QUIC variable-length integer",
-});
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TooLarge => "integer exceeds the QUIC variable-length range",
+            Self::Underflow => "truncated QUIC variable-length integer",
+        })
+    }
+}
+
+impl error::Error for Error {}
 
 type Value = bounded::U64<0, { (1u64 << 62) - 1 }>;
 

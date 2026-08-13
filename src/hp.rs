@@ -1,4 +1,5 @@
 use ring::aead::quic;
+use std::{error, fmt};
 
 pub(crate) struct HeaderProtectionKey {
     inner: quic::HeaderProtectionKey,
@@ -10,10 +11,16 @@ pub(crate) enum HeaderProtectionError {
     InvalidSample,
 }
 
-impl_error!(HeaderProtectionError {
-    Self::InvalidKey => "invalid header protection key",
-    Self::InvalidSample => "invalid header protection sample",
-});
+impl fmt::Display for HeaderProtectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidKey => "invalid header protection key",
+            Self::InvalidSample => "invalid header protection sample",
+        })
+    }
+}
+
+impl error::Error for HeaderProtectionError {}
 
 impl HeaderProtectionKey {
     pub fn aes_128(key: &[u8; 16]) -> Result<Self, HeaderProtectionError> {

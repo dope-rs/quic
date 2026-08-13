@@ -1,3 +1,5 @@
+use std::{error, fmt};
+
 use crate::packet;
 use crate::varint;
 
@@ -65,14 +67,20 @@ pub enum TransportParameterError {
     OutOfRange,
 }
 
-impl_error!(TransportParameterError {
-    Self::Underflow => "truncated transport parameter",
-    Self::BadVarInt => "invalid transport parameter integer",
-    Self::Duplicate => "duplicate transport parameter",
-    Self::TooMany => "too many transport parameters",
-    Self::BadValueLength => "invalid transport parameter length",
-    Self::OutOfRange => "transport parameter is out of range",
-});
+impl fmt::Display for TransportParameterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Underflow => "truncated transport parameter",
+            Self::BadVarInt => "invalid transport parameter integer",
+            Self::Duplicate => "duplicate transport parameter",
+            Self::TooMany => "too many transport parameters",
+            Self::BadValueLength => "invalid transport parameter length",
+            Self::OutOfRange => "transport parameter is out of range",
+        })
+    }
+}
+
+impl error::Error for TransportParameterError {}
 
 impl From<varint::Error> for TransportParameterError {
     fn from(_: varint::Error) -> Self {

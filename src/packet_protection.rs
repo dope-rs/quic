@@ -1,4 +1,4 @@
-use std::ops;
+use std::{error, fmt, ops};
 
 use shin::crypto::aead;
 
@@ -14,13 +14,19 @@ pub enum CryptoFailure {
     HeaderProtection,
 }
 
-impl_error!(CryptoFailure {
-    Self::InvalidKey => "invalid packet protection key",
-    Self::Encrypt => "packet encryption failed",
-    Self::InvalidPacket => "invalid protected packet",
-    Self::Decrypt => "packet decryption failed",
-    Self::HeaderProtection => "header protection failed",
-});
+impl fmt::Display for CryptoFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidKey => "invalid packet protection key",
+            Self::Encrypt => "packet encryption failed",
+            Self::InvalidPacket => "invalid protected packet",
+            Self::Decrypt => "packet decryption failed",
+            Self::HeaderProtection => "header protection failed",
+        })
+    }
+}
+
+impl error::Error for CryptoFailure {}
 
 pub struct PacketProtection {
     aead: aead::Key,

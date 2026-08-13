@@ -1,5 +1,4 @@
-use std::mem;
-use std::ops;
+use std::{error, fmt, mem, ops};
 
 use o3::buffer::bytes;
 use o3::buffer::queue;
@@ -448,10 +447,16 @@ pub enum RecvError {
     OffsetOverflow,
 }
 
-impl_error!(RecvError {
-    Self::TooManyRanges => "stream reassembly capacity exceeded",
-    Self::OffsetOverflow => "stream offset overflow",
-});
+impl fmt::Display for RecvError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TooManyRanges => "stream reassembly capacity exceeded",
+            Self::OffsetOverflow => "stream offset overflow",
+        })
+    }
+}
+
+impl error::Error for RecvError {}
 
 impl From<range_buffer::InsertError> for RecvError {
     fn from(error: range_buffer::InsertError) -> Self {

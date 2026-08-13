@@ -1,4 +1,4 @@
-use std::ops;
+use std::{error, fmt, ops};
 
 use subtle::ConstantTimeEq as _;
 
@@ -111,9 +111,15 @@ pub enum ConnectionIdError {
     TooLong,
 }
 
-impl_error!(ConnectionIdError {
-    Self::TooLong => "connection ID exceeds 20 bytes",
-});
+impl fmt::Display for ConnectionIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TooLong => "connection ID exceeds 20 bytes",
+        })
+    }
+}
+
+impl error::Error for ConnectionIdError {}
 
 /// A validated connection ID borrowing its wire storage for exactly `'a`.
 #[repr(transparent)]
@@ -193,14 +199,20 @@ pub enum DecodeError {
     BadType,
 }
 
-impl_error!(DecodeError {
-    Self::Underflow => "truncated packet header",
-    Self::NotLongHeader => "expected a long packet header",
-    Self::UnsupportedVersion => "unsupported QUIC version",
-    Self::BadCidLen => "invalid connection ID length",
-    Self::BadVarInt => "invalid packet integer",
-    Self::BadType => "invalid packet type",
-});
+impl fmt::Display for DecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Underflow => "truncated packet header",
+            Self::NotLongHeader => "expected a long packet header",
+            Self::UnsupportedVersion => "unsupported QUIC version",
+            Self::BadCidLen => "invalid connection ID length",
+            Self::BadVarInt => "invalid packet integer",
+            Self::BadType => "invalid packet type",
+        })
+    }
+}
+
+impl error::Error for DecodeError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodeError {
@@ -210,12 +222,18 @@ pub enum EncodeError {
     Crypto,
 }
 
-impl_error!(EncodeError {
-    Self::InvalidPacketNumberLength => "invalid packet number length",
-    Self::CidTooLong => "connection ID is too long",
-    Self::ValueOutOfRange => "packet value is out of range",
-    Self::Crypto => "packet cryptography failed",
-});
+impl fmt::Display for EncodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidPacketNumberLength => "invalid packet number length",
+            Self::CidTooLong => "connection ID is too long",
+            Self::ValueOutOfRange => "packet value is out of range",
+            Self::Crypto => "packet cryptography failed",
+        })
+    }
+}
+
+impl error::Error for EncodeError {}
 
 fn validate_header_fields(pn_len: u8, dcid: &[u8], scid: &[u8]) -> Result<(), EncodeError> {
     if !matches!(pn_len, 1..=4) {

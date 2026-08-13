@@ -1,3 +1,5 @@
+use std::{error, fmt};
+
 use crate::conn;
 use crate::stream;
 use conn::streams::events::Events as _;
@@ -14,14 +16,20 @@ pub enum Error {
     ValueOutOfRange,
 }
 
-impl_error!(Error {
-    Self::NotEstablished => "connection is not established",
-    Self::PeerLimit => "peer stream limit reached",
-    Self::Capacity => "local active stream capacity reached",
-    Self::IdOverflow => "stream ID space exhausted",
-    Self::InvalidStream => "invalid stream operation",
-    Self::ValueOutOfRange => "stream value is out of range",
-});
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NotEstablished => "connection is not established",
+            Self::PeerLimit => "peer stream limit reached",
+            Self::Capacity => "local active stream capacity reached",
+            Self::IdOverflow => "stream ID space exhausted",
+            Self::InvalidStream => "invalid stream operation",
+            Self::ValueOutOfRange => "stream value is out of range",
+        })
+    }
+}
+
+impl error::Error for Error {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
