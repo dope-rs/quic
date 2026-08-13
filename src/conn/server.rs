@@ -84,10 +84,10 @@ impl Ids {
 }
 
 mod sealed {
-    pub trait Sealed {}
+    pub trait Policy {}
 }
 
-pub trait Policy: sealed::Sealed + 'static {
+pub trait Policy: sealed::Policy + 'static {
     type Guard: EarlyDataGuard + 'static;
     type Verifier: server::config::ClientCertVerifier + 'static;
 
@@ -103,7 +103,7 @@ pub trait Policy: sealed::Sealed + 'static {
 
 pub struct Standard<G = NoGuard>(core::marker::PhantomData<fn() -> G>);
 
-impl<G> sealed::Sealed for Standard<G> {}
+impl<G> sealed::Policy for Standard<G> {}
 
 impl<G> Policy for Standard<G>
 where
@@ -123,7 +123,7 @@ where
 
 pub struct Mutual<G, V>(core::marker::PhantomData<fn() -> (G, V)>);
 
-impl<G, V> sealed::Sealed for Mutual<G, V> {}
+impl<G, V> sealed::Policy for Mutual<G, V> {}
 
 impl<G, V> Policy for Mutual<G, V>
 where
