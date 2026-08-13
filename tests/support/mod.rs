@@ -1,4 +1,3 @@
-#[path = "support/sealed.rs"]
 mod sealed;
 
 pub use sealed::Allocator;
