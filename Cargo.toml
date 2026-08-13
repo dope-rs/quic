@@ -21,3 +21,15 @@ dope-gen = "0.15"
 [[bench]]
 name = "conn_first_flush"
 harness = false
+
+[[test]]
+name = "client_reconnect"
+path = "tests/client_reconnect/main.rs"
+
+[[test]]
+name = "loopback_handshake"
+path = "tests/loopback_handshake/main.rs"
+
+[[test]]
+name = "retained_receive"
+path = "tests/retained_receive/main.rs"

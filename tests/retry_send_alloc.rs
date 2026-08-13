@@ -1,6 +1,8 @@
-use std::alloc::{GlobalAlloc, Layout, System};
+pub mod support;
+
+use std::cell::Cell;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use dope_quic::conn;
@@ -9,33 +11,20 @@ use dope_quic::packet::{InitialHeader, QUIC_V1, RetryPacketRef};
 use dope_quic::{Handler, mux::Outgoing};
 use shin::crypto::sig::SigningKey;
 
-struct CountingAllocator;
-
-static COUNTING: AtomicBool = AtomicBool::new(false);
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.alloc(layout) }
-    }
+thread_local! {
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+}
 
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) }
-    }
-
-    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.realloc(pointer, layout, size) }
+fn record_allocation(_size: usize) {
+    if COUNTING.get() {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+static ALLOCATOR: support::Allocator = support::Allocator::new(record_allocation);
 
 struct Noop;
 
@@ -71,9 +60,9 @@ fn control_transmit_allocates_once_cold_and_zero_times_after_recycling() {
     let source: SocketAddr = "127.0.0.1:55001".parse().expect("source address");
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     let received = mux.protocol().recv(source, &mut initial, Instant::now());
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     received.expect("receive Initial");
     assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 1, "cold Retry");
@@ -85,9 +74,9 @@ fn control_transmit_allocates_once_cold_and_zero_times_after_recycling() {
     mux.output().recycle(outgoing);
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     let received = mux.protocol().recv(source, &mut initial, Instant::now());
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     received.expect("receive second Initial");
     assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0, "warm Retry");
@@ -105,11 +94,11 @@ fn control_transmit_allocates_once_cold_and_zero_times_after_recycling() {
     let mut trigger = vec![0x40; 64];
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     let received = reset_mux
         .protocol()
         .recv(source, &mut trigger, Instant::now());
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     received.expect("receive unknown packet");
     assert_eq!(
@@ -123,11 +112,11 @@ fn control_transmit_allocates_once_cold_and_zero_times_after_recycling() {
     reset_mux.output().recycle(outgoing);
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     let received = reset_mux
         .protocol()
         .recv(source, &mut trigger, Instant::now());
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     received.expect("receive second unknown packet");
     assert_eq!(

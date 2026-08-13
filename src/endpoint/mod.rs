@@ -1,3 +1,4 @@
+pub mod raw;
 mod runtime;
 mod sealed;
 
@@ -88,16 +89,6 @@ where
         self.inner.as_ref().get_ref().handler()
     }
 
-    pub fn handler_control(&mut self) -> <H as ControlHandler<'d, ID, B>>::Control<'_>
-    where
-        H: ControlHandler<'d, ID, B>,
-    {
-        let handler = self.inner.as_mut().handler_mut();
-        // SAFETY: this is the exact handler installed beneath the endpoint and
-        // the returned control cannot outlive this exclusive step borrow.
-        unsafe { H::control(handler) }
-    }
-
     pub fn connect(
         &mut self,
         peer_addr: SocketAddr,
@@ -136,27 +127,6 @@ where
     ) -> Result<(), TrySendError<Vec<u8>>> {
         self.inner.as_mut().try_send_datagram(handle, data)
     }
-}
-
-/// Restricted coordinate view supplied by an endpoint handler.
-///
-/// # Safety
-/// `Control` must not expose an operation that moves, replaces, or drops
-/// driver-branded retained storage owned by the handler.
-pub unsafe trait ControlHandler<'d, const ID: u8, B: ReceiveBuffer = Vec<u8>>:
-    mux::Handler<ID, B>
-{
-    type Control<'step>
-    where
-        Self: 'step,
-        'd: 'step;
-
-    /// # Safety
-    /// `handler` must be the handler installed beneath its live endpoint and
-    /// no endpoint lifecycle phase may overlap the returned control.
-    unsafe fn control<'step>(handler: &'step mut Self) -> Self::Control<'step>
-    where
-        'd: 'step;
 }
 
 #[derive(Clone, Copy, Debug)]

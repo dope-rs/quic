@@ -1,4 +1,5 @@
-use std::alloc::{GlobalAlloc, Layout, System};
+pub mod support;
+
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -6,36 +7,20 @@ use dope_quic::packet::ConnectionId;
 use dope_quic::transport_params::{self, Params, TransportParameterError};
 use dope_quic::varint::VarInt;
 
-struct CountingAllocator;
-
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
 }
 
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.get() {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) }
-    }
-
-    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if COUNTING.get() {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.realloc(pointer, layout, size) }
+fn record_allocation(_size: usize) {
+    if COUNTING.get() {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+static ALLOCATOR: support::Allocator = support::Allocator::new(record_allocation);
 
 fn push_parameter(out: &mut Vec<u8>, id: u64, value: &[u8]) {
     VarInt::new(id).expect("test ID fits").encode(out);

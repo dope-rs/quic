@@ -1,10 +1,9 @@
 use super::Error;
 use crate::range_buffer::MAX_RANGES;
-use std::mem::MaybeUninit;
 
 const MAX_CRYPTO_BUFFERED: usize = 64 * 1024;
-const STORAGE_WORDS: usize = MAX_CRYPTO_BUFFERED / size_of::<u64>();
-const WORKSPACE_WORDS: usize = STORAGE_WORDS + MAX_RANGES;
+const SPAN_BYTES: usize = size_of::<u64>();
+const WORKSPACE_BYTES: usize = MAX_CRYPTO_BUFFERED + MAX_RANGES * SPAN_BYTES;
 
 #[derive(Clone, Copy)]
 struct Span {
@@ -14,7 +13,7 @@ struct Span {
 
 struct Fragmented {
     base: u64,
-    words: Vec<MaybeUninit<u64>>,
+    storage: Vec<u8>,
     ranges: u16,
 }
 
@@ -192,17 +191,14 @@ impl Crypto {
 
 impl Fragmented {
     fn new(base: u64) -> Result<Self, Error> {
-        let mut words = Vec::new();
-        words
-            .try_reserve_exact(WORKSPACE_WORDS)
+        let mut storage = Vec::new();
+        storage
+            .try_reserve_exact(WORKSPACE_BYTES)
             .map_err(|_| Error::CryptoBufferExceeded)?;
-        // SAFETY: `MaybeUninit<u64>` has no initialization or drop
-        // requirement. The storage and range accessors expose only positions
-        // that have subsequently been written.
-        unsafe { words.set_len(WORKSPACE_WORDS) };
+        storage.resize(WORKSPACE_BYTES, 0);
         Ok(Self {
             base,
-            words,
+            storage,
             ranges: 0,
         })
     }
@@ -231,18 +227,14 @@ impl Fragmented {
 
     fn bytes(&self, start: usize, end: usize) -> &[u8] {
         debug_assert!(start <= end && end <= MAX_CRYPTO_BUFFERED);
-        // SAFETY: callers request only a subrange covered by a recorded Span.
-        // Span insertion writes every byte before publishing its metadata, so
-        // this exact region is initialized and remains live with `self`.
-        unsafe {
-            std::slice::from_raw_parts(self.words.as_ptr().cast::<u8>().add(start), end - start)
-        }
+        &self.storage[start..end]
     }
 
     fn span(&self, index: usize) -> Span {
-        // SAFETY: indices below `ranges` are initialized by `set_span` before
-        // the range count is increased.
-        let encoded = unsafe { self.words[STORAGE_WORDS + index].assume_init() };
+        let start = MAX_CRYPTO_BUFFERED + index * SPAN_BYTES;
+        let mut bytes = [0; SPAN_BYTES];
+        bytes.copy_from_slice(&self.storage[start..start + SPAN_BYTES]);
+        let encoded = u64::from_ne_bytes(bytes);
         Span {
             start: (encoded >> 32) as u32,
             end: encoded as u32,
@@ -250,8 +242,9 @@ impl Fragmented {
     }
 
     fn set_span(&mut self, index: usize, span: Span) {
-        self.words[STORAGE_WORDS + index]
-            .write((u64::from(span.start) << 32) | u64::from(span.end));
+        let start = MAX_CRYPTO_BUFFERED + index * SPAN_BYTES;
+        let encoded = ((u64::from(span.start) << 32) | u64::from(span.end)).to_ne_bytes();
+        self.storage[start..start + SPAN_BYTES].copy_from_slice(&encoded);
     }
 
     fn first(&self) -> Option<Span> {
@@ -316,19 +309,7 @@ impl Fragmented {
     fn copy_part(&mut self, input_start: u32, part: Span, input: &[u8]) {
         let source = (part.start - input_start) as usize..(part.end - input_start) as usize;
         debug_assert!((part.end as usize) <= MAX_CRYPTO_BUFFERED);
-        // SAFETY: the destination lies in the reserved byte-storage prefix,
-        // the source range was derived from `input`, and a caller-held mutable
-        // borrow prevents either region from aliasing this workspace.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                input[source].as_ptr(),
-                self.words
-                    .as_mut_ptr()
-                    .cast::<u8>()
-                    .add(part.start as usize),
-                (part.end - part.start) as usize,
-            );
-        }
+        self.storage[part.start as usize..part.end as usize].copy_from_slice(&input[source]);
     }
 
     fn merge(&mut self, inserted: Span) -> Result<(), Error> {

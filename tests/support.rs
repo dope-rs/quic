@@ -1,3 +1,8 @@
+#[path = "support/sealed.rs"]
+mod sealed;
+
+pub use sealed::Allocator;
+
 use dope_quic::conn::server;
 use dope_quic::packet::{InitialHeader, QUIC_V1};
 use dope_quic::packet_protection::PacketProtection;

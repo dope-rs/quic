@@ -1,6 +1,5 @@
 pub mod support;
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -12,36 +11,20 @@ const INITIAL_DCID: [u8; 8] = [0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce];
 const CLIENT_SCID: [u8; 4] = [1, 2, 3, 4];
 const SERVER_CID: [u8; 8] = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
 
-struct CountingAllocator;
-
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
 }
 
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.get() {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) }
-    }
-
-    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if COUNTING.get() {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.realloc(pointer, layout, size) }
+fn record_allocation(_size: usize) {
+    if COUNTING.get() {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+static ALLOCATOR: support::Allocator = support::Allocator::new(record_allocation);
 
 fn sparse_packet(packet_number: u64, offset: u64) -> Vec<u8> {
     let mut frames = Vec::new();

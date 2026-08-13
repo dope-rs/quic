@@ -1,3 +1,4 @@
+pub mod raw;
 mod sealed;
 
 use std::io;
@@ -290,16 +291,6 @@ where
         self.inner.as_ref().get_ref().protocol()
     }
 
-    pub fn protocol_control(&mut self) -> <P as ControlProtocol>::Control<'_>
-    where
-        P: ControlProtocol,
-    {
-        let protocol = self.inner.as_mut().protocol_mut();
-        // SAFETY: this is the exact protocol installed beneath the client and
-        // the returned control cannot outlive this exclusive step borrow.
-        unsafe { P::control(protocol) }
-    }
-
     pub fn smoothed_rtt(&self, slot: SlotId) -> Option<Duration> {
         self.inner.as_ref().get_ref().smoothed_rtt(slot)
     }
@@ -315,22 +306,6 @@ where
     ) -> Result<(), TrySendError<Vec<u8>>> {
         self.inner.as_mut().try_send_datagram(slot, data)
     }
-}
-
-/// Restricted coordinate view supplied by a client protocol.
-///
-/// # Safety
-/// `Control` must not expose an operation that moves, replaces, or drops
-/// driver-branded retained storage owned by the protocol.
-pub unsafe trait ControlProtocol: Protocol {
-    type Control<'step>
-    where
-        Self: 'step;
-
-    /// # Safety
-    /// `protocol` must be the protocol installed beneath its live client and
-    /// no client lifecycle phase may overlap the returned control.
-    unsafe fn control<'step>(protocol: &'step mut Self) -> Self::Control<'step>;
 }
 
 impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy>

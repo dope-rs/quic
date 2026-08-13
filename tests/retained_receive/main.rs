@@ -1,4 +1,4 @@
-pub mod support;
+mod sealed;
 
 use std::cell::RefCell;
 use std::net::SocketAddr;
@@ -10,6 +10,7 @@ use dope::manifold::timing;
 use dope::runtime::{executor::Executor, shutdown};
 use dope_quic::conn::{self, Handle, server, session::Connection};
 use dope_quic::{Handler, RecvBuffer, RetainedEndpoint, endpoint, transport_params};
+use shin::crypto::sig::SigningKey;
 use shin::server::config::NoGuard;
 
 const CID: [u8; 8] = [0x31; 8];
@@ -127,23 +128,6 @@ impl CaptureControl<'_> {
     }
 }
 
-// SAFETY: the control exposes only test-owned command state and cannot move
-// or replace retained endpoint storage.
-unsafe impl<'d, const ID: u8> endpoint::ControlHandler<'d, ID, RecvBuffer<'d>> for Capture {
-    type Control<'step>
-        = CaptureControl<'step>
-    where
-        Self: 'step,
-        'd: 'step;
-
-    unsafe fn control<'step>(handler: &'step mut Self) -> Self::Control<'step>
-    where
-        'd: 'step,
-    {
-        CaptureControl(handler)
-    }
-}
-
 #[pin_project::pin_project]
 #[derive(dope_gen::Application)]
 #[coordinate]
@@ -186,7 +170,7 @@ impl<'d> App<'d> {
 }
 
 fn receive(payload: Vec<u8>) -> (Vec<u8>, usize) {
-    let signing = support::signing_key(0x52);
+    let signing = SigningKey::from_seed(&[0x52; 32]).expect("test signing key");
     let server_pubkey = *signing.pubkey().unwrap();
     let parameters = transport_params::Params {
         max_idle_timeout_ms: 30_000,

@@ -1,8 +1,7 @@
-#[allow(dead_code)]
-mod support;
+pub mod support;
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dope_quic::conn::packet::Batch;
@@ -10,36 +9,22 @@ use dope_quic::conn::server;
 use dope_quic::{conn, conn::session::Connection, transport_params};
 use shin::crypto::sig::SigningKey;
 
-struct CountingAllocator;
-
-static COUNTING: AtomicBool = AtomicBool::new(false);
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static LAST_SIZE: AtomicUsize = AtomicUsize::new(0);
 
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            LAST_SIZE.store(layout.size(), Ordering::Relaxed);
-        }
-        unsafe { System.alloc(layout) }
-    }
+thread_local! {
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+}
 
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) }
-    }
-
-    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            LAST_SIZE.store(size, Ordering::Relaxed);
-        }
-        unsafe { System.realloc(pointer, layout, size) }
+fn record_allocation(size: usize) {
+    if COUNTING.get() {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        LAST_SIZE.store(size, Ordering::Relaxed);
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+static ALLOCATOR: support::Allocator = support::Allocator::new(record_allocation);
 
 fn config() -> conn::config::Options {
     conn::config::Options {
@@ -104,11 +89,11 @@ fn warmed_one_rtt_send_and_decrypt_do_not_allocate() {
     assert_eq!(batch.packets(), 1);
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     client
         .transmit()
         .send_batch(&mut batch, now + Duration::from_secs(1), 1, 1200);
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     assert_eq!(batch.packets(), 1);
     assert_eq!(
@@ -131,11 +116,11 @@ fn warmed_one_rtt_send_and_decrypt_do_not_allocate() {
         .unwrap();
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     server
         .recv_packet(&mut workspace, &mut duplicate, packet_now)
         .unwrap();
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     assert_eq!(
         ALLOCATIONS.load(Ordering::Relaxed),
@@ -180,11 +165,11 @@ fn maximal_receive_plan_does_not_allocate() {
     let frames = [dope_quic::frame::TYPE_PING; 256];
     let mut packet = support::client_initial(&INITIAL_DCID, &CLIENT_SCID, 1, &frames);
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     server
         .recv_packet(&mut workspace, &mut packet, now)
         .unwrap();
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     assert_eq!(
         ALLOCATIONS.load(Ordering::Relaxed),
@@ -208,10 +193,10 @@ fn initial_crypto_pto_does_not_allocate() {
     let deadline = client.status().next_timer().expect("Initial PTO");
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     conn::recovery::Loss::new(&mut client).check_loss(deadline);
     client.transmit().send_batch(&mut batch, deadline, 1, 1_200);
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     assert_eq!(batch.packets(), 1);
     assert_eq!(
@@ -228,9 +213,9 @@ fn recurring_control_delivery_does_not_allocate() {
     let now = Instant::now() + Duration::from_secs(20);
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     client.send_path_challenge(1u64.to_ne_bytes());
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     assert_eq!(
         ALLOCATIONS.load(Ordering::Relaxed),
@@ -243,12 +228,12 @@ fn recurring_control_delivery_does_not_allocate() {
     assert_eq!(batch.packets(), 1);
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     client.send_path_challenge(2u64.to_ne_bytes());
     client
         .transmit()
         .send_batch(&mut batch, now + Duration::from_millis(1), 1, 1200);
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     assert_eq!(batch.packets(), 1);
     assert_eq!(
@@ -263,9 +248,9 @@ fn first_send_stream_state_does_not_allocate() {
     let (mut client, _, _workspace) = established();
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     let stream = client.streams().open_uni().unwrap();
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     assert_eq!(
         ALLOCATIONS.load(Ordering::Relaxed),
@@ -300,10 +285,10 @@ fn recycled_send_stream_state_does_not_allocate() {
     }
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     let second_stream = client.streams().open_uni().unwrap();
     client.streams().send(second_stream, &[0x62; 128]).unwrap();
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     assert_eq!(
         ALLOCATIONS.load(Ordering::Relaxed),
@@ -324,11 +309,11 @@ fn first_receive_stream_state_does_not_allocate() {
     assert!(!packets.is_empty());
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     for packet in &mut packets {
         server.recv_packet(&mut workspace, packet, now).unwrap();
     }
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     assert_eq!(
         server.stream_events().poll_event(),
@@ -376,13 +361,13 @@ fn recycled_receive_stream_state_does_not_allocate() {
     assert!(!second_packets.is_empty());
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     for packet in &mut second_packets {
         server
             .recv_packet(&mut workspace, packet, packet_now)
             .unwrap();
     }
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     assert_eq!(
         server.stream_events().poll_event(),
@@ -428,11 +413,11 @@ fn recurring_stream_event_does_not_allocate() {
         .unwrap();
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     server
         .recv_packet(&mut workspace, &mut second, packet_now)
         .unwrap();
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     assert_eq!(
         server.stream_events().poll_event(),
@@ -476,11 +461,11 @@ fn ack_generation_does_not_allocate() {
         .unwrap();
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     server
         .transmit()
         .send_batch(&mut batch, now + Duration::from_millis(3), 1, 1_200);
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     assert_eq!(batch.packets(), 1);
     assert_eq!(
@@ -504,9 +489,9 @@ fn out_of_order_stream_ack_bookkeeping_does_not_allocate() {
     let mut fragmented = false;
     for packet in packets.iter_mut() {
         ALLOCATIONS.store(0, Ordering::Relaxed);
-        COUNTING.store(true, Ordering::Relaxed);
+        COUNTING.set(true);
         server.recv_packet(&mut workspace, packet, now).unwrap();
-        COUNTING.store(false, Ordering::Relaxed);
+        COUNTING.set(false);
         let allocations = ALLOCATIONS.load(Ordering::Relaxed);
         assert!(
             allocations <= 1,
@@ -519,13 +504,13 @@ fn out_of_order_stream_ack_bookkeeping_does_not_allocate() {
     let suffix_ack = server.transmit().send(now + Duration::from_millis(1));
     assert!(!suffix_ack.is_empty());
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     for mut packet in suffix_ack {
         client
             .recv_packet(&mut workspace, &mut packet, now + Duration::from_millis(1))
             .unwrap();
     }
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
     assert_eq!(
         ALLOCATIONS.load(Ordering::Relaxed),
         0,
@@ -537,13 +522,13 @@ fn out_of_order_stream_ack_bookkeeping_does_not_allocate() {
     let prefix_ack = server.transmit().send(now + Duration::from_millis(2));
     assert!(!prefix_ack.is_empty());
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     for mut packet in prefix_ack {
         client
             .recv_packet(&mut workspace, &mut packet, now + Duration::from_millis(2))
             .unwrap();
     }
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
     assert_eq!(
         ALLOCATIONS.load(Ordering::Relaxed),
         0,

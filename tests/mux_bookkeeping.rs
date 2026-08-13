@@ -1,45 +1,27 @@
-use std::alloc::{GlobalAlloc, Layout, System};
+pub mod support;
+
+use std::cell::Cell;
 use std::hint::black_box;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dope_quic::{Handler, conn};
 
-struct Allocator;
-
-static COUNTING: AtomicBool = AtomicBool::new(false);
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
-unsafe impl GlobalAlloc for Allocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.alloc(layout) }
-    }
+thread_local! {
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+}
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.alloc_zeroed(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.realloc(ptr, layout, new_size) }
+fn record_allocation(_size: usize) {
+    if COUNTING.get() {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: Allocator = Allocator;
+static ALLOCATOR: support::Allocator = support::Allocator::new(record_allocation);
 
 struct Noop;
 
@@ -76,7 +58,7 @@ fn deadline_and_close_bookkeeping_do_not_allocate() {
     let deadline = mux.next_deadline(now).unwrap();
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNTING.set(true);
     for _ in 0..4096 {
         black_box(mux.next_deadline(now));
         mux.output().drive_bounded(now);
@@ -85,7 +67,7 @@ fn deadline_and_close_bookkeeping_do_not_allocate() {
     // first deadline can be a loss timer rather than the configured 1ms idle timer.
     mux.output()
         .drive_bounded(deadline + Duration::from_secs(5));
-    COUNTING.store(false, Ordering::Relaxed);
+    COUNTING.set(false);
 
     assert_eq!(mux.active_conns(), 0);
     assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);

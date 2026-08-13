@@ -1,4 +1,4 @@
-pub mod support;
+mod sealed;
 
 use std::cell::RefCell;
 use std::net::SocketAddr;
@@ -11,6 +11,7 @@ use dope::runtime::{executor::Executor, shutdown};
 use dope_quic::conn::Handle;
 use dope_quic::conn::server;
 use dope_quic::{Endpoint, Handler, conn, conn::session::Connection, endpoint, transport_params};
+use shin::crypto::sig::SigningKey;
 use shin::server::config::NoGuard;
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
@@ -101,23 +102,6 @@ impl CapturingControl<'_> {
     }
 }
 
-// SAFETY: the control moves only test-owned command/timer state and cannot
-// replace the handler installed beneath the endpoint.
-unsafe impl<'d, const ID: u8> endpoint::ControlHandler<'d, ID> for CapturingHandler {
-    type Control<'step>
-        = CapturingControl<'step>
-    where
-        Self: 'step,
-        'd: 'step;
-
-    unsafe fn control<'step>(handler: &'step mut Self) -> Self::Control<'step>
-    where
-        'd: 'step,
-    {
-        CapturingControl(handler)
-    }
-}
-
 #[pin_project::pin_project]
 #[derive(dope_gen::Application)]
 #[coordinate]
@@ -157,7 +141,7 @@ impl<'d> App<'d> {
 
 #[test]
 fn quic_datagram_handshake_completes_on_loopback() {
-    let signing = support::signing_key(0x39);
+    let signing = SigningKey::from_seed(&[0x39; 32]).expect("test signing key");
     let server_pubkey = *signing.pubkey().unwrap();
 
     let user_tp = transport_params::Params {

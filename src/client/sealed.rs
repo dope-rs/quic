@@ -11,6 +11,23 @@ use o3::cell::region;
 
 use crate::client;
 
+impl<'step, 'd, 'tls, const ID: u8, P, B, A, C>
+    client::ControlInner<'step, 'd, 'tls, ID, P, B, A, C>
+where
+    'd: 'step,
+    P: client::raw::ControlProtocol,
+    B: client::BackoffPolicy,
+    A: client::EndpointAuthority<'tls>,
+    C: client::ConfigProvider,
+{
+    pub fn protocol_control(&mut self) -> <P as client::raw::ControlProtocol>::Control<'_> {
+        let protocol = self.inner.as_mut().protocol_mut();
+        // SAFETY: this is the exact protocol installed beneath the client and
+        // the returned control cannot outlive this exclusive step borrow.
+        unsafe { P::control(protocol) }
+    }
+}
+
 // SAFETY: `Control` exposes only protocol borrows and slot commands inside one
 // step. It cannot move, replace, or drop the client or its retained endpoint.
 unsafe impl<'d, 'tls, const ID: u8, P, B, A, C> dispatch::raw::Controlled<'d>

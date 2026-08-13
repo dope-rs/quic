@@ -11,6 +11,23 @@ use o3::cell::region;
 
 use crate::{conn::server, endpoint, mux};
 
+impl<'step, 'd, 'tls, const ID: u8, H, P, B> endpoint::ControlInner<'step, 'd, 'tls, ID, H, P, B>
+where
+    'd: 'step,
+    H: endpoint::raw::ControlHandler<'d, ID, B>,
+    P: server::Policy,
+    B: endpoint::EndpointBuffer<'d>,
+{
+    pub fn handler_control(
+        &mut self,
+    ) -> <H as endpoint::raw::ControlHandler<'d, ID, B>>::Control<'_> {
+        let handler = self.inner.as_mut().handler_mut();
+        // SAFETY: this is the exact handler installed beneath the endpoint and
+        // the returned control cannot outlive this exclusive step borrow.
+        unsafe { H::control(handler) }
+    }
+}
+
 // SAFETY: `Control` exposes only handler/connection commands borrowed inside
 // one step. It cannot move, replace, or drop the endpoint or retained UDP mux.
 unsafe impl<'d, 'tls, const ID: u8, H, P, B> dispatch::raw::Controlled<'d>

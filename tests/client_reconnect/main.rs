@@ -1,4 +1,4 @@
-pub mod support;
+mod sealed;
 
 use std::cell::Cell;
 use std::net::SocketAddr;
@@ -13,6 +13,7 @@ use dope_quic::{
     BackoffPolicy, Client, Endpoint, EndpointSpec, Handler, Protocol, SlotId, client, conn,
     endpoint, transport_params,
 };
+use shin::crypto::sig::SigningKey;
 
 const ENDPOINT: endpoint::Config = endpoint::Config {
     max_conns: 1,
@@ -99,19 +100,6 @@ impl EventsControl<'_> {
     }
 }
 
-// SAFETY: the control moves only test-owned timer state and cannot replace the
-// protocol installed beneath the client.
-unsafe impl client::ControlProtocol for Events {
-    type Control<'step>
-        = EventsControl<'step>
-    where
-        Self: 'step;
-
-    unsafe fn control<'step>(protocol: &'step mut Self) -> Self::Control<'step> {
-        EventsControl(protocol)
-    }
-}
-
 #[pin_project::pin_project]
 #[derive(dope_gen::Application)]
 #[coordinate]
@@ -147,7 +135,7 @@ impl<'d> Runtime<'d> {
 
 #[test]
 fn immediate_reconnect_reuses_one_generation_checked_slot() {
-    let signing = support::signing_key(0x39);
+    let signing = SigningKey::from_seed(&[0x39; 32]).expect("test signing key");
     let pubkey = *signing.pubkey().unwrap();
     let params = transport_params::Params {
         max_idle_timeout_ms: 30_000,
