@@ -60,7 +60,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
         Self::initial_payload_limit_for(
             self.connection.path.peer_cid().len(),
             self.connection.path.local_cid().len(),
-            self.connection.path.retry_token.len(),
+            self.connection.path.handshake.retry_token.len(),
             max_packet_bytes,
         )
     }
@@ -277,8 +277,8 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
         };
         let mut header = mem::take(&mut self.connection.scratch.header);
         header.clear();
-        let token =
-            (epoch == conn::Epoch::Initial).then_some(self.connection.path.retry_token.as_slice());
+        let token = (epoch == conn::Epoch::Initial)
+            .then_some(self.connection.path.handshake.retry_token.as_slice());
         let result = crate::packet::LongHeader {
             version: crate::packet::QUIC_V1,
             packet_type,

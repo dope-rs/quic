@@ -182,18 +182,18 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Ingress<'a, DOMAIN, B> {
             .handshake
             .read_key(conn::Epoch::Handshake)
             .is_some()
-            || self.connection.path.peer_first_scid.is_some()
+            || self.connection.path.handshake.peer_first_scid.is_some()
         {
             return Ok(());
         }
         let retry = crate::packet::RetryRef::decode(wire).map_err(|_| conn::Error::HeaderDecode)?;
-        let original_dcid = self.connection.path.original_dcid;
+        let original_dcid = self.connection.path.handshake.original_dcid;
         let local_cid = self.connection.path.local_cid_id();
         let Some((peer_cid, token_len)) = retry
             .verify_into(
                 original_dcid.as_ref_id(),
                 local_cid.as_ref_id(),
-                &mut self.connection.path.retry_token,
+                &mut self.connection.path.handshake.retry_token,
             )
             .map_err(|_| conn::Error::Tls)?
             .map(|verified| {
@@ -273,7 +273,9 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Ingress<'a, DOMAIN, B> {
         let Some(initial_r) = self.connection.handshake.read_key(conn::Epoch::Initial) else {
             return Ok(());
         };
-        if self.connection.peer.is_client && self.connection.path.peer_first_scid.is_none() {
+        if self.connection.peer.is_client
+            && self.connection.path.handshake.peer_first_scid.is_none()
+        {
             self.connection.path.set_first_peer_cid(packet.scid());
         }
         let expected =

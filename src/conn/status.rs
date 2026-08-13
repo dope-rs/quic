@@ -50,7 +50,11 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> View<'conn, DOMAIN, B> {
     }
 
     pub fn path_validated(&self, token: &[u8; 8]) -> bool {
-        self.connection.path.validated_tokens.contains(token)
+        self.connection
+            .path
+            .validation
+            .validated_tokens
+            .contains(token)
     }
 
     pub fn path_mtu(&self) -> u64 {

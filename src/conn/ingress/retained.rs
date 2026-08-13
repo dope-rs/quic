@@ -217,7 +217,13 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
             return Ok(());
         };
         if self.ingress.connection.peer.is_client
-            && self.ingress.connection.path.peer_first_scid.is_none()
+            && self
+                .ingress
+                .connection
+                .path
+                .handshake
+                .peer_first_scid
+                .is_none()
         {
             self.ingress
                 .connection

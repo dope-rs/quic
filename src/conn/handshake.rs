@@ -86,6 +86,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Establishment<'_, DOMAIN, B> {
 
         let expected_iscid = self
             .path
+            .handshake
             .peer_first_scid
             .as_ref()
             .ok_or(conn::Error::TransportParameterMismatch)?;
@@ -102,7 +103,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Establishment<'_, DOMAIN, B> {
                 .original_destination_connection_id
                 .as_ref()
                 .ok_or(conn::Error::TransportParameterMismatch)?;
-            if peer_odcid.as_slice() != self.path.original_dcid.as_slice() {
+            if peer_odcid.as_slice() != self.path.handshake.original_dcid.as_slice() {
                 return Err(conn::Error::TransportParameterMismatch);
             }
         } else if peer_tp.original_destination_connection_id.is_some()

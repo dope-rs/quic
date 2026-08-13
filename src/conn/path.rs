@@ -268,17 +268,35 @@ impl PathState {
 }
 
 pub(super) struct Path {
+    peer: PeerCidState,
+    local: LocalCidState,
+    pub(super) handshake: HandshakeState,
+    pub(super) validation: ValidationState,
+}
+
+struct PeerCidState {
     active_peer_cid: PeerCid,
     spare_peer_cids: Vec<PeerCid>,
     peer_retire_prior_to: u64,
+}
+
+struct LocalCidState {
     initial_local_cid: packet::ConnectionId,
     local_cids: LocalCidSet,
     route_updates: Box<RouteUpdates>,
     routing_enabled: bool,
+    cid_prefix: Option<u8>,
+    stateless_reset_secret: Option<[u8; 32]>,
+    local_active_connection_id_limit: u64,
+}
+
+pub(super) struct HandshakeState {
     pub(super) original_dcid: packet::ConnectionId,
     pub(super) peer_first_scid: Option<packet::ConnectionId>,
-    pub(super) cid_prefix: Option<u8>,
-    pub(super) stateless_reset_secret: Option<[u8; 32]>,
+    pub(super) retry_token: Vec<u8>,
+}
+
+pub(super) struct ValidationState {
     challenges: Vec<Challenge>,
     pub(super) validated_tokens: Vec<[u8; 8]>,
     response_controls: Vec<(
@@ -289,9 +307,7 @@ pub(super) struct Path {
         u64,
         Option<control::OwnerKey<control::kind::RetireConnectionId>>,
     )>,
-    pub(super) local_active_connection_id_limit: u64,
     state: PathState,
-    pub(super) retry_token: Vec<u8>,
 }
 
 impl Path {
@@ -305,28 +321,36 @@ impl Path {
         local_active_connection_id_limit: u64,
     ) -> Self {
         Self {
-            active_peer_cid: PeerCid {
-                sequence: 0,
-                id: peer_cid,
-                reset_token: None,
+            peer: PeerCidState {
+                active_peer_cid: PeerCid {
+                    sequence: 0,
+                    id: peer_cid,
+                    reset_token: None,
+                },
+                spare_peer_cids: Vec::with_capacity(conn::MAX_ACTIVE_CONNECTION_IDS - 1),
+                peer_retire_prior_to: 0,
             },
-            spare_peer_cids: Vec::with_capacity(conn::MAX_ACTIVE_CONNECTION_IDS - 1),
-            peer_retire_prior_to: 0,
-            initial_local_cid: local_cid,
-            local_cids: LocalCidSet::new(local_cid),
-            route_updates: Box::new(RouteUpdates::new()),
-            routing_enabled: false,
-            original_dcid,
-            peer_first_scid,
-            cid_prefix,
-            stateless_reset_secret,
-            challenges: Vec::with_capacity(conn::MAX_PATH_TOKENS),
-            validated_tokens: Vec::with_capacity(conn::MAX_PATH_TOKENS),
-            response_controls: Vec::with_capacity(conn::MAX_PATH_TOKENS),
-            retirements: Vec::with_capacity(conn::MAX_PENDING_RETIRE_CONNECTION_IDS),
-            local_active_connection_id_limit,
-            state: PathState::new(),
-            retry_token: Vec::new(),
+            local: LocalCidState {
+                initial_local_cid: local_cid,
+                local_cids: LocalCidSet::new(local_cid),
+                route_updates: Box::new(RouteUpdates::new()),
+                routing_enabled: false,
+                cid_prefix,
+                stateless_reset_secret,
+                local_active_connection_id_limit,
+            },
+            handshake: HandshakeState {
+                original_dcid,
+                peer_first_scid,
+                retry_token: Vec::new(),
+            },
+            validation: ValidationState {
+                challenges: Vec::with_capacity(conn::MAX_PATH_TOKENS),
+                validated_tokens: Vec::with_capacity(conn::MAX_PATH_TOKENS),
+                response_controls: Vec::with_capacity(conn::MAX_PATH_TOKENS),
+                retirements: Vec::with_capacity(conn::MAX_PENDING_RETIRE_CONNECTION_IDS),
+                state: PathState::new(),
+            },
         }
     }
 
@@ -339,111 +363,116 @@ impl Path {
     }
 
     pub(super) fn peer_reset_tokens(&self) -> impl Iterator<Item = StatelessResetToken> + '_ {
-        self.active_peer_cid.reset_token.into_iter().chain(
-            self.spare_peer_cids
+        self.peer.active_peer_cid.reset_token.into_iter().chain(
+            self.peer
+                .spare_peer_cids
                 .iter()
                 .filter_map(|cid| cid.reset_token),
         )
     }
 
     pub(super) fn peer_cid(&self) -> &[u8] {
-        self.active_peer_cid.id.as_slice()
+        self.peer.active_peer_cid.id.as_slice()
     }
 
     pub(super) fn local_cid(&self) -> &[u8] {
-        self.initial_local_cid.as_slice()
+        self.local.initial_local_cid.as_slice()
     }
 
     pub(super) const fn local_cid_id(&self) -> packet::ConnectionId {
-        self.initial_local_cid
+        self.local.initial_local_cid
     }
 
     pub(crate) fn enable_cid_routing(&mut self) -> (LocalCidKey, packet::ConnectionId) {
-        self.routing_enabled = true;
+        self.local.routing_enabled = true;
         (
-            self.local_cids
+            self.local
+                .local_cids
                 .key(0)
                 .expect("the initial local CID remains active before routing starts"),
-            self.initial_local_cid,
+            self.local.initial_local_cid,
         )
     }
 
     pub(crate) fn take_route_updates(&mut self) -> RouteUpdates {
-        let updates = *self.route_updates;
-        self.route_updates.clear();
+        let updates = *self.local.route_updates;
+        self.local.route_updates.clear();
         updates
     }
 
     fn queue_route_update(&mut self, update: RouteUpdate) {
-        if !self.routing_enabled {
+        if !self.local.routing_enabled {
             return;
         }
-        self.route_updates
+        self.local
+            .route_updates
             .push(update)
             .unwrap_or_else(|_| unreachable!("local CID route updates are bounded"));
     }
 
     pub(crate) fn local_cid_frame(&self, key: LocalCidKey) -> Option<(u64, &[u8], [u8; 16])> {
-        let cid = self.local_cids.resolve(key)?;
+        let cid = self.local.local_cids.resolve(key)?;
         Some((cid.sequence, cid.id.as_slice(), cid.reset_token))
     }
 
     pub(crate) fn local_cid_sent(&mut self, key: LocalCidKey) {
-        if let Some(cid) = self.local_cids.resolve(key) {
-            self.local_cids.largest_sent = self.local_cids.largest_sent.max(cid.sequence);
+        if let Some(cid) = self.local.local_cids.resolve(key) {
+            self.local.local_cids.largest_sent =
+                self.local.local_cids.largest_sent.max(cid.sequence);
         }
     }
 
     pub(crate) fn local_cids(&self) -> impl Iterator<Item = (u64, &[u8])> {
-        self.local_cids
+        self.local
+            .local_cids
             .iter()
             .map(|cid| (cid.sequence, cid.id.as_slice()))
     }
 
     pub(super) fn set_initial_peer_cid(&mut self, connection_id: packet::ConnectionId) {
-        debug_assert_eq!(self.active_peer_cid.sequence, 0);
-        self.active_peer_cid.id = connection_id;
+        debug_assert_eq!(self.peer.active_peer_cid.sequence, 0);
+        self.peer.active_peer_cid.id = connection_id;
     }
 
     pub(super) fn set_first_peer_cid(&mut self, id: packet::ConnectionId) {
-        debug_assert_eq!(self.active_peer_cid.sequence, 0);
-        self.active_peer_cid.id = id;
-        self.peer_first_scid = Some(id);
+        debug_assert_eq!(self.peer.active_peer_cid.sequence, 0);
+        self.peer.active_peer_cid.id = id;
+        self.handshake.peer_first_scid = Some(id);
     }
 
     pub(super) fn set_initial_peer_reset_token(&mut self, reset_token: [u8; 16]) {
-        debug_assert_eq!(self.active_peer_cid.sequence, 0);
-        self.active_peer_cid.reset_token = StatelessResetToken::new(reset_token);
+        debug_assert_eq!(self.peer.active_peer_cid.sequence, 0);
+        self.peer.active_peer_cid.reset_token = StatelessResetToken::new(reset_token);
     }
 
     pub(super) fn mark_stateless_reset(&mut self) {
-        self.state.mark_stateless_reset();
+        self.validation.state.mark_stateless_reset();
     }
 
     pub(super) fn was_stateless_reset(&self) -> bool {
-        self.state.was_stateless_reset()
+        self.validation.state.was_stateless_reset()
     }
 
     pub(super) fn retry_processed(&self) -> bool {
-        self.state.retry_processed()
+        self.validation.state.retry_processed()
     }
 
     pub(super) fn mark_retry_processed(&mut self) {
-        self.state.mark_retry_processed();
+        self.validation.state.mark_retry_processed();
     }
 
     fn derive_cid(&self, sequence: u64) -> packet::ConnectionId {
-        let initial = self.initial_local_cid.as_slice();
+        let initial = self.local.initial_local_cid.as_slice();
         let mut bytes = [0; crate::packet::MAX_CONNECTION_ID_LEN];
         bytes[..initial.len()].copy_from_slice(initial);
-        let prefix_len = usize::from(self.cid_prefix.is_some());
+        let prefix_len = usize::from(self.local.cid_prefix.is_some());
         for (byte, sequence) in bytes[prefix_len..initial.len()]
             .iter_mut()
             .zip(sequence.to_le_bytes())
         {
             *byte ^= sequence;
         }
-        if let Some(prefix) = self.cid_prefix
+        if let Some(prefix) = self.local.cid_prefix
             && !initial.is_empty()
         {
             bytes[0] = prefix;
@@ -467,10 +496,11 @@ impl Path {
             return Err(conn::Error::ProtocolViolation);
         };
         let reset_token = StatelessResetToken::new(reset_token);
-        let known = if self.active_peer_cid.sequence == sequence {
-            Some(&self.active_peer_cid)
+        let known = if self.peer.active_peer_cid.sequence == sequence {
+            Some(&self.peer.active_peer_cid)
         } else {
-            self.spare_peer_cids
+            self.peer
+                .spare_peer_cids
                 .iter()
                 .find(|candidate| candidate.sequence == sequence)
         };
@@ -480,12 +510,12 @@ impl Path {
             return Err(conn::Error::ProtocolViolation);
         }
         let known = known.is_some();
-        let retire_prior_to = self.peer_retire_prior_to.max(retire_prior_to);
+        let retire_prior_to = self.peer.peer_retire_prior_to.max(retire_prior_to);
 
-        let dirty = self.state.retirement_dirty();
-        let live = self.retirements.len() - dirty;
+        let dirty = self.validation.state.retirement_dirty();
+        let live = self.validation.retirements.len() - dirty;
         let mut index = 0;
-        self.retirements.retain(|(_, owner)| {
+        self.validation.retirements.retain(|(_, owner)| {
             let keep = index >= live || control.owner_is_live(*owner);
             index += 1;
             keep
@@ -499,10 +529,10 @@ impl Path {
                     retirement_count += 1;
                 }
             };
-            if self.active_peer_cid.sequence < retire_prior_to {
-                record_retirement(self.active_peer_cid.sequence);
+            if self.peer.active_peer_cid.sequence < retire_prior_to {
+                record_retirement(self.peer.active_peer_cid.sequence);
             }
-            for cid in &self.spare_peer_cids {
+            for cid in &self.peer.spare_peer_cids {
                 if cid.sequence < retire_prior_to {
                     record_retirement(cid.sequence);
                 }
@@ -512,8 +542,9 @@ impl Path {
             }
         }
 
-        let retained = usize::from(self.active_peer_cid.sequence >= retire_prior_to)
+        let retained = usize::from(self.peer.active_peer_cid.sequence >= retire_prior_to)
             + self
+                .peer
                 .spare_peer_cids
                 .iter()
                 .filter(|cid| cid.sequence >= retire_prior_to)
@@ -522,7 +553,7 @@ impl Path {
         let final_count = retained + usize::from(admit);
         if final_count == 0
             || final_count > conn::MAX_ACTIVE_CONNECTION_IDS
-            || final_count as u64 > self.local_active_connection_id_limit
+            || final_count as u64 > self.local.local_active_connection_id_limit
         {
             return Err(conn::Error::ConnectionIdLimit);
         }
@@ -531,37 +562,39 @@ impl Path {
             .iter()
             .filter(|candidate| {
                 !self
+                    .validation
                     .retirements
                     .iter()
                     .any(|(sequence, _)| sequence == *candidate)
             })
             .count();
-        if self.retirements.len().saturating_add(additional)
+        if self.validation.retirements.len().saturating_add(additional)
             > conn::MAX_PENDING_RETIRE_CONNECTION_IDS
         {
             return Err(conn::Error::ConnectionIdLimit);
         }
-        self.peer_retire_prior_to = retire_prior_to;
+        self.peer.peer_retire_prior_to = retire_prior_to;
         let mut incoming = admit.then_some(PeerCid {
             sequence,
             id: connection_id,
             reset_token,
         });
         let mut index = 0;
-        while index < self.spare_peer_cids.len() {
-            if self.spare_peer_cids[index].sequence < retire_prior_to {
-                self.spare_peer_cids.swap_remove(index);
+        while index < self.peer.spare_peer_cids.len() {
+            if self.peer.spare_peer_cids[index].sequence < retire_prior_to {
+                self.peer.spare_peer_cids.swap_remove(index);
             } else {
                 index += 1;
             }
         }
-        if self.active_peer_cid.sequence < retire_prior_to {
-            self.active_peer_cid = if let Some(replacement) = self
+        if self.peer.active_peer_cid.sequence < retire_prior_to {
+            self.peer.active_peer_cid = if let Some(replacement) = self
+                .peer
                 .spare_peer_cids
                 .iter()
                 .position(|cid| cid.sequence >= retire_prior_to)
             {
-                self.spare_peer_cids.swap_remove(replacement)
+                self.peer.spare_peer_cids.swap_remove(replacement)
             } else {
                 incoming
                     .take()
@@ -569,83 +602,87 @@ impl Path {
             };
         }
         if let Some(incoming) = incoming {
-            debug_assert!(self.spare_peer_cids.len() < conn::MAX_ACTIVE_CONNECTION_IDS - 1);
-            self.spare_peer_cids.push(incoming);
+            debug_assert!(self.peer.spare_peer_cids.len() < conn::MAX_ACTIVE_CONNECTION_IDS - 1);
+            self.peer.spare_peer_cids.push(incoming);
         }
         for &retired in &retiring[..retirement_count] {
             if self
+                .validation
                 .retirements
                 .iter()
                 .any(|(sequence, _)| *sequence == retired)
             {
                 continue;
             }
-            self.retirements.push((retired, None));
-            self.state.add_retirement();
+            self.validation.retirements.push((retired, None));
+            self.validation.state.add_retirement();
         }
         Ok(())
     }
 
     pub(super) fn queue_challenge(&mut self, data: [u8; 8]) {
         if self
+            .validation
             .challenges
             .iter()
             .any(|challenge| challenge.data == data)
         {
             return;
         }
-        if self.challenges.len() == conn::MAX_PATH_TOKENS {
+        if self.validation.challenges.len() == conn::MAX_PATH_TOKENS {
             return;
         }
-        self.challenges.push(Challenge {
+        self.validation.challenges.push(Challenge {
             data,
             control: None,
             outstanding: false,
         });
-        self.state.add_challenge();
+        self.validation.state.add_challenge();
     }
 
     pub(super) fn reconcile_controls(&mut self, control: &mut control::Pending, mut work: usize) {
-        while work != 0 && self.state.response_dirty() != 0 {
-            let index = self.response_controls.len() - self.state.response_dirty();
-            let (data, owner) = &mut self.response_controls[index];
+        while work != 0 && self.validation.state.response_dirty() != 0 {
+            let index =
+                self.validation.response_controls.len() - self.validation.state.response_dirty();
+            let (data, owner) = &mut self.validation.response_controls[index];
             debug_assert!(owner.is_none());
             let Some(mut permit) = control.try_reserve(1) else {
                 return;
             };
             permit.queue_path_response(owner, *data);
-            self.state.materialize_response();
+            self.validation.state.materialize_response();
             work -= 1;
         }
-        while work != 0 && self.state.retirement_dirty() != 0 {
-            let index = self.retirements.len() - self.state.retirement_dirty();
-            let (sequence, owner) = &mut self.retirements[index];
+        while work != 0 && self.validation.state.retirement_dirty() != 0 {
+            let index =
+                self.validation.retirements.len() - self.validation.state.retirement_dirty();
+            let (sequence, owner) = &mut self.validation.retirements[index];
             debug_assert!(owner.is_none());
             let Some(mut permit) = control.try_reserve(1) else {
                 return;
             };
             permit.retire_connection_id(owner, *sequence);
-            self.state.materialize_retirement();
+            self.validation.state.materialize_retirement();
             work -= 1;
         }
-        while work != 0 && self.state.challenge_dirty() != 0 {
-            let index = self.challenges.len() - self.state.challenge_dirty();
-            let challenge = &mut self.challenges[index];
+        while work != 0 && self.validation.state.challenge_dirty() != 0 {
+            let index = self.validation.challenges.len() - self.validation.state.challenge_dirty();
+            let challenge = &mut self.validation.challenges[index];
             debug_assert!(challenge.control.is_none());
             let Some(mut permit) = control.try_reserve(1) else {
                 return;
             };
             permit.queue_path_challenge(&mut challenge.control, challenge.data);
             drop(permit);
-            self.state.materialize_challenge();
+            self.validation.state.materialize_challenge();
             work -= 1;
         }
     }
 
     pub(super) fn controls_pending(&self) -> bool {
-        self.state.response_dirty() != 0
-            || self.state.retirement_dirty() != 0
-            || self.state.challenge_dirty() != 0
+        self.validation.state.response_dirty() != 0
+            || self.validation.state.retirement_dirty() != 0
+            || self.validation.state.challenge_dirty() != 0
     }
 
     pub(super) fn controls_sendable(&self, control: &control::Pending) -> bool {
@@ -654,6 +691,7 @@ impl Path {
 
     pub(super) fn challenge_sent(&mut self, data: [u8; 8]) {
         if let Some(challenge) = self
+            .validation
             .challenges
             .iter_mut()
             .find(|challenge| challenge.data == data)
@@ -663,80 +701,86 @@ impl Path {
     }
 
     pub(super) fn queue_response(&mut self, data: [u8; 8], control: &control::Pending) {
-        let dirty = self.state.response_dirty();
-        let live = self.response_controls.len() - dirty;
+        let dirty = self.validation.state.response_dirty();
+        let live = self.validation.response_controls.len() - dirty;
         let mut position = 0;
-        self.response_controls.retain(|(_, owner)| {
+        self.validation.response_controls.retain(|(_, owner)| {
             let keep = position >= live || control.owner_is_live(*owner);
             position += 1;
             keep
         });
         let index = self
+            .validation
             .response_controls
             .iter()
             .position(|(candidate, _)| *candidate == data);
         let index = match index {
             Some(index) => index,
-            None if self.response_controls.len() == conn::MAX_PATH_TOKENS => return,
+            None if self.validation.response_controls.len() == conn::MAX_PATH_TOKENS => return,
             None => {
-                self.response_controls.push((data, None));
-                self.state.add_response();
-                self.response_controls.len() - 1
+                self.validation.response_controls.push((data, None));
+                self.validation.state.add_response();
+                self.validation.response_controls.len() - 1
             }
         };
-        debug_assert_eq!(self.response_controls[index].0, data);
+        debug_assert_eq!(self.validation.response_controls[index].0, data);
     }
 
     pub(super) fn record_response<C: control::Write>(&mut self, token: [u8; 8], control: &mut C) {
         let Some(index) = self
+            .validation
             .challenges
             .iter()
             .position(|challenge| challenge.data == token && challenge.outstanding)
         else {
             return;
         };
-        let dirty = self.state.challenge_dirty();
-        debug_assert!(index < self.challenges.len() - dirty);
-        let mut challenge = self.challenges.swap_remove(index);
-        let new_live_len = self.challenges.len().saturating_sub(dirty);
+        let dirty = self.validation.state.challenge_dirty();
+        debug_assert!(index < self.validation.challenges.len() - dirty);
+        let mut challenge = self.validation.challenges.swap_remove(index);
+        let new_live_len = self.validation.challenges.len().saturating_sub(dirty);
         if dirty != 0 && index < new_live_len {
-            self.challenges.swap(index, new_live_len);
+            self.validation.challenges.swap(index, new_live_len);
         }
         control.remove_control(&mut challenge.control);
-        if self.validated_tokens.contains(&token) {
+        if self.validation.validated_tokens.contains(&token) {
             return;
         }
-        if self.validated_tokens.len() == conn::MAX_PATH_TOKENS {
-            self.validated_tokens.swap_remove(0);
+        if self.validation.validated_tokens.len() == conn::MAX_PATH_TOKENS {
+            self.validation.validated_tokens.swap_remove(0);
         }
-        self.validated_tokens.push(token);
+        self.validation.validated_tokens.push(token);
     }
 
     pub(super) fn issue_local_cids(&mut self, limit: u64) -> usize {
-        if self.state.auto_issued() {
+        if self.validation.state.auto_issued() {
             return 0;
         }
-        self.state.mark_auto_issued();
-        if self.initial_local_cid.as_slice().is_empty() || self.stateless_reset_secret.is_none() {
+        self.validation.state.mark_auto_issued();
+        if self.local.initial_local_cid.as_slice().is_empty()
+            || self.local.stateless_reset_secret.is_none()
+        {
             return 0;
         }
-        self.local_cids.target = limit.min(conn::MAX_ACTIVE_CONNECTION_IDS as u64) as u8;
+        self.local.local_cids.target = limit.min(conn::MAX_ACTIVE_CONNECTION_IDS as u64) as u8;
         let mut issued = 0;
-        while self.local_cids.active < self.local_cids.target && self.issue_local_cid() {
+        while self.local.local_cids.active < self.local.local_cids.target && self.issue_local_cid()
+        {
             issued += 1;
         }
         issued
     }
 
     fn issue_local_cid(&mut self) -> bool {
-        let sequence = self.local_cids.next_sequence;
+        let sequence = self.local.local_cids.next_sequence;
         if crate::varint::VarInt::new(sequence).is_none() {
             return false;
         }
         let variable_bytes = self
+            .local
             .initial_local_cid
             .len()
-            .saturating_sub(usize::from(self.cid_prefix.is_some()))
+            .saturating_sub(usize::from(self.local.cid_prefix.is_some()))
             .min(std::mem::size_of::<u64>());
         if variable_bytes < std::mem::size_of::<u64>() && sequence >= 1u64 << (variable_bytes * 8) {
             return false;
@@ -745,12 +789,12 @@ impl Path {
             return false;
         };
         let id = self.derive_cid(sequence);
-        debug_assert!(self.local_cids.iter().all(|cid| cid.id != id));
-        let Some(secret) = self.stateless_reset_secret else {
+        debug_assert!(self.local.local_cids.iter().all(|cid| cid.id != id));
+        let Some(secret) = self.local.stateless_reset_secret else {
             return false;
         };
         let reset_token = crate::secrets::StatelessResetSecret(secret).token_for(id.as_slice());
-        let Some(key) = self.local_cids.insert(LocalCid {
+        let Some(key) = self.local.local_cids.insert(LocalCid {
             sequence,
             id,
             reset_token,
@@ -758,20 +802,21 @@ impl Path {
         }) else {
             return false;
         };
-        self.local_cids.next_sequence = next_sequence;
+        self.local.local_cids.next_sequence = next_sequence;
         self.queue_route_update(RouteUpdate::Add { key, cid: id });
         true
     }
 
     pub(super) fn issued_local_cid_control_slots(&self) -> usize {
-        self.local_cids
+        self.local
+            .local_cids
             .iter()
             .filter(|cid| cid.sequence != 0 && cid.control.is_none())
             .count()
     }
 
     pub(super) fn queue_issued_local_cids<C: control::Write>(&mut self, control: &mut C) {
-        for (index, slot) in self.local_cids.slots.iter_mut().enumerate() {
+        for (index, slot) in self.local.local_cids.slots.iter_mut().enumerate() {
             let Some(cid) = slot
                 .cid
                 .as_mut()
@@ -792,23 +837,27 @@ impl Path {
         packet_dcid: &[u8],
         control: &mut C,
     ) -> Result<usize, conn::Error> {
-        if self.initial_local_cid.as_slice().is_empty() || sequence > self.local_cids.largest_sent {
+        if self.local.initial_local_cid.as_slice().is_empty()
+            || sequence > self.local.local_cids.largest_sent
+        {
             return Err(conn::Error::ProtocolViolation);
         }
-        let Some((key, cid)) = self.local_cids.find_sequence(sequence) else {
+        let Some((key, cid)) = self.local.local_cids.find_sequence(sequence) else {
             return Ok(0);
         };
         if routed == Some(key) || cid.id.as_slice() == packet_dcid {
             return Err(conn::Error::ProtocolViolation);
         }
         let mut retired = self
+            .local
             .local_cids
             .remove(key)
             .ok_or(conn::Error::ConnectionIdLimit)?;
         control.remove_control(&mut retired.control);
         self.queue_route_update(RouteUpdate::Remove(key));
         let mut issued = 0;
-        while self.local_cids.active < self.local_cids.target && self.issue_local_cid() {
+        while self.local.local_cids.active < self.local.local_cids.target && self.issue_local_cid()
+        {
             issued += 1;
         }
         Ok(issued)
