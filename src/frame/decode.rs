@@ -1,11 +1,11 @@
 use crate::frame::*;
 use crate::varint;
 
-fn data_end(input: &[u8], pos: usize, length: varint::VarInt) -> Result<usize, error::Decode> {
-    let length = usize::try_from(length.get()).map_err(|_| error::Decode::Underflow)?;
+fn data_end(input: &[u8], pos: usize, length: varint::VarInt) -> Result<usize, errors::Decode> {
+    let length = usize::try_from(length.get()).map_err(|_| errors::Decode::Underflow)?;
     pos.checked_add(length)
         .filter(|&end| end <= input.len())
-        .ok_or(error::Decode::Underflow)
+        .ok_or(errors::Decode::Underflow)
 }
 
 pub(crate) struct Decoder<'a, DataMap, RangeMap> {
@@ -23,7 +23,7 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
         }
     }
 
-    pub(crate) fn decode<Data, Ranges>(self) -> Result<(Frame<Data, Ranges>, usize), error::Decode>
+    pub(crate) fn decode<Data, Ranges>(self) -> Result<(Frame<Data, Ranges>, usize), errors::Decode>
     where
         DataMap: Copy + Fn(&'a [u8]) -> Data,
         RangeMap: Fn(&'a [u8], usize) -> Ranges,
@@ -33,7 +33,7 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
             data,
             ranges,
         } = self;
-        let ty = *input.first().ok_or(error::Decode::Underflow)?;
+        let ty = *input.first().ok_or(errors::Decode::Underflow)?;
         let mut pos = 1;
         match ty {
             TYPE_PADDING => Ok((Frame::Padding, pos)),
@@ -169,19 +169,19 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                 let (range_count, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 let range_count = usize::try_from(range_count.get())
-                    .map_err(|_| error::Decode::InvalidAckRange)?;
+                    .map_err(|_| errors::Decode::InvalidAckRange)?;
                 if range_count > MAX_ADDITIONAL_ACK_RANGES {
-                    return Err(error::Decode::InvalidAckRange);
+                    return Err(errors::Decode::InvalidAckRange);
                 }
                 let (first_range, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 let mut previous_smallest = largest
                     .get()
                     .checked_sub(first_range.get())
-                    .ok_or(error::Decode::InvalidAckRange)?;
+                    .ok_or(errors::Decode::InvalidAckRange)?;
                 let remaining = input.len().saturating_sub(pos);
                 if range_count > remaining {
-                    return Err(error::Decode::Underflow);
+                    return Err(errors::Decode::Underflow);
                 }
                 let ranges_start = pos;
                 for _ in 0..range_count {
@@ -192,13 +192,13 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                     let skip = gap
                         .get()
                         .checked_add(2)
-                        .ok_or(error::Decode::InvalidAckRange)?;
+                        .ok_or(errors::Decode::InvalidAckRange)?;
                     let next_largest = previous_smallest
                         .checked_sub(skip)
-                        .ok_or(error::Decode::InvalidAckRange)?;
+                        .ok_or(errors::Decode::InvalidAckRange)?;
                     previous_smallest = next_largest
                         .checked_sub(range_len.get())
-                        .ok_or(error::Decode::InvalidAckRange)?;
+                        .ok_or(errors::Decode::InvalidAckRange)?;
                 }
                 let additional_ranges = ranges(&input[ranges_start..pos], range_count);
                 if ty == TYPE_ACK_ECN {
@@ -258,12 +258,12 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                 let (retire_prior_to, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 if input.len() <= pos {
-                    return Err(error::Decode::Underflow);
+                    return Err(errors::Decode::Underflow);
                 }
                 let cid_len = input[pos] as usize;
                 pos += 1;
                 if input.len() < pos + cid_len + 16 {
-                    return Err(error::Decode::Underflow);
+                    return Err(errors::Decode::Underflow);
                 }
                 let connection_id = data(&input[pos..pos + cid_len]);
                 pos += cid_len;
@@ -287,7 +287,7 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
             }
             TYPE_PATH_CHALLENGE | TYPE_PATH_RESPONSE => {
                 if input.len() < pos + 8 {
-                    return Err(error::Decode::Underflow);
+                    return Err(errors::Decode::Underflow);
                 }
                 let mut data = [0u8; 8];
                 data.copy_from_slice(&input[pos..pos + 8]);
@@ -325,7 +325,7 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                     pos,
                 ))
             }
-            _ => Err(error::Decode::BadType),
+            _ => Err(errors::Decode::BadType),
         }
     }
 }
