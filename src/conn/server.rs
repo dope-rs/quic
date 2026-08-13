@@ -83,9 +83,7 @@ impl Ids {
     }
 }
 
-mod sealed {
-    pub trait Policy {}
-}
+mod sealed;
 
 pub trait Policy: sealed::Policy + 'static {
     type Guard: EarlyDataGuard + 'static;

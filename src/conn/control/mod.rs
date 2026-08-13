@@ -41,20 +41,7 @@ const NONE: u32 = u32::MAX;
 const SIGNAL_LIVE: u64 = 1 << 63;
 const SIGNAL_VALUE_MAX: u64 = (1 << 62) - 1;
 
-pub(super) mod kind {
-    pub(in crate::conn) struct HandshakeDone;
-    pub(in crate::conn) struct NewConnectionId;
-    pub(in crate::conn) struct RetireConnectionId;
-    pub(in crate::conn) struct StopSending;
-    pub(in crate::conn) struct ResetStream;
-    pub(in crate::conn) struct MaxData;
-    pub(in crate::conn) struct MaxStreamData;
-    pub(in crate::conn) struct MaxStreams;
-    pub(in crate::conn) struct PathResponse;
-    pub(in crate::conn) struct PathChallenge;
-    pub(in crate::conn) struct DataBlocked;
-    pub(in crate::conn) struct StreamDataBlocked;
-}
+pub(super) mod kind;
 
 /// Stable typed identity held by the control's natural owner.
 ///

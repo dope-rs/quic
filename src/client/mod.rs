@@ -67,9 +67,7 @@ pub struct PooledEndpointSpec<'tls> {
     pub pool: &'tls conn::tls::ClientPool,
 }
 
-mod authority {
-    pub trait Sealed {}
-}
+mod authority;
 
 #[doc(hidden)]
 pub trait EndpointAuthority<'tls>: Copy + authority::Sealed {

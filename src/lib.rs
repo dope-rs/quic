@@ -49,10 +49,4 @@ pub use o3::buffer::CapacityError;
 pub use stream::{INLINE_SEND_CAPACITY, ReceiveBuffer, RecvBuffer, SendBuffer};
 pub use transport_params::TransportParameterError;
 
-pub mod client_auth {
-    pub use shin::client::config::Identity;
-    pub use shin::server::{
-        config::ClientAuth, config::ClientAuthVerifier, config::ClientCertVerifier,
-        config::ClientIdentity,
-    };
-}
+pub mod client_auth;

@@ -12,9 +12,7 @@ use crate::range_buffer::{Arena, InsertError, MAX_RANGES, RangeBuffer, ReadySegm
 
 const MAX_RECV_SEGMENTS: usize = MAX_RANGES;
 
-mod receive_buffer {
-    pub trait Sealed {}
-}
+mod receive_buffer;
 
 /// Receive storage that can preserve a packet owner's lifetime while exposing
 /// only the accepted byte range.
