@@ -1,7 +1,8 @@
-use crate::varint;
 use crate::varint::VarInt;
 
+pub mod ack_ranges;
 pub(crate) mod decode;
+pub mod error;
 
 use decode::FrameDecoder;
 
@@ -33,68 +34,7 @@ pub const TYPE_PATH_CHALLENGE: u8 = 0x1a;
 pub const TYPE_PATH_RESPONSE: u8 = 0x1b;
 pub const TYPE_DATAGRAM: u8 = 0x30;
 pub const TYPE_DATAGRAM_LEN: u8 = 0x31;
-pub(crate) const MAX_ACK_RANGES: usize = 256;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameError {
-    Underflow,
-    BadVarInt,
-    BadType,
-    InvalidAckRange,
-}
-
-impl_error!(FrameError {
-    Self::Underflow => "truncated frame",
-    Self::BadVarInt => "invalid frame integer",
-    Self::BadType => "invalid frame type",
-    Self::InvalidAckRange => "invalid ACK range",
-});
-
-impl From<varint::Error> for FrameError {
-    fn from(_: varint::Error) -> Self {
-        Self::BadVarInt
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AckRanges<'a> {
-    input: &'a [u8],
-    remaining: usize,
-}
-
-impl<'a> AckRanges<'a> {
-    pub(crate) fn new(input: &'a [u8], remaining: usize) -> Self {
-        Self { input, remaining }
-    }
-}
-
-impl Iterator for AckRanges<'_> {
-    type Item = (VarInt, VarInt);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-        let Ok((gap, gap_len)) = VarInt::decode(self.input) else {
-            self.remaining = 0;
-            return None;
-        };
-        let input = &self.input[gap_len..];
-        let Ok((range, range_len)) = VarInt::decode(input) else {
-            self.remaining = 0;
-            return None;
-        };
-        self.input = &input[range_len..];
-        self.remaining -= 1;
-        Some((gap, range))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl ExactSizeIterator for AckRanges<'_> {}
+pub(crate) const MAX_ADDITIONAL_ACK_RANGES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame<Data = Vec<u8>, Ranges = Vec<(VarInt, VarInt)>> {
@@ -306,7 +246,7 @@ impl Frame {
         fin: bool,
         length_prefixed: bool,
         data: &[u8],
-    ) -> Result<(), FrameError> {
+    ) -> Result<(), error::Decode> {
         Self::encode_stream_header(
             out,
             stream_id,
@@ -324,7 +264,7 @@ impl Frame {
         offset: VarInt,
         fin: bool,
         length: Option<usize>,
-    ) -> Result<(), FrameError> {
+    ) -> Result<(), error::Decode> {
         let mut ty = TYPE_STREAM_BASE;
         if offset != VarInt::ZERO {
             ty |= STREAM_FLAG_OFF;
@@ -342,13 +282,13 @@ impl Frame {
         }
         if let Some(length) = length {
             VarInt::from_usize(length)
-                .ok_or(FrameError::BadVarInt)?
+                .ok_or(error::Decode::BadVarInt)?
                 .encode(out);
         }
         Ok(())
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), error::Decode> {
         match self {
             Self::Padding => out.push(TYPE_PADDING),
             Self::Ping => out.push(TYPE_PING),
@@ -362,7 +302,7 @@ impl Frame {
                 largest.encode(out);
                 delay.encode(out);
                 VarInt::from_usize(additional_ranges.len())
-                    .ok_or(FrameError::BadVarInt)?
+                    .ok_or(error::Decode::BadVarInt)?
                     .encode(out);
                 first_range.encode(out);
                 for (gap, range_len) in additional_ranges {
@@ -374,7 +314,7 @@ impl Frame {
                 out.push(TYPE_CRYPTO);
                 offset.encode(out);
                 VarInt::from_usize(data.len())
-                    .ok_or(FrameError::BadVarInt)?
+                    .ok_or(error::Decode::BadVarInt)?
                     .encode(out);
                 out.extend_from_slice(data);
             }
@@ -385,7 +325,7 @@ impl Frame {
                 if *length_prefixed {
                     out.push(TYPE_DATAGRAM_LEN);
                     VarInt::from_usize(data.len())
-                        .ok_or(FrameError::BadVarInt)?
+                        .ok_or(error::Decode::BadVarInt)?
                         .encode(out);
                     out.extend_from_slice(data);
                 } else {
@@ -508,7 +448,7 @@ impl Frame {
                     frame_type.encode(out);
                 }
                 VarInt::from_usize(reason.len())
-                    .ok_or(FrameError::BadVarInt)?
+                    .ok_or(error::Decode::BadVarInt)?
                     .encode(out);
                 out.extend_from_slice(reason);
             }
@@ -518,14 +458,14 @@ impl Frame {
 }
 
 impl Frame {
-    pub fn decode(input: &[u8]) -> Result<(Self, usize), FrameError> {
+    pub fn decode(input: &[u8]) -> Result<(Self, usize), error::Decode> {
         FrameDecoder::new(input, <[u8]>::to_vec, |input, count| {
-            AckRanges::new(input, count).collect()
+            ack_ranges::Ranges::new(input, count).collect()
         })
         .decode()
     }
 
-    pub fn decode_all(mut input: &[u8]) -> Result<Vec<Self>, FrameError> {
+    pub fn decode_all(mut input: &[u8]) -> Result<Vec<Self>, error::Decode> {
         let mut out = Vec::new();
         while !input.is_empty() {
             let (f, n) = Self::decode(input)?;
@@ -538,8 +478,8 @@ impl Frame {
     }
 }
 
-impl<'a> Frame<&'a [u8], AckRanges<'a>> {
-    pub fn decode_ref(input: &'a [u8]) -> Result<(Self, usize), FrameError> {
-        FrameDecoder::new(input, |input| input, AckRanges::new).decode()
+impl<'a> Frame<&'a [u8], ack_ranges::Ranges<'a>> {
+    pub fn decode_ref(input: &'a [u8]) -> Result<(Self, usize), error::Decode> {
+        FrameDecoder::new(input, |input| input, ack_ranges::Ranges::new).decode()
     }
 }

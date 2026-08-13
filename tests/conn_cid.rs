@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use dope_quic::conn::Handle;
-use dope_quic::{Connection, Handler, Mux, transport_params};
+use dope_quic::{Handler, Mux, conn::session::Connection, transport_params};
 use shin::crypto::sig::SigningKey;
 
 const CID: [u8; 8] = [0x42; 8];
@@ -14,7 +14,7 @@ struct CountHandler {
     established: usize,
     datagrams: usize,
 }
-impl Handler for CountHandler {
+impl Handler<0> for CountHandler {
     type Connection = ();
 
     fn create_connection(&mut self, _conn: &mut Connection, _handle: Handle) {}
@@ -27,7 +27,7 @@ impl Handler for CountHandler {
     }
 }
 
-fn user_tp() -> dope_quic::conn::Config {
+fn user_tp() -> dope_quic::conn::config::Options {
     transport_params::Params {
         max_idle_timeout_ms: 30_000,
         max_datagram_frame_size: Some(65535),
@@ -45,20 +45,26 @@ fn signed_keys() -> ([u8; 32], SigningKey) {
 
 fn relay(src: &mut Mux<CountHandler>, dst: &mut Mux<CountHandler>, src_addr: SocketAddr) {
     let now = Instant::now();
-    for mut out in src.drain_outgoing() {
-        dst.recv(src_addr, out.payload_mut(), now).expect("recv");
+    for mut out in src.output().drain() {
+        dst.protocol()
+            .recv(src_addr, out.payload_mut(), now)
+            .expect("recv");
     }
 }
 
 #[test]
 fn handshake_completes_with_dcid_routing() {
     let (server_pubkey, signing) = signed_keys();
-    let mut server = Mux::server(CountHandler::default(), signing, user_tp()).unwrap();
-    let mut client = Mux::client(CountHandler::default()).unwrap();
+    let mut server =
+        dope_quic::mux::setup::Server::accept(CountHandler::default(), signing, user_tp()).unwrap();
+    let mut client = dope_quic::mux::setup::Client::new(CountHandler::default())
+        .build()
+        .unwrap();
     let server_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
     let client_addr: SocketAddr = "10.0.0.1:50000".parse().unwrap();
 
     let _h = client
+        .protocol()
         .connect(
             server_addr,
             server_pubkey,
@@ -80,15 +86,21 @@ fn handshake_completes_with_dcid_routing() {
 #[test]
 fn server_demultiplexes_two_clients_at_same_addr_via_dcid() {
     let (server_pubkey, signing) = signed_keys();
-    let mut server = Mux::server(CountHandler::default(), signing, user_tp()).unwrap();
+    let mut server =
+        dope_quic::mux::setup::Server::accept(CountHandler::default(), signing, user_tp()).unwrap();
 
-    let mut client_a = Mux::client(CountHandler::default()).unwrap();
-    let mut client_b = Mux::client(CountHandler::default()).unwrap();
+    let mut client_a = dope_quic::mux::setup::Client::new(CountHandler::default())
+        .build()
+        .unwrap();
+    let mut client_b = dope_quic::mux::setup::Client::new(CountHandler::default())
+        .build()
+        .unwrap();
 
     let server_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
     let shared_addr: SocketAddr = "10.0.0.1:50000".parse().unwrap();
 
     let _ha = client_a
+        .protocol()
         .connect(
             server_addr,
             server_pubkey,
@@ -98,6 +110,7 @@ fn server_demultiplexes_two_clients_at_same_addr_via_dcid() {
         )
         .unwrap();
     let _hb = client_b
+        .protocol()
         .connect(
             server_addr,
             server_pubkey,
@@ -112,7 +125,7 @@ fn server_demultiplexes_two_clients_at_same_addr_via_dcid() {
 
     let mut conn_count = 0;
     for h in 0..16u32 {
-        if server.conn_mut(Handle(u64::from(h))).is_some() {
+        if server.protocol().conn_mut(Handle(u64::from(h))).is_some() {
             conn_count += 1;
         }
     }

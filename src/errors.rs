@@ -3,15 +3,17 @@ use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectError {
+    Closed,
     Capacity,
     InvalidConfig,
-    InvalidTlsConfig(shin::client::config::ConfigError),
+    InvalidTlsConfig(shin::client::config::Error),
     Tls,
 }
 
 impl fmt::Display for ConnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Closed => "multiplexer is shutting down",
             Self::Capacity => "connection capacity exhausted",
             Self::InvalidConfig => "invalid connection configuration",
             Self::InvalidTlsConfig(error) => {
@@ -26,7 +28,7 @@ impl Error for ConnectError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidTlsConfig(error) => Some(error),
-            Self::Capacity | Self::InvalidConfig | Self::Tls => None,
+            Self::Closed | Self::Capacity | Self::InvalidConfig | Self::Tls => None,
         }
     }
 }

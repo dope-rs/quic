@@ -1,7 +1,11 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::rc::Rc;
 
 use crate::clock::WallClock;
+use crate::conn::server::ReplayGuard;
+use shin::server::ReplayDomain;
 use shin::server::config::EarlyDataGuard;
 
 const REPLAY_WINDOW_MS: u64 = 7_200_000;
@@ -10,43 +14,64 @@ const DEFAULT_REPLAY_CAPACITY: usize = MAX_REPLAY_CAPACITY;
 const MAX_TOKEN_LEN: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReplayCacheError;
+pub enum ReplayCacheError {
+    Capacity,
+    Entropy,
+}
 
 impl fmt::Display for ReplayCacheError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("early data replay capacity exceeds the supported maximum")
+        f.write_str(match self {
+            Self::Capacity => "early data replay capacity exceeds the supported maximum",
+            Self::Entropy => "failed to create an early data replay domain",
+        })
     }
 }
 
 impl std::error::Error for ReplayCacheError {}
 
 #[derive(Debug)]
-pub struct EarlyDataReplayCache {
+struct State {
     seen: HashMap<Vec<u8>, u64>,
     expiry: VecDeque<(u64, Vec<u8>)>,
     capacity: usize,
 }
 
+/// Lane-local replay protection that can be cloned across standalone QUIC
+/// connections. Clones share both the replay store and its authenticated
+/// ticket domain; the type remains `!Send` for thread-per-core runtimes.
+#[derive(Clone, Debug)]
+pub struct EarlyDataReplayCache {
+    state: Rc<RefCell<State>>,
+    domain: ReplayDomain,
+}
+
 impl EarlyDataReplayCache {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, ReplayCacheError> {
         Self::from_capacity(DEFAULT_REPLAY_CAPACITY)
     }
 
     pub fn with_capacity(capacity: usize) -> Result<Self, ReplayCacheError> {
         if capacity > MAX_REPLAY_CAPACITY {
-            return Err(ReplayCacheError);
+            return Err(ReplayCacheError::Capacity);
         }
-        Ok(Self::from_capacity(capacity))
+        Self::from_capacity(capacity)
     }
 
-    fn from_capacity(capacity: usize) -> Self {
-        Self {
-            seen: HashMap::new(),
-            expiry: VecDeque::new(),
-            capacity,
-        }
+    fn from_capacity(capacity: usize) -> Result<Self, ReplayCacheError> {
+        let domain = ReplayDomain::random().map_err(|_| ReplayCacheError::Entropy)?;
+        Ok(Self {
+            state: Rc::new(RefCell::new(State {
+                seen: HashMap::new(),
+                expiry: VecDeque::new(),
+                capacity,
+            })),
+            domain,
+        })
     }
+}
 
+impl State {
     fn register(&mut self, token: &[u8], now_ms: u64) -> bool {
         while self
             .expiry
@@ -75,14 +100,16 @@ impl EarlyDataReplayCache {
     }
 }
 
-impl Default for EarlyDataReplayCache {
-    fn default() -> Self {
-        Self::new()
+impl ReplayGuard for EarlyDataReplayCache {
+    fn replay_domain(&self) -> Option<ReplayDomain> {
+        Some(self.domain.clone())
     }
 }
 
 impl EarlyDataGuard for EarlyDataReplayCache {
-    fn register(&mut self, token: &[u8]) -> bool {
-        self.register(token, WallClock::now_millis())
+    fn register(&self, token: &[u8]) -> bool {
+        self.state
+            .borrow_mut()
+            .register(token, WallClock::now_millis())
     }
 }

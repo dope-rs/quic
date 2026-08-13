@@ -3,19 +3,23 @@ pub mod support;
 use std::time::Instant;
 
 use dope_quic::conn::server;
-use dope_quic::{Connection, conn, transport_params};
+use dope_quic::{conn, conn::session::Connection, transport_params};
 
 const CID: [u8; 8] = [0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44];
 
-fn drain<R: support::Receiver>(from: &mut Connection, into: &mut R) {
+fn drain<R: support::Receiver>(
+    workspace: &mut conn::ReceiveWorkspace,
+    from: &mut Connection,
+    into: &mut R,
+) {
     let now = Instant::now();
-    for mut pkt in from.send_packets(now) {
-        into.receive(&mut pkt, now);
+    for mut pkt in from.transmit().send(now) {
+        into.receive(workspace, &mut pkt, now);
     }
 }
 
-fn cfg() -> conn::Config {
-    conn::Config {
+fn cfg() -> conn::config::Options {
+    conn::config::Options {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
             max_datagram_frame_size: Some(65535),
@@ -26,22 +30,34 @@ fn cfg() -> conn::Config {
     }
 }
 
-fn handshake() -> (server::Connection, Connection) {
+fn handshake() -> (server::Connection, Connection, conn::ReceiveWorkspace) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
 
-    let mut server =
-        Connection::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, cfg()).unwrap();
-    let mut client =
-        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, cfg()).unwrap();
+    let mut server = dope_quic::conn::setup::Server::<0>::accept(
+        CID.to_vec(),
+        CID.to_vec(),
+        CID.to_vec(),
+        signing,
+        cfg(),
+    )
+    .unwrap();
+    let mut client = dope_quic::conn::setup::Client::<0>::connect(
+        CID.to_vec(),
+        CID.to_vec(),
+        server_pubkey,
+        cfg(),
+    )
+    .unwrap();
+    let mut workspace = conn::ReceiveWorkspace::new();
 
-    drain(&mut client, &mut server);
-    drain(&mut server, &mut client);
-    drain(&mut client, &mut server);
-    drain(&mut server, &mut client);
-    drain(&mut client, &mut server);
-    assert!(client.is_established() && server.is_established());
-    (server, client)
+    drain(&mut workspace, &mut client, &mut server);
+    drain(&mut workspace, &mut server, &mut client);
+    drain(&mut workspace, &mut client, &mut server);
+    drain(&mut workspace, &mut server, &mut client);
+    drain(&mut workspace, &mut client, &mut server);
+    assert!(client.status().is_established() && server.status().is_established());
+    (server, client, workspace)
 }
 
 #[test]
@@ -75,32 +91,32 @@ fn path_response_round_trip() {
 
 #[test]
 fn active_challenge_response_round_trip_validates_path() {
-    let (mut server, mut client) = handshake();
+    let (mut server, mut client, mut workspace) = handshake();
     let token = [0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF];
 
     server.send_path_challenge(token);
     assert!(
-        !server.path_validated(&token),
+        !server.status().path_validated(&token),
         "not yet validated — RESPONSE hasn't come back",
     );
 
-    drain(&mut server, &mut client);
-    drain(&mut client, &mut server);
+    drain(&mut workspace, &mut server, &mut client);
+    drain(&mut workspace, &mut client, &mut server);
 
     assert!(
-        server.path_validated(&token),
+        server.status().path_validated(&token),
         "server should have validated the path after RESPONSE round-trip",
     );
 }
 
 #[test]
 fn unsolicited_path_response_does_not_falsely_validate() {
-    let (server, client) = handshake();
+    let (server, client, _workspace) = handshake();
 
     let bogus = [0u8; 8];
     let _ = (client, bogus);
     assert!(
-        !server.path_validated(&[0xFFu8; 8]),
+        !server.status().path_validated(&[0xFFu8; 8]),
         "never-issued token must not be reported validated",
     );
 }
@@ -109,26 +125,31 @@ fn unsolicited_path_response_does_not_falsely_validate() {
 fn pre_handshake_send_path_challenge_is_noop() {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
-    let mut client =
-        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, cfg()).unwrap();
-    assert!(client.is_handshaking());
+    let mut client = dope_quic::conn::setup::Client::<0>::connect(
+        CID.to_vec(),
+        CID.to_vec(),
+        server_pubkey,
+        cfg(),
+    )
+    .unwrap();
+    assert!(client.status().is_handshaking());
     let token = [0x01u8; 8];
     client.send_path_challenge(token);
-    let _ = client.send_packets(Instant::now());
-    assert!(!client.path_validated(&token));
+    let _ = client.transmit().send(Instant::now());
+    assert!(!client.status().path_validated(&token));
 }
 
 #[test]
 fn multiple_outstanding_challenges_validate_independently() {
-    let (mut server, mut client) = handshake();
+    let (mut server, mut client, mut workspace) = handshake();
     let a = [0xAAu8; 8];
     let b = [0xBBu8; 8];
     server.send_path_challenge(a);
     server.send_path_challenge(b);
-    drain(&mut server, &mut client);
-    drain(&mut client, &mut server);
-    assert!(server.path_validated(&a));
-    assert!(server.path_validated(&b));
+    drain(&mut workspace, &mut server, &mut client);
+    drain(&mut workspace, &mut client, &mut server);
+    assert!(server.status().path_validated(&a));
+    assert!(server.status().path_validated(&b));
 }
 
 #[test]

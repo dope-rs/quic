@@ -1,21 +1,21 @@
+mod sealed;
+
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use dope::DriverContext;
-use dope::manifold::Manifold;
-use o3::cell::RegionToken;
-use o3::collections::IndexedMinHeap;
-use o3::collections::SlotQueue;
+use dope::core::driver::Context;
+use o3::collections::{heap::Min, queue::slot::Fifo};
 use pin_project::pin_project;
 use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::TrySendError;
-use crate::conn::{self, Connection, Handle};
-use crate::endpoint::{self, Endpoint};
+use crate::conn::session::Connection;
+use crate::conn::{self, Handle};
+use crate::endpoint::{self, PooledEndpoint};
 use crate::mux::Handler;
-use dope::runtime::dispatcher::Idle;
+use crate::packet::ConnectionId;
 use std::io::Error;
 use std::io::ErrorKind;
 
@@ -43,13 +43,13 @@ pub trait Protocol: 'static {
 }
 
 pub trait ConfigProvider: 'static {
-    fn config(&mut self, slot: SlotId) -> Option<conn::Config>;
+    fn config(&mut self, slot: SlotId) -> Option<conn::config::Options>;
 }
 
-pub struct StaticConfig(conn::Config);
+pub struct StaticConfig(conn::config::Options);
 
 impl ConfigProvider for StaticConfig {
-    fn config(&mut self, _slot: SlotId) -> Option<conn::Config> {
+    fn config(&mut self, _slot: SlotId) -> Option<conn::config::Options> {
         self.0.duplicate_connection().ok()
     }
 }
@@ -58,6 +58,58 @@ impl ConfigProvider for StaticConfig {
 pub struct EndpointSpec {
     pub addr: SocketAddr,
     pub pubkey: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+/// One remote endpoint backed by externally owned, exactly reserved TLS state.
+pub struct PooledEndpointSpec<'tls> {
+    pub addr: SocketAddr,
+    pub pool: &'tls conn::tls::ClientPool,
+}
+
+mod authority {
+    pub trait Sealed {}
+}
+
+#[doc(hidden)]
+pub trait EndpointAuthority<'tls>: Copy + authority::Sealed {
+    fn connect<'d, const ID: u8, H: Handler<ID>>(
+        self,
+        endpoint: Pin<&mut PooledEndpoint<'d, 'tls, ID, H>>,
+        addr: SocketAddr,
+        config: conn::config::Options,
+        dcid: ConnectionId,
+    ) -> Result<Handle, crate::ConnectError>;
+}
+
+impl authority::Sealed for [u8; 32] {}
+
+impl<'tls> EndpointAuthority<'tls> for [u8; 32] {
+    #[inline]
+    fn connect<'d, const ID: u8, H: Handler<ID>>(
+        self,
+        endpoint: Pin<&mut PooledEndpoint<'d, 'tls, ID, H>>,
+        addr: SocketAddr,
+        config: conn::config::Options,
+        dcid: ConnectionId,
+    ) -> Result<Handle, crate::ConnectError> {
+        endpoint.connect_with_config_id(addr, self, config, dcid)
+    }
+}
+
+impl authority::Sealed for &conn::tls::ClientPool {}
+
+impl<'tls> EndpointAuthority<'tls> for &'tls conn::tls::ClientPool {
+    #[inline]
+    fn connect<'d, const ID: u8, H: Handler<ID>>(
+        self,
+        endpoint: Pin<&mut PooledEndpoint<'d, 'tls, ID, H>>,
+        addr: SocketAddr,
+        config: conn::config::Options,
+        dcid: ConnectionId,
+    ) -> Result<Handle, crate::ConnectError> {
+        endpoint.connect_pooled_with_config_id(addr, self, config, dcid)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,9 +127,9 @@ pub struct PathStats {
     pub bytes_in_flight: u64,
 }
 
-struct EndpointSlot {
+struct EndpointSlot<A> {
     addr: SocketAddr,
-    pubkey: [u8; 32],
+    authority: A,
     handle: Option<Handle>,
     attempt: u32,
 }
@@ -91,8 +143,8 @@ struct Binding {
 struct Bridge<P: Protocol> {
     protocol: P,
     handle_to_slot: Box<[Option<Binding>]>,
-    pending_close: SlotQueue<Binding>,
-    pending_established: SlotQueue<Binding>,
+    pending_close: Fifo<Binding>,
+    pending_established: Fifo<Binding>,
 }
 
 impl<P: Protocol> Bridge<P> {
@@ -125,25 +177,29 @@ impl<P: Protocol> Bridge<P> {
     }
 }
 
-impl<P: Protocol> Handler for Bridge<P> {
+impl<const DOMAIN: u8, P: Protocol> Handler<DOMAIN> for Bridge<P> {
     type Connection = ();
 
-    fn create_connection(&mut self, _conn: &mut Connection, _handle: Handle) {}
+    fn create_connection(&mut self, _conn: &mut Connection<DOMAIN>, _handle: Handle) {}
 
-    fn established(&mut self, _connection: &mut (), _conn: &mut Connection, handle: Handle) {
+    fn established(
+        &mut self,
+        _connection: &mut (),
+        _conn: &mut Connection<DOMAIN>,
+        handle: Handle,
+    ) {
         if let Some(slot) = self.lookup_slot(handle) {
             let binding = Binding { handle, slot };
             if let Some(entry) = self.pending_established.vacant_entry(slot.index() as usize) {
                 entry.push_back(binding);
             }
-            self.protocol.connect(slot);
         }
     }
 
     fn datagram(
         &mut self,
         _connection: &mut (),
-        _conn: &mut Connection,
+        _conn: &mut Connection<DOMAIN>,
         handle: Handle,
         data: Vec<u8>,
     ) {
@@ -164,12 +220,19 @@ impl<P: Protocol> Handler for Bridge<P> {
 }
 
 #[pin_project]
-pub struct Client<'d, const ID: u8, P: Protocol, B: BackoffPolicy, C: ConfigProvider = StaticConfig>
-{
+pub struct ClientInner<
+    'd,
+    'tls,
+    const ID: u8,
+    P: Protocol,
+    B: BackoffPolicy,
+    A: EndpointAuthority<'tls>,
+    C: ConfigProvider = StaticConfig,
+> {
     #[pin]
-    inner: Endpoint<'d, ID, Bridge<P>>,
-    endpoints: Vec<EndpointSlot>,
-    retries: IndexedMinHeap<Instant>,
+    inner: PooledEndpoint<'d, 'tls, ID, Bridge<P>>,
+    endpoints: Vec<EndpointSlot<A>>,
+    retries: Min<Instant>,
     backoff: B,
     config_provider: C,
     event_budget: usize,
@@ -177,15 +240,112 @@ pub struct Client<'d, const ID: u8, P: Protocol, B: BackoffPolicy, C: ConfigProv
     dcid_seed: u64,
 }
 
-impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Client<'d, ID, P, B, StaticConfig> {
+pub type Client<'d, const ID: u8, P, B, C = StaticConfig> =
+    ClientInner<'d, 'static, ID, P, B, [u8; 32], C>;
+
+/// High-level client whose active TLS handshakes cannot outlive their pools.
+///
+/// ```compile_fail
+/// use dope_quic::client::{BackoffPolicy, ConfigProvider, PooledClient, Protocol};
+///
+/// fn erase_pool_lifetime<'d, 'tls, const ID: u8, P, B, C>(
+///     client: PooledClient<'d, 'tls, ID, P, B, C>,
+/// ) -> PooledClient<'d, 'static, ID, P, B, C>
+/// where
+///     P: Protocol,
+///     B: BackoffPolicy,
+///     C: ConfigProvider,
+/// {
+///     client
+/// }
+/// ```
+pub type PooledClient<'d, 'tls, const ID: u8, P, B, C = StaticConfig> =
+    ClientInner<'d, 'tls, ID, P, B, &'tls conn::tls::ClientPool, C>;
+
+/// Lifecycle-preserving client operations for one application step.
+pub struct ControlInner<'step, 'd, 'tls, const ID: u8, P, B, A, C = StaticConfig>
+where
+    'd: 'step,
+    P: Protocol,
+    B: BackoffPolicy,
+    A: EndpointAuthority<'tls>,
+    C: ConfigProvider,
+{
+    inner: Pin<&'step mut ClientInner<'d, 'tls, ID, P, B, A, C>>,
+}
+
+pub type Control<'step, 'd, const ID: u8, P, B, C = StaticConfig> =
+    ControlInner<'step, 'd, 'static, ID, P, B, [u8; 32], C>;
+
+pub type PooledControl<'step, 'd, 'tls, const ID: u8, P, B, C = StaticConfig> =
+    ControlInner<'step, 'd, 'tls, ID, P, B, &'tls conn::tls::ClientPool, C>;
+
+impl<'step, 'd, 'tls, const ID: u8, P, B, A, C> ControlInner<'step, 'd, 'tls, ID, P, B, A, C>
+where
+    'd: 'step,
+    P: Protocol,
+    B: BackoffPolicy,
+    A: EndpointAuthority<'tls>,
+    C: ConfigProvider,
+{
+    pub fn protocol(&self) -> &P {
+        self.inner.as_ref().get_ref().protocol()
+    }
+
+    pub fn protocol_control(&mut self) -> <P as ControlProtocol>::Control<'_>
+    where
+        P: ControlProtocol,
+    {
+        let protocol = self.inner.as_mut().protocol_mut();
+        // SAFETY: this is the exact protocol installed beneath the client and
+        // the returned control cannot outlive this exclusive step borrow.
+        unsafe { P::control(protocol) }
+    }
+
+    pub fn smoothed_rtt(&self, slot: SlotId) -> Option<Duration> {
+        self.inner.as_ref().get_ref().smoothed_rtt(slot)
+    }
+
+    pub fn path_stats(&self, slot: SlotId) -> Option<PathStats> {
+        self.inner.as_ref().get_ref().path_stats(slot)
+    }
+
+    pub fn try_send_datagram(
+        &mut self,
+        slot: SlotId,
+        data: Vec<u8>,
+    ) -> Result<(), TrySendError<Vec<u8>>> {
+        self.inner.as_mut().try_send_datagram(slot, data)
+    }
+}
+
+/// Restricted coordinate view supplied by a client protocol.
+///
+/// # Safety
+/// `Control` must not expose an operation that moves, replaces, or drops
+/// driver-branded retained storage owned by the protocol.
+pub unsafe trait ControlProtocol: Protocol {
+    type Control<'step>
+    where
+        Self: 'step;
+
+    /// # Safety
+    /// `protocol` must be the protocol installed beneath its live client and
+    /// no client lifecycle phase may overlap the returned control.
+    unsafe fn control<'step>(protocol: &'step mut Self) -> Self::Control<'step>;
+}
+
+impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy>
+    ClientInner<'d, 'static, ID, P, B, [u8; 32], StaticConfig>
+{
     pub fn build(
         bind: SocketAddr,
         endpoints: Vec<EndpointSpec>,
-        client_config: conn::Config,
+        client_config: conn::config::Options,
         protocol: P,
         backoff: B,
         config: Config,
-        driver: &mut DriverContext<'_, 'd>,
+        driver: &mut Context<'_, 'd>,
     ) -> io::Result<Self> {
         client_config
             .validate()
@@ -205,7 +365,7 @@ impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy> Client<'d, ID, P, B, Stati
     }
 }
 
-impl<'d, const ID: u8, P, B, C> Client<'d, ID, P, B, C>
+impl<'d, const ID: u8, P, B, C> ClientInner<'d, 'static, ID, P, B, [u8; 32], C>
 where
     P: Protocol,
     B: BackoffPolicy,
@@ -218,7 +378,111 @@ where
         protocol: P,
         backoff: B,
         config: Config,
-        driver: &mut DriverContext<'_, 'd>,
+        driver: &mut Context<'_, 'd>,
+    ) -> io::Result<Self> {
+        let endpoints = endpoints
+            .into_iter()
+            .map(|endpoint| EndpointSlot {
+                addr: endpoint.addr,
+                authority: endpoint.pubkey,
+                handle: None,
+                attempt: 0,
+            })
+            .collect();
+        Self::build_inner(
+            bind,
+            endpoints,
+            config_provider,
+            protocol,
+            backoff,
+            config,
+            driver,
+        )
+    }
+}
+
+impl<'d, 'tls, const ID: u8, P: Protocol, B: BackoffPolicy>
+    ClientInner<'d, 'tls, ID, P, B, &'tls conn::tls::ClientPool, StaticConfig>
+{
+    pub fn build_pooled(
+        bind: SocketAddr,
+        endpoints: Vec<PooledEndpointSpec<'tls>>,
+        client_config: conn::config::Options,
+        protocol: P,
+        backoff: B,
+        config: Config,
+        driver: &mut Context<'_, 'd>,
+    ) -> io::Result<Self> {
+        client_config
+            .validate_pooled_client()
+            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+        client_config
+            .duplicate_connection()
+            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+        Self::build_pooled_with_config_provider(
+            bind,
+            endpoints,
+            StaticConfig(client_config),
+            protocol,
+            backoff,
+            config,
+            driver,
+        )
+    }
+}
+
+impl<'d, 'tls, const ID: u8, P, B, C>
+    ClientInner<'d, 'tls, ID, P, B, &'tls conn::tls::ClientPool, C>
+where
+    P: Protocol,
+    B: BackoffPolicy,
+    C: ConfigProvider,
+{
+    pub fn build_pooled_with_config_provider(
+        bind: SocketAddr,
+        endpoints: Vec<PooledEndpointSpec<'tls>>,
+        config_provider: C,
+        protocol: P,
+        backoff: B,
+        config: Config,
+        driver: &mut Context<'_, 'd>,
+    ) -> io::Result<Self> {
+        let endpoints = endpoints
+            .into_iter()
+            .map(|endpoint| EndpointSlot {
+                addr: endpoint.addr,
+                authority: endpoint.pool,
+                handle: None,
+                attempt: 0,
+            })
+            .collect();
+        Self::build_inner(
+            bind,
+            endpoints,
+            config_provider,
+            protocol,
+            backoff,
+            config,
+            driver,
+        )
+    }
+}
+
+impl<'d, 'tls, const ID: u8, P, B, A, C> ClientInner<'d, 'tls, ID, P, B, A, C>
+where
+    P: Protocol,
+    B: BackoffPolicy,
+    A: EndpointAuthority<'tls>,
+    C: ConfigProvider,
+{
+    fn build_inner(
+        bind: SocketAddr,
+        endpoints: Vec<EndpointSlot<A>>,
+        config_provider: C,
+        protocol: P,
+        backoff: B,
+        config: Config,
+        driver: &mut Context<'_, 'd>,
     ) -> io::Result<Self> {
         let endpoint_config = config.endpoint.validate()?;
         if config.event_budget == 0
@@ -245,26 +509,17 @@ where
         let bridge = Bridge {
             protocol,
             handle_to_slot: vec![None; capacity].into_boxed_slice(),
-            pending_close: SlotQueue::with_capacity(capacity),
-            pending_established: SlotQueue::with_capacity(capacity),
+            pending_close: Fifo::with_capacity(capacity),
+            pending_established: Fifo::with_capacity(capacity),
         };
-        let inner = Endpoint::build_client(bind, bridge, endpoint_config, driver)?;
+        let inner = PooledEndpoint::build_client_pooled(bind, bridge, endpoint_config, driver)?;
         let now = Instant::now();
-        let mut retries = IndexedMinHeap::with_capacity(capacity);
+        let mut retries = Min::with_capacity(capacity);
         for index in 0..capacity {
             retries
                 .insert(index, now)
                 .map_err(|_| Error::other("QUIC retry scheduler capacity mismatch"))?;
         }
-        let endpoints = endpoints
-            .into_iter()
-            .map(|e| EndpointSlot {
-                addr: e.addr,
-                pubkey: e.pubkey,
-                handle: None,
-                attempt: 0,
-            })
-            .collect();
         Ok(Self {
             inner,
             endpoints,
@@ -281,7 +536,7 @@ where
         &self.inner.handler().protocol
     }
 
-    pub fn protocol_mut(self: Pin<&mut Self>) -> &mut P {
+    pub(crate) fn protocol_mut(self: Pin<&mut Self>) -> &mut P {
         &mut self.project().inner.handler_mut().protocol
     }
 
@@ -303,7 +558,7 @@ where
     /// Smoothed RTT of the QUIC connection on `slot`, if connected.
     pub fn smoothed_rtt(&self, slot: SlotId) -> Option<Duration> {
         let handle = self.endpoints.get(slot.index() as usize)?.handle?;
-        self.inner.conn(handle)?.smoothed_rtt()
+        self.inner.conn(handle)?.status().smoothed_rtt()
     }
 
     /// Current path statistics for the QUIC connection on `slot`, if connected.
@@ -311,10 +566,10 @@ where
         let handle = self.endpoints.get(slot.index() as usize)?.handle?;
         let conn = self.inner.conn(handle)?;
         Some(PathStats {
-            srtt: conn.smoothed_rtt(),
-            min_rtt: conn.min_rtt(),
-            cwnd: conn.cwnd(),
-            bytes_in_flight: conn.bytes_in_flight(),
+            srtt: conn.status().smoothed_rtt(),
+            min_rtt: conn.status().min_rtt(),
+            cwnd: conn.status().congestion_window(),
+            bytes_in_flight: conn.status().bytes_in_flight(),
         })
     }
 
@@ -350,13 +605,15 @@ where
     fn try_connect(self: Pin<&mut Self>, slot: SlotId) -> bool {
         let mut this = self.project();
         let index = slot.index() as usize;
-        let (addr, pubkey) = match this.endpoints.get(index) {
-            Some(endpoint) if endpoint.handle.is_none() => (endpoint.addr, endpoint.pubkey),
+        let (addr, authority) = match this.endpoints.get(index) {
+            Some(endpoint) if endpoint.handle.is_none() => (endpoint.addr, endpoint.authority),
             None => return false,
             Some(_) => return false,
         };
         *this.dcid_seed = this.dcid_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let dcid = this.dcid_seed.to_be_bytes().to_vec();
+        let Ok(dcid) = ConnectionId::try_from(this.dcid_seed.to_be_bytes()) else {
+            return false;
+        };
         let Some(config) = this.config_provider.config(slot) else {
             if let Some(endpoint) = this.endpoints.get_mut(index) {
                 endpoint.attempt = endpoint.attempt.saturating_add(1);
@@ -366,11 +623,8 @@ where
             }
             return false;
         };
-        let Ok(handle) = this
-            .inner
-            .as_mut()
-            .connect_with_config(addr, pubkey, config, dcid)
-        else {
+        let connection = authority.connect(this.inner.as_mut(), addr, config, dcid);
+        let Ok(handle) = connection else {
             if let Some(endpoint) = this.endpoints.get_mut(index) {
                 endpoint.attempt = endpoint.attempt.saturating_add(1);
                 let retry_at = this.backoff.next_retry_at(endpoint.attempt, Instant::now());
@@ -393,102 +647,5 @@ where
             let _ = this.retries.insert(index, retry_at);
         }
         false
-    }
-}
-
-impl<'d, const ID: u8, P, B, C> Manifold<'d> for Client<'d, ID, P, B, C>
-where
-    P: Protocol,
-    B: BackoffPolicy,
-    C: ConfigProvider,
-{
-    const ID: u8 = ID;
-
-    fn dispatch(mut self: Pin<&mut Self>, ev: dope::Event<'d>, driver: &mut DriverContext<'_, 'd>) {
-        self.as_mut().project().inner.dispatch(ev, driver);
-    }
-
-    fn pre_park(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
-        let mut this_client = self.as_mut();
-        this_client.as_mut().project().inner.flush_pending(driver);
-        let now = Instant::now();
-        {
-            let mut this = this_client.as_mut().project();
-            let mut remaining = *this.event_budget;
-            while remaining != 0 {
-                let Some(binding) = this.inner.as_mut().handler_mut().pending_close.pop_front()
-                else {
-                    break;
-                };
-                remaining -= 1;
-                let index = binding.slot.index() as usize;
-                if let Some(endpoint) = this.endpoints.get_mut(index)
-                    && endpoint.handle == Some(binding.handle)
-                {
-                    endpoint.handle = None;
-                    endpoint.attempt = endpoint.attempt.saturating_add(1);
-                    let retry_at = this.backoff.next_retry_at(endpoint.attempt, now);
-                    this.retries.remove(index);
-                    let _ = this.retries.insert(index, retry_at);
-                }
-            }
-            while remaining != 0 {
-                let Some(binding) = this
-                    .inner
-                    .as_mut()
-                    .handler_mut()
-                    .pending_established
-                    .pop_front()
-                else {
-                    break;
-                };
-                remaining -= 1;
-                if let Some(endpoint) = this.endpoints.get_mut(binding.slot.index() as usize)
-                    && endpoint.handle == Some(binding.handle)
-                {
-                    endpoint.attempt = 0;
-                }
-            }
-        }
-        let mut connected = false;
-        let mut remaining = *this_client.as_ref().project_ref().retry_budget;
-        while remaining != 0 {
-            let due = {
-                let this = this_client.as_mut().project();
-                match this.retries.peek() {
-                    Some((_, retry_at)) if *retry_at <= now => this.retries.pop().map(|(i, _)| i),
-                    _ => None,
-                }
-            };
-            let Some(index) = due else { break };
-            remaining -= 1;
-            connected |= this_client
-                .as_mut()
-                .try_connect(SlotId::from_index(index as u32));
-        }
-        if connected {
-            this_client.project().inner.flush_pending(driver);
-        }
-    }
-
-    fn idle(self: Pin<&Self>, _region: &RegionToken<'d>) -> Idle {
-        let client = self.as_ref();
-        let this = client.project_ref();
-        if !this.inner.handler().pending_close.is_empty()
-            || !this.inner.handler().pending_established.is_empty()
-        {
-            return Idle::Busy;
-        }
-        match this.inner.get_ref().idle() {
-            Idle::Busy => Idle::Busy,
-            Idle::Park(deadline) => {
-                let retry = this.retries.peek().map(|(_, retry)| *retry);
-                Idle::Park(match (deadline, retry) {
-                    (Some(left), Some(right)) => Some(left.min(right)),
-                    (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-                    (None, None) => None,
-                })
-            }
-        }
     }
 }

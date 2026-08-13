@@ -2,7 +2,7 @@ use dope_quic::conn::server;
 use dope_quic::packet::{InitialHeader, QUIC_V1};
 use dope_quic::packet_protection::PacketProtection;
 use dope_quic::qkdf::{InitialSecrets, PacketKeys};
-use dope_quic::{Connection, conn, transport_params};
+use dope_quic::{conn, conn::session::Connection, transport_params};
 use shin::crypto::sig::SigningKey;
 use shin::server::{config::ClientCertVerifier, config::EarlyDataGuard};
 use std::time::Instant;
@@ -11,7 +11,7 @@ pub fn signing_key(seed: u8) -> SigningKey {
     SigningKey::from_seed(&[seed; 32]).unwrap()
 }
 
-pub fn config() -> conn::Config {
+pub fn config() -> conn::config::Options {
     config_with_credit(1 << 20, 1 << 20, 8, 8)
 }
 
@@ -20,8 +20,8 @@ pub fn config_with_credit(
     connection_credit: u64,
     bidi_streams: u64,
     uni_streams: u64,
-) -> conn::Config {
-    conn::Config {
+) -> conn::config::Options {
+    conn::config::Options {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
             max_datagram_frame_size: Some(65_535),
@@ -39,12 +39,12 @@ pub fn config_with_credit(
 }
 
 pub trait Receiver {
-    fn receive(&mut self, packet: &mut [u8], now: Instant);
+    fn receive(&mut self, workspace: &mut conn::ReceiveWorkspace, packet: &mut [u8], now: Instant);
 }
 
 impl Receiver for Connection {
-    fn receive(&mut self, packet: &mut [u8], now: Instant) {
-        self.recv_packet(packet, now).unwrap();
+    fn receive(&mut self, workspace: &mut conn::ReceiveWorkspace, packet: &mut [u8], now: Instant) {
+        self.recv_packet(workspace, packet, now).unwrap();
     }
 }
 
@@ -53,23 +53,23 @@ where
     G: EarlyDataGuard,
     V: ClientCertVerifier,
 {
-    fn receive(&mut self, packet: &mut [u8], now: Instant) {
-        self.recv_packet(packet, now).unwrap();
+    fn receive(&mut self, workspace: &mut conn::ReceiveWorkspace, packet: &mut [u8], now: Instant) {
+        self.recv_packet(workspace, packet, now).unwrap();
     }
 }
 
-pub fn connected_pair() -> (server::Connection, Connection) {
+pub fn connected_pair() -> (server::Connection, Connection, conn::ReceiveWorkspace) {
     connected_pair_with(config(), config())
 }
 
 pub fn connected_pair_with(
-    server_config: conn::Config,
-    client_config: conn::Config,
-) -> (server::Connection, Connection) {
+    server_config: conn::config::Options,
+    client_config: conn::config::Options,
+) -> (server::Connection, Connection, conn::ReceiveWorkspace) {
     let cid = vec![0x71; 8];
     let signing = signing_key(0x39);
     let public_key = *signing.pubkey().unwrap();
-    let mut server = Connection::new_server(
+    let mut server = dope_quic::conn::setup::Server::<0>::accept(
         cid.clone(),
         cid.clone(),
         cid.clone(),
@@ -77,19 +77,27 @@ pub fn connected_pair_with(
         server_config,
     )
     .unwrap();
-    let mut client = Connection::new_client(cid.clone(), cid, public_key, client_config).unwrap();
+    let mut client =
+        dope_quic::conn::setup::Client::<0>::connect(cid.clone(), cid, public_key, client_config)
+            .unwrap();
     let now = Instant::now();
+    let mut workspace = conn::ReceiveWorkspace::new();
     for _ in 0..6 {
-        transfer(&mut client, &mut server, now);
-        transfer(&mut server, &mut client, now);
+        transfer(&mut workspace, &mut client, &mut server, now);
+        transfer(&mut workspace, &mut server, &mut client, now);
     }
-    assert!(client.is_established() && server.is_established());
-    (server, client)
+    assert!(client.status().is_established() && server.status().is_established());
+    (server, client, workspace)
 }
 
-pub fn transfer<R: Receiver>(from: &mut Connection, into: &mut R, now: Instant) {
-    for mut packet in from.send_packets(now) {
-        into.receive(&mut packet, now);
+pub fn transfer<R: Receiver>(
+    workspace: &mut conn::ReceiveWorkspace,
+    from: &mut Connection,
+    into: &mut R,
+    now: Instant,
+) {
+    for mut packet in from.transmit().send(now) {
+        into.receive(workspace, &mut packet, now);
     }
 }
 

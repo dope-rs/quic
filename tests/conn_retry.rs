@@ -4,8 +4,10 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use dope_quic::conn::Error;
-use dope_quic::packet::{InitialHeader, QUIC_V1, RetryPacket};
-use dope_quic::{Connection, Handler, Mux, conn};
+use dope_quic::packet::{
+    ConnectionIdRef, InitialHeader, QUIC_V1, RetryPacket, RetryPacketRef, VerifiedRetry,
+};
+use dope_quic::{Handler, Mux, conn, conn::session::Connection};
 
 #[test]
 fn rfc9001_a4_vector_round_trips() {
@@ -24,7 +26,7 @@ fn rfc9001_a4_vector_round_trips() {
 }
 
 struct NoopHandler;
-impl Handler for NoopHandler {
+impl Handler<0> for NoopHandler {
     type Connection = ();
 
     fn create_connection(&mut self, _conn: &mut Connection, _handle: dope_quic::conn::Handle) {}
@@ -32,12 +34,12 @@ impl Handler for NoopHandler {
 
 fn server_mux_with_retry(retry_secret: [u8; 32]) -> Mux<NoopHandler> {
     let signing = support::signing_key(0x39);
-    let cfg = conn::Config {
+    let cfg = conn::config::Options {
         require_address_validation: true,
         retry_token_secret: Some(retry_secret),
         ..Default::default()
     };
-    Mux::server(NoopHandler, signing, cfg).unwrap()
+    dope_quic::mux::setup::Server::accept(NoopHandler, signing, cfg).unwrap()
 }
 
 fn craft_initial(dcid: &[u8], scid: &[u8], token: &[u8]) -> Vec<u8> {
@@ -55,6 +57,23 @@ fn craft_initial(dcid: &[u8], scid: &[u8], token: &[u8]) -> Vec<u8> {
     wire
 }
 
+fn verify_retry<'wire, 'storage>(
+    wire: &'wire [u8],
+    original_dcid: &[u8],
+    expected_dcid: &[u8],
+    storage: &'storage mut Vec<u8>,
+) -> VerifiedRetry<'wire, 'storage> {
+    RetryPacketRef::decode(wire)
+        .unwrap()
+        .verify_into(
+            ConnectionIdRef::new(original_dcid).unwrap(),
+            ConnectionIdRef::new(expected_dcid).unwrap(),
+            storage,
+        )
+        .unwrap()
+        .expect("Retry integrity and destination binding")
+}
+
 #[test]
 fn first_initial_without_token_triggers_retry() {
     let secret = [0xA1u8; 32];
@@ -65,19 +84,26 @@ fn first_initial_without_token_triggers_retry() {
     let mut initial = craft_initial(&client_dcid, &client_scid, &[]);
 
     let from: SocketAddr = "127.0.0.1:55001".parse().unwrap();
-    mux.recv(from, &mut initial, Instant::now()).unwrap();
+    mux.protocol()
+        .recv(from, &mut initial, Instant::now())
+        .unwrap();
 
-    let outgoing: Vec<_> = mux.drain_outgoing().collect();
+    let outgoing: Vec<_> = mux.output().drain().collect();
     assert_eq!(outgoing.len(), 1, "exactly one Retry should be emitted");
     let (dst, retry_wire) = (outgoing[0].addr(), outgoing[0].payload());
     assert_eq!(dst, from);
-    let retry = RetryPacket::decode(retry_wire).expect("decode Retry");
-    assert_eq!(retry.dcid, client_scid, "retry DCID echoes client's SCID");
-    assert!(
-        retry.verify_integrity(&client_dcid),
-        "tag must verify with the original DCID",
+    let retry = RetryPacketRef::decode(retry_wire).expect("decode Retry");
+    assert_eq!(
+        retry.destination_connection_id(),
+        client_scid,
+        "retry DCID echoes client's SCID"
     );
-    assert!(!retry.token.is_empty(), "retry must carry a server token");
+    let mut token = Vec::new();
+    let verified = verify_retry(retry_wire, &client_dcid, &client_scid, &mut token);
+    assert!(
+        !verified.token().is_empty(),
+        "retry must carry a server token"
+    );
 }
 
 #[test]
@@ -90,15 +116,25 @@ fn second_initial_with_valid_token_does_not_re_retry() {
     let from: SocketAddr = "127.0.0.1:55002".parse().unwrap();
 
     let mut first_initial = craft_initial(&client_dcid, &client_scid, &[]);
-    mux.recv(from, &mut first_initial, Instant::now()).unwrap();
-    let first_out: Vec<_> = mux.drain_outgoing().collect();
-    let retry = RetryPacket::decode(first_out[0].payload()).unwrap();
-    let token = retry.token.clone();
-    let new_dcid = retry.scid;
+    mux.protocol()
+        .recv(from, &mut first_initial, Instant::now())
+        .unwrap();
+    let first_out: Vec<_> = mux.output().drain().collect();
+    let mut token_storage = Vec::new();
+    let retry = verify_retry(
+        first_out[0].payload(),
+        &client_dcid,
+        &client_scid,
+        &mut token_storage,
+    );
+    let token = retry.token().to_vec();
+    let new_dcid = retry.source_connection_id();
 
-    let mut second_initial = craft_initial(&new_dcid, &client_scid, &token);
-    let _ = mux.recv(from, &mut second_initial, Instant::now());
-    let second_out: Vec<_> = mux.drain_outgoing().collect();
+    let mut second_initial = craft_initial(new_dcid.as_slice(), &client_scid, &token);
+    let _ = mux
+        .protocol()
+        .recv(from, &mut second_initial, Instant::now());
+    let second_out: Vec<_> = mux.output().drain().collect();
     for out in &second_out {
         let wire = out.payload();
         let is_retry = matches!(wire.first(), Some(b) if b & 0xF0 == 0xF0);
@@ -120,15 +156,25 @@ fn second_initial_with_wrong_addr_is_rejected() {
     let from_b: SocketAddr = "127.0.0.1:55004".parse().unwrap();
 
     let mut first_initial = craft_initial(&client_dcid, &client_scid, &[]);
-    mux.recv(from_a, &mut first_initial, Instant::now())
+    mux.protocol()
+        .recv(from_a, &mut first_initial, Instant::now())
         .unwrap();
-    let retry = RetryPacket::decode(mux.drain_outgoing().next().unwrap().payload()).unwrap();
-    let token = retry.token;
-    let new_dcid = retry.scid;
+    let retry_packet = mux.output().drain().next().unwrap();
+    let mut token_storage = Vec::new();
+    let retry = verify_retry(
+        retry_packet.payload(),
+        &client_dcid,
+        &client_scid,
+        &mut token_storage,
+    );
+    let token = retry.token().to_vec();
+    let new_dcid = retry.source_connection_id();
 
-    let mut second_initial = craft_initial(&new_dcid, &client_scid, &token);
-    let _ = mux.recv(from_b, &mut second_initial, Instant::now());
-    let out: Vec<_> = mux.drain_outgoing().collect();
+    let mut second_initial = craft_initial(new_dcid.as_slice(), &client_scid, &token);
+    let _ = mux
+        .protocol()
+        .recv(from_b, &mut second_initial, Instant::now());
+    let out: Vec<_> = mux.output().drain().collect();
     assert!(
         out.is_empty(),
         "address-bound token mismatch must drop the packet silently"
@@ -138,12 +184,17 @@ fn second_initial_with_wrong_addr_is_rejected() {
 #[test]
 fn retry_off_by_default_lets_initials_through() {
     let signing = support::signing_key(0x39);
-    let mut mux = Mux::server(NoopHandler, signing, conn::Config::default()).unwrap();
+    let mut mux = dope_quic::mux::setup::Server::accept(
+        NoopHandler,
+        signing,
+        conn::config::Options::default(),
+    )
+    .unwrap();
 
     let mut initial = craft_initial(&[0u8; 8], &[1u8; 8], &[]);
     let from: SocketAddr = "127.0.0.1:55005".parse().unwrap();
-    let _ = mux.recv(from, &mut initial, Instant::now());
-    let out: Vec<_> = mux.drain_outgoing().collect();
+    let _ = mux.protocol().recv(from, &mut initial, Instant::now());
+    let out: Vec<_> = mux.output().drain().collect();
     for o in &out {
         let wire = o.payload();
         let is_retry = matches!(wire.first(), Some(b) if b & 0xF0 == 0xF0);
@@ -154,11 +205,11 @@ fn retry_off_by_default_lets_initials_through() {
 const CLIENT_LOCAL_CID: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
 
 fn client_with_initial_dcid(initial_dcid: &[u8]) -> Connection {
-    Connection::new_client(
+    dope_quic::conn::setup::Client::<0>::connect(
         initial_dcid.to_vec(),
         CLIENT_LOCAL_CID.to_vec(),
         [0xABu8; 32],
-        conn::Config::default(),
+        conn::config::Options::default(),
     )
     .unwrap()
 }
@@ -179,8 +230,9 @@ fn craft_retry_for(odcid: &[u8], echo_dcid: &[u8], new_scid: &[u8], token: &[u8]
 fn client_accepts_retry_and_resends_initial_with_token() {
     let original_dcid = vec![0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
     let mut client = client_with_initial_dcid(&original_dcid);
+    let mut workspace = conn::ReceiveWorkspace::new();
 
-    let first = client.send_packets(Instant::now());
+    let first = client.transmit().send(Instant::now());
     assert!(!first.is_empty(), "client must emit its first Initial");
 
     let new_scid = vec![0xF0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5];
@@ -188,10 +240,10 @@ fn client_accepts_retry_and_resends_initial_with_token() {
     let mut retry_wire = craft_retry_for(&original_dcid, &CLIENT_LOCAL_CID, &new_scid, &token);
 
     client
-        .recv_packet(&mut retry_wire, Instant::now())
+        .recv_packet(&mut workspace, &mut retry_wire, Instant::now())
         .expect("recv retry");
 
-    let second = client.send_packets(Instant::now());
+    let second = client.transmit().send(Instant::now());
     assert!(!second.is_empty(), "client must resend Initial after Retry");
     let prefix = InitialHeader::decode_pre_hp(&second[0]).expect("decode reissued initial");
     assert_eq!(prefix.dcid, new_scid, "client must swap DCID to retry.scid");
@@ -207,7 +259,8 @@ fn client_accepts_retry_and_resends_initial_with_token() {
 fn client_drops_retry_with_invalid_integrity() {
     let original_dcid = vec![0xAAu8; 8];
     let mut client = client_with_initial_dcid(&original_dcid);
-    let _ = client.send_packets(Instant::now());
+    let mut workspace = conn::ReceiveWorkspace::new();
+    let _ = client.transmit().send(Instant::now());
 
     let new_scid = vec![0x55u8; 8];
     let token = b"tok".to_vec();
@@ -215,9 +268,11 @@ fn client_drops_retry_with_invalid_integrity() {
     let n = wire.len();
     wire[n - 1] ^= 0xFF;
 
-    client.recv_packet(&mut wire, Instant::now()).expect("recv");
+    client
+        .recv_packet(&mut workspace, &mut wire, Instant::now())
+        .expect("recv");
 
-    let next = client.send_packets(Instant::now());
+    let next = client.transmit().send(Instant::now());
     for w in &next {
         let prefix = InitialHeader::decode_pre_hp(w).expect("decode");
         assert_ne!(prefix.dcid, new_scid, "rejected Retry must not swap DCID");
@@ -229,10 +284,33 @@ fn client_drops_retry_with_invalid_integrity() {
 }
 
 #[test]
+fn client_drops_authenticated_retry_for_another_connection() {
+    let original_dcid = vec![0xA5; 8];
+    let mut client = client_with_initial_dcid(&original_dcid);
+    let mut workspace = conn::ReceiveWorkspace::new();
+    let _ = client.transmit().send(Instant::now());
+
+    let new_scid = vec![0x5A; 8];
+    let token = b"valid-tag-wrong-destination".to_vec();
+    let mut wire = craft_retry_for(&original_dcid, &[0x99; 8], &new_scid, &token);
+
+    client
+        .recv_packet(&mut workspace, &mut wire, Instant::now())
+        .unwrap();
+
+    for wire in client.transmit().send(Instant::now()) {
+        let prefix = InitialHeader::decode_pre_hp(&wire).unwrap();
+        assert_ne!(prefix.dcid, new_scid);
+        assert!(prefix.token.is_empty());
+    }
+}
+
+#[test]
 fn client_ignores_second_retry() {
     let original_dcid = vec![0xCCu8; 8];
     let mut client = client_with_initial_dcid(&original_dcid);
-    let _ = client.send_packets(Instant::now());
+    let mut workspace = conn::ReceiveWorkspace::new();
+    let _ = client.transmit().send(Instant::now());
 
     let scid_a = vec![0x10u8; 8];
     let scid_b = vec![0x20u8; 8];
@@ -240,12 +318,16 @@ fn client_ignores_second_retry() {
     let token_b = b"second-token".to_vec();
 
     let mut retry_a = craft_retry_for(&original_dcid, &CLIENT_LOCAL_CID, &scid_a, &token_a);
-    client.recv_packet(&mut retry_a, Instant::now()).unwrap();
+    client
+        .recv_packet(&mut workspace, &mut retry_a, Instant::now())
+        .unwrap();
 
     let mut retry_b = craft_retry_for(&original_dcid, &CLIENT_LOCAL_CID, &scid_b, &token_b);
-    client.recv_packet(&mut retry_b, Instant::now()).unwrap();
+    client
+        .recv_packet(&mut workspace, &mut retry_b, Instant::now())
+        .unwrap();
 
-    let next = client.send_packets(Instant::now());
+    let next = client.transmit().send(Instant::now());
     let prefix = InitialHeader::decode_pre_hp(&next[0]).expect("decode");
     assert_eq!(
         prefix.dcid, scid_a,
@@ -257,18 +339,19 @@ fn client_ignores_second_retry() {
 #[test]
 fn retry_token_that_cannot_fit_active_initial_ceiling_closes_without_panic() {
     let original_dcid = vec![0xceu8; 8];
-    let config = conn::Config {
+    let config = conn::config::Options {
         max_pmtu: 1200,
         ..Default::default()
     };
-    let mut client = Connection::new_client(
+    let mut client = dope_quic::conn::setup::Client::<0>::connect(
         original_dcid.clone(),
         CLIENT_LOCAL_CID.to_vec(),
         [0xabu8; 32],
         config,
     )
     .unwrap();
-    assert_eq!(client.send_packets(Instant::now()).len(), 1);
+    let mut workspace = conn::ReceiveWorkspace::new();
+    assert_eq!(client.transmit().send(Instant::now()).len(), 1);
 
     let mut retry = craft_retry_for(
         &original_dcid,
@@ -277,10 +360,10 @@ fn retry_token_that_cannot_fit_active_initial_ceiling_closes_without_panic() {
         &vec![0x91; 1200],
     );
     assert_eq!(
-        client.recv_packet(&mut retry, Instant::now()),
+        client.recv_packet(&mut workspace, &mut retry, Instant::now()),
         Err(Error::PacketCeiling)
     );
-    assert!(client.is_closed());
+    assert!(client.status().is_closed());
 }
 
 fn hex_decode(s: &str) -> Vec<u8> {

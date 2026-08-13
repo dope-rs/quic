@@ -4,12 +4,12 @@ struct BorrowedHandler<'a> {
     state: &'a u64,
 }
 
-impl Handler for BorrowedHandler<'_> {
+impl Handler<0> for BorrowedHandler<'_> {
     type Connection = ();
 
     fn create_connection(
         &mut self,
-        _conn: &mut dope_quic::Connection,
+        _conn: &mut dope_quic::conn::session::Connection,
         _handle: dope_quic::conn::Handle,
     ) {
     }
@@ -17,7 +17,7 @@ impl Handler for BorrowedHandler<'_> {
     fn established(
         &mut self,
         _connection: &mut (),
-        _conn: &mut dope_quic::Connection,
+        _conn: &mut dope_quic::conn::session::Connection,
         _handle: dope_quic::conn::Handle,
     ) {
         std::hint::black_box(self.state);
@@ -29,6 +29,6 @@ fn handler_may_borrow_lexical_state() {
     let state = 42;
     let handler = BorrowedHandler { state: &state };
 
-    fn accepts_handler(_: impl Handler) {}
+    fn accepts_handler(_: impl Handler<0>) {}
     accepts_handler(handler);
 }

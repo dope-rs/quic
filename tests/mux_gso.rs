@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use dope_quic::conn::{Handle, stream::Event};
 use dope_quic::mux::Outgoing;
-use dope_quic::{Connection, Handler, Mux, transport_params};
+use dope_quic::{Handler, Mux, conn::session::Connection, transport_params};
 use shin::crypto::sig::SigningKey;
 
 const CID: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -21,7 +21,7 @@ struct CapturingHandler {
     events: Rc<RefCell<Events>>,
 }
 
-impl Handler for CapturingHandler {
+impl Handler<0> for CapturingHandler {
     type Connection = ();
 
     fn create_connection(&mut self, _conn: &mut Connection, _handle: Handle) {}
@@ -46,11 +46,18 @@ fn deliver(dst: &mut Mux<CapturingHandler>, src_addr: SocketAddr, burst: Vec<Out
     for out in burst {
         match out {
             Outgoing::Plain(_, mut payload) => {
-                dst.recv(src_addr, &mut payload, now).expect("recv");
+                dst.protocol()
+                    .recv(src_addr, &mut payload, now)
+                    .expect("recv");
+            }
+            Outgoing::Suffix(_, mut payload) => {
+                dst.protocol()
+                    .recv(src_addr, payload.as_mut_slice(), now)
+                    .expect("recv");
             }
             Outgoing::Batch(_, mut payload, segment_size) => {
                 for segment in payload.chunks_mut(usize::from(segment_size.get())) {
-                    dst.recv(src_addr, segment, now).unwrap();
+                    dst.protocol().recv(src_addr, segment, now).unwrap();
                 }
                 gso_runs += 1;
             }
@@ -74,48 +81,62 @@ fn gso_burst_reassembles_to_full_stream() {
 
     let server_handler = CapturingHandler::default();
     let server_events = server_handler.events.clone();
-    let mut server =
-        Mux::server_with_outgoing_capacity(server_handler, signing, tp.clone().into(), 64).unwrap();
-    server.set_gso(true);
+    let mut server = dope_quic::mux::setup::Server::with_outgoing_capacity(
+        server_handler,
+        signing,
+        tp.clone().into(),
+        64,
+    )
+    .unwrap();
+    server.configuration().enable_gso().unwrap();
 
     let client_handler = CapturingHandler::default();
     let client_events = client_handler.events.clone();
-    let mut client = Mux::client(client_handler).unwrap();
+    let mut client = dope_quic::mux::setup::Client::new(client_handler)
+        .build()
+        .unwrap();
 
     let server_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
     let client_addr: SocketAddr = "10.0.0.1:50000".parse().unwrap();
 
     let mut now = Instant::now();
     let client_handle = client
+        .protocol()
         .connect(server_addr, server_pubkey, tp.into(), CID.to_vec(), now)
         .unwrap();
-    deliver(&mut server, client_addr, client.drain_outgoing().collect());
-    deliver(&mut client, server_addr, server.drain_outgoing().collect());
-    deliver(&mut server, client_addr, client.drain_outgoing().collect());
+    deliver(&mut server, client_addr, client.output().drain().collect());
+    deliver(&mut client, server_addr, server.output().drain().collect());
+    deliver(&mut server, client_addr, client.output().drain().collect());
+    server.output().drive_bounded(now);
+    client.output().drive_bounded(now);
 
     let server_handle = server_events.borrow().established[0];
 
     let body: Vec<u8> = (0..8192u32).map(|i| (i * 31) as u8).collect();
     let stream_id = {
-        let conn = server.conn_mut(server_handle).expect("server conn");
-        let sid = conn.open_uni_stream().expect("uni stream");
-        conn.stream_send(sid, &body).unwrap();
-        conn.stream_send_fin(sid).unwrap();
+        let mut conn = server
+            .protocol()
+            .conn_mut(server_handle)
+            .expect("server conn");
+        let sid = conn.streams().open_uni().expect("uni stream");
+        conn.streams().send(sid, &body).unwrap();
+        conn.streams().finish(sid).unwrap();
         sid
     };
 
     let mut gso_runs = 0;
     for _ in 0..16 {
         now += Duration::from_millis(20);
-        server.flush(server_handle, now);
-        assert!(server.outgoing_len() <= server.outgoing_capacity());
-        assert!(server.outgoing_bytes() <= server.outgoing_bytes_capacity());
-        gso_runs += deliver(&mut client, server_addr, server.drain_outgoing().collect());
-        client.flush(client_handle, now);
-        deliver(&mut server, client_addr, client.drain_outgoing().collect());
+        server.protocol().flush(server_handle, now);
+        assert!(server.output().len() <= server.output().capacity());
+        assert!(server.output().bytes() <= server.output().bytes_capacity());
+        gso_runs += deliver(&mut client, server_addr, server.output().drain().collect());
+        client.protocol().flush(client_handle, now);
+        deliver(&mut server, client_addr, client.output().drain().collect());
         if client
+            .protocol()
             .conn_mut(client_handle)
-            .is_some_and(|c| c.stream_recv_eof(stream_id))
+            .is_some_and(|c| c.stream_state().recv_eof(stream_id))
         {
             break;
         }
@@ -126,13 +147,16 @@ fn gso_burst_reassembles_to_full_stream() {
         client_events
             .borrow()
             .streams
-            .contains(&(client_handle, Event::Data { stream_id })),
+            .contains(&(client_handle, Event::Readable { stream_id })),
         "client saw stream data"
     );
 
     let mut recv = Vec::new();
-    let conn = client.conn_mut(client_handle).expect("client conn");
-    conn.stream_recv(stream_id, &mut recv);
+    let mut conn = client
+        .protocol()
+        .conn_mut(client_handle)
+        .expect("client conn");
+    conn.streams().recv(stream_id, &mut recv);
     assert_eq!(recv, body, "GSO-coalesced burst reassembles byte-exact");
-    assert!(conn.stream_recv_eof(stream_id), "fin delivered");
+    assert!(conn.stream_state().recv_eof(stream_id), "fin delivered");
 }

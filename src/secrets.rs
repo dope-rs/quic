@@ -5,6 +5,8 @@ use ring::hmac::Context;
 use ring::hmac::Key;
 use subtle::ConstantTimeEq;
 
+use crate::packet::{ConnectionId, ConnectionIdRef};
+
 #[derive(Clone, Copy)]
 pub struct StatelessResetSecret(pub [u8; 32]);
 
@@ -37,19 +39,36 @@ impl From<[u8; 32]> for RetryTokenSecret {
 }
 
 impl RetryTokenSecret {
-    pub fn issue(&self, addr: &SocketAddr, odcid: &[u8], expiry_unix_secs: u64) -> Vec<u8> {
-        let addr_bytes = Self::addr_bytes(addr);
-        let tag = self.tag(&addr_bytes, odcid, expiry_unix_secs);
-        let mut out = Vec::with_capacity(8 + 1 + odcid.len() + 16);
+    const TAG_LEN: usize = 16;
+    const FIXED_LEN: usize = 8 + 1 + Self::TAG_LEN;
+
+    pub const fn encoded_len(odcid: ConnectionIdRef<'_>) -> usize {
+        Self::FIXED_LEN + odcid.len()
+    }
+
+    pub fn issue_into(
+        &self,
+        out: &mut Vec<u8>,
+        addr: &SocketAddr,
+        odcid: ConnectionIdRef<'_>,
+        expiry_unix_secs: u64,
+    ) {
+        let (addr_bytes, addr_len) = Self::addr_bytes(addr);
+        let odcid = odcid.as_slice();
+        let tag = self.tag(&addr_bytes[..addr_len], odcid, expiry_unix_secs);
         out.extend_from_slice(&expiry_unix_secs.to_be_bytes());
         out.push(odcid.len() as u8);
         out.extend_from_slice(odcid);
         out.extend_from_slice(&tag);
-        out
     }
 
-    pub fn validate(&self, addr: &SocketAddr, token: &[u8], now_unix_secs: u64) -> Option<Vec<u8>> {
-        if token.len() < 8 + 1 + 16 {
+    pub fn validate(
+        &self,
+        addr: &SocketAddr,
+        token: &[u8],
+        now_unix_secs: u64,
+    ) -> Option<ConnectionId> {
+        if token.len() < Self::FIXED_LEN {
             return None;
         }
         let expiry = u64::from_be_bytes(token[..8].try_into().ok()?);
@@ -57,39 +76,41 @@ impl RetryTokenSecret {
             return None;
         }
         let odcid_len = token[8] as usize;
-        if token.len() != 8 + 1 + odcid_len + 16 {
+        if odcid_len > ConnectionId::MAX_LEN {
+            return None;
+        }
+        if token.len() != Self::FIXED_LEN + odcid_len {
             return None;
         }
         let odcid = &token[9..9 + odcid_len];
         let provided_tag = &token[9 + odcid_len..];
-        let addr_bytes = Self::addr_bytes(addr);
-        let expected = self.tag(&addr_bytes, odcid, expiry);
+        let (addr_bytes, addr_len) = Self::addr_bytes(addr);
+        let expected = self.tag(&addr_bytes[..addr_len], odcid, expiry);
         if !bool::from(provided_tag.ct_eq(&expected[..])) {
             return None;
         }
-        Some(odcid.to_vec())
+        ConnectionId::new(odcid)
     }
 
-    fn addr_bytes(addr: &SocketAddr) -> Vec<u8> {
+    fn addr_bytes(addr: &SocketAddr) -> ([u8; 19], usize) {
+        let mut bytes = [0; 19];
         match addr {
             SocketAddr::V4(a) => {
-                let mut b = Vec::with_capacity(1 + 4 + 2);
-                b.push(4);
-                b.extend_from_slice(&a.ip().octets());
-                b.extend_from_slice(&a.port().to_be_bytes());
-                b
+                bytes[0] = 4;
+                bytes[1..5].copy_from_slice(&a.ip().octets());
+                bytes[5..7].copy_from_slice(&a.port().to_be_bytes());
+                (bytes, 7)
             }
             SocketAddr::V6(a) => {
-                let mut b = Vec::with_capacity(1 + 16 + 2);
-                b.push(6);
-                b.extend_from_slice(&a.ip().octets());
-                b.extend_from_slice(&a.port().to_be_bytes());
-                b
+                bytes[0] = 6;
+                bytes[1..17].copy_from_slice(&a.ip().octets());
+                bytes[17..19].copy_from_slice(&a.port().to_be_bytes());
+                (bytes, 19)
             }
         }
     }
 
-    fn tag(&self, addr_bytes: &[u8], odcid: &[u8], expiry: u64) -> [u8; 16] {
+    fn tag(&self, addr_bytes: &[u8], odcid: &[u8], expiry: u64) -> [u8; Self::TAG_LEN] {
         let key = Key::new(hmac::HMAC_SHA256, &self.0);
         let mut ctx = Context::with_key(&key);
         ctx.update(b"qretrytok");
@@ -98,8 +119,8 @@ impl RetryTokenSecret {
         ctx.update(&[odcid.len() as u8]);
         ctx.update(odcid);
         let tag = ctx.sign();
-        let mut out = [0u8; 16];
-        out.copy_from_slice(&tag.as_ref()[..16]);
+        let mut out = [0u8; Self::TAG_LEN];
+        out.copy_from_slice(&tag.as_ref()[..Self::TAG_LEN]);
         out
     }
 }

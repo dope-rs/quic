@@ -1,19 +1,19 @@
+use dope_quic::Handler;
 use dope_quic::client_auth::{ClientAuth, ClientCertVerifier, ClientIdentity};
 use dope_quic::conn::server;
 use dope_quic::early_data::EarlyDataReplayCache;
-use dope_quic::{Connection, Handler, Mux};
 use shin::crypto::sig::SigningKey;
-use shin::crypto::ticket::TicketKeys;
+use shin::crypto::ticket::Keys;
 use shin::server::config::NoGuard;
 
 struct Noop;
 
-impl Handler for Noop {
+impl Handler<0> for Noop {
     type Connection = ();
 
     fn create_connection(
         &mut self,
-        _conn: &mut dope_quic::Connection,
+        _conn: &mut dope_quic::conn::session::Connection,
         _handle: dope_quic::conn::Handle,
     ) {
     }
@@ -33,49 +33,61 @@ fn signing() -> SigningKey {
 
 #[test]
 fn lane_owned_security_policies_are_concrete() {
-    let mut early = Mux::server_with_early_data_guard(
+    let mut early = dope_quic::mux::setup::Server::with_early_data_guard(
         Noop,
         signing(),
         Default::default(),
-        EarlyDataReplayCache::new(),
+        EarlyDataReplayCache::new().unwrap(),
     )
     .unwrap();
-    assert!(early.replace_ticket_keys(Some(TicketKeys::single([0x41; 32]))));
+    assert!(
+        early
+            .configuration()
+            .replace_ticket_keys(Some(Keys::single([0x41; 32]).unwrap()))
+    );
 
-    let mut mutual = Mux::server_mutual(
+    let mut mutual = dope_quic::mux::setup::Server::mutual(
         Noop,
         signing(),
         Default::default(),
         server::Authentication::new(ClientAuth::Required, Accept),
     )
     .unwrap();
-    assert!(mutual.replace_ticket_keys(None));
+    assert!(mutual.configuration().replace_ticket_keys(None));
 
-    let mut combined = Mux::server_mutual_with_early_data_guard(
+    let mut combined = dope_quic::mux::setup::Server::mutual_with_early_data_guard(
         Noop,
         signing(),
         Default::default(),
         server::Authentication::with_early_data_guard(
-            EarlyDataReplayCache::new(),
+            EarlyDataReplayCache::new().unwrap(),
             ClientAuth::Required,
             Accept,
         ),
     )
     .unwrap();
-    assert!(combined.replace_ticket_keys(Some(TicketKeys::single([0x43; 32]))));
+    assert!(
+        combined
+            .configuration()
+            .replace_ticket_keys(Some(Keys::single([0x43; 32]).unwrap()))
+    );
 }
 
 #[test]
 fn clients_have_no_ticket_shard() {
-    let mut client = Mux::client(Noop).unwrap();
-    assert!(!client.replace_ticket_keys(Some(TicketKeys::single([0x42; 32]))));
+    let mut client = dope_quic::mux::setup::Client::new(Noop).build().unwrap();
+    assert!(
+        !client
+            .configuration()
+            .replace_ticket_keys(Some(Keys::single([0x42; 32]).unwrap()))
+    );
 }
 
 #[test]
 fn generic_policy_paths_cover_conn_and_mux() {
-    let cid = vec![0x71; 8];
-    let ids = server::Ids::initial(cid.clone(), cid.clone(), cid);
-    let _server = Connection::new_server_with_policy::<server::Standard>(
+    let cid = dope_quic::packet::ConnectionId::try_from(&[0x71; 8][..]).unwrap();
+    let ids = server::Ids::initial(cid, cid, cid);
+    let _server = dope_quic::conn::setup::Server::<0>::accept_with_policy::<server::Standard>(
         ids,
         signing(),
         Default::default(),
@@ -84,16 +96,20 @@ fn generic_policy_paths_cover_conn_and_mux() {
     .unwrap();
 
     let authentication = server::Authentication::with_early_data_guard(
-        EarlyDataReplayCache::new(),
+        EarlyDataReplayCache::new().unwrap(),
         ClientAuth::Required,
         Accept,
     );
-    let mut mux = Mux::<_, server::Mutual<EarlyDataReplayCache, Accept>>::server_with_policy(
-        Noop,
-        signing(),
-        Default::default(),
-        authentication,
-    )
-    .unwrap();
-    assert!(mux.replace_ticket_keys(Some(TicketKeys::single([0x44; 32]))));
+    let mut mux =
+        dope_quic::mux::setup::Server::<server::Mutual<EarlyDataReplayCache, Accept>>::with_policy(
+            Noop,
+            signing(),
+            Default::default(),
+            authentication,
+        )
+        .unwrap();
+    assert!(
+        mux.configuration()
+            .replace_ticket_keys(Some(Keys::single([0x44; 32]).unwrap()))
+    );
 }

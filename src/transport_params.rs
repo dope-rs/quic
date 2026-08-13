@@ -1,7 +1,33 @@
-use std::collections::HashSet;
+use o3::collections::fixed::array::CopyInline;
 
+use crate::packet::{ConnectionId, ConnectionIdRef};
 use crate::varint::Error;
 use crate::varint::VarInt;
+
+trait Sink {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), TransportParameterError>;
+}
+
+#[derive(Clone, Copy)]
+struct ConnectionIds<'a> {
+    initial: Option<ConnectionIdRef<'a>>,
+    original: Option<ConnectionIdRef<'a>>,
+    retry: Option<ConnectionIdRef<'a>>,
+}
+
+impl Sink for Vec<u8> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), TransportParameterError> {
+        self.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+impl Sink for shin::connection::RetainedBytes<'_> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), TransportParameterError> {
+        self.try_extend(bytes)
+            .map_err(|_| TransportParameterError::OutOfRange)
+    }
+}
 
 pub const ID_ORIGINAL_DESTINATION_CONNECTION_ID: u64 = 0x00;
 pub const ID_MAX_IDLE_TIMEOUT: u64 = 0x01;
@@ -26,11 +52,18 @@ pub const DEFAULT_ACK_DELAY_EXPONENT: u64 = 3;
 pub const DEFAULT_MAX_ACK_DELAY_MS: u64 = 25;
 pub const DEFAULT_ACTIVE_CONNECTION_ID_LIMIT: u64 = 2;
 
+/// Maximum number of distinct, non-reserved parameters accepted from one
+/// peer. The current profile defines 17 parameters; the remaining slots are
+/// an explicit forward-compatibility budget that keeps decoding allocation
+/// free and adversarial work bounded.
+pub const MAX_PARAMETERS: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportParameterError {
     Underflow,
     BadVarInt,
     Duplicate,
+    TooMany,
     BadValueLength,
     OutOfRange,
 }
@@ -39,6 +72,7 @@ impl_error!(TransportParameterError {
     Self::Underflow => "truncated transport parameter",
     Self::BadVarInt => "invalid transport parameter integer",
     Self::Duplicate => "duplicate transport parameter",
+    Self::TooMany => "too many transport parameters",
     Self::BadValueLength => "invalid transport parameter length",
     Self::OutOfRange => "transport parameter is out of range",
 });
@@ -63,9 +97,9 @@ pub struct Params {
     pub max_ack_delay_ms: u64,
     pub disable_active_migration: bool,
     pub active_connection_id_limit: u64,
-    pub initial_source_connection_id: Option<Vec<u8>>,
-    pub original_destination_connection_id: Option<Vec<u8>>,
-    pub retry_source_connection_id: Option<Vec<u8>>,
+    pub initial_source_connection_id: Option<ConnectionId>,
+    pub original_destination_connection_id: Option<ConnectionId>,
+    pub retry_source_connection_id: Option<ConnectionId>,
     pub max_datagram_frame_size: Option<u64>,
     pub stateless_reset_token: Option<[u8; 16]>,
 }
@@ -95,6 +129,10 @@ impl Default for Params {
 }
 
 impl Params {
+    /// Conservative exact-all-fields reservation bound. Every valid parameter
+    /// set, including maximum-length connection IDs, fits this many bytes.
+    pub const MAX_ENCODED_LEN: usize = 193;
+
     pub fn validate(&self) -> Result<(), TransportParameterError> {
         let varints = [
             self.max_idle_timeout_ms,
@@ -119,51 +157,59 @@ impl Params {
             || self
                 .max_datagram_frame_size
                 .is_some_and(|value| value > VarInt::MAX)
-            || [
-                self.initial_source_connection_id.as_deref(),
-                self.original_destination_connection_id.as_deref(),
-                self.retry_source_connection_id.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|cid| cid.len() > 20)
         {
             return Err(TransportParameterError::OutOfRange);
         }
         Ok(())
     }
 
-    fn put_varint(out: &mut Vec<u8>, id: u64, value: u64) -> Result<(), TransportParameterError> {
-        VarInt::new(id)
-            .ok_or(TransportParameterError::OutOfRange)?
-            .encode(out);
-        let mut value_buf = Vec::with_capacity(8);
-        VarInt::new(value)
-            .ok_or(TransportParameterError::OutOfRange)?
-            .encode(&mut value_buf);
-        VarInt::from_usize(value_buf.len())
-            .ok_or(TransportParameterError::OutOfRange)?
-            .encode(out);
-        out.extend_from_slice(&value_buf);
+    fn put_encoded(out: &mut impl Sink, value: VarInt) -> Result<(), TransportParameterError> {
+        let raw = value.get();
+        match value.encoded_len() {
+            1 => out.put(&[raw as u8]),
+            2 => out.put(&((raw as u16) | 0x4000).to_be_bytes()),
+            4 => out.put(&((raw as u32) | 0x8000_0000).to_be_bytes()),
+            _ => out.put(&(raw | 0xC000_0000_0000_0000).to_be_bytes()),
+        }
+    }
+
+    fn put_varint(out: &mut impl Sink, id: u64, value: u64) -> Result<(), TransportParameterError> {
+        Self::put_encoded(
+            out,
+            VarInt::new(id).ok_or(TransportParameterError::OutOfRange)?,
+        )?;
+        let value = VarInt::new(value).ok_or(TransportParameterError::OutOfRange)?;
+        Self::put_encoded(
+            out,
+            VarInt::from_usize(value.encoded_len()).ok_or(TransportParameterError::OutOfRange)?,
+        )?;
+        Self::put_encoded(out, value)?;
         Ok(())
     }
 
-    fn put_bytes(out: &mut Vec<u8>, id: u64, value: &[u8]) -> Result<(), TransportParameterError> {
-        VarInt::new(id)
-            .ok_or(TransportParameterError::OutOfRange)?
-            .encode(out);
-        VarInt::from_usize(value.len())
-            .ok_or(TransportParameterError::OutOfRange)?
-            .encode(out);
-        out.extend_from_slice(value);
+    fn put_bytes(
+        out: &mut impl Sink,
+        id: u64,
+        value: &[u8],
+    ) -> Result<(), TransportParameterError> {
+        Self::put_encoded(
+            out,
+            VarInt::new(id).ok_or(TransportParameterError::OutOfRange)?,
+        )?;
+        Self::put_encoded(
+            out,
+            VarInt::from_usize(value.len()).ok_or(TransportParameterError::OutOfRange)?,
+        )?;
+        out.put(value)?;
         Ok(())
     }
 
-    fn put_empty(out: &mut Vec<u8>, id: u64) -> Result<(), TransportParameterError> {
-        VarInt::new(id)
-            .ok_or(TransportParameterError::OutOfRange)?
-            .encode(out);
-        out.push(0);
+    fn put_empty(out: &mut impl Sink, id: u64) -> Result<(), TransportParameterError> {
+        Self::put_encoded(
+            out,
+            VarInt::new(id).ok_or(TransportParameterError::OutOfRange)?,
+        )?;
+        out.put(&[0])?;
         Ok(())
     }
 
@@ -179,7 +225,11 @@ impl Params {
         id >= 27 && (id - 27).is_multiple_of(31)
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), TransportParameterError> {
+    fn encode_to(
+        &self,
+        out: &mut impl Sink,
+        ids: ConnectionIds<'_>,
+    ) -> Result<(), TransportParameterError> {
         self.validate()?;
         Self::put_varint(out, ID_MAX_IDLE_TIMEOUT, self.max_idle_timeout_ms)?;
         Self::put_varint(out, ID_MAX_UDP_PAYLOAD_SIZE, self.max_udp_payload_size)?;
@@ -219,14 +269,14 @@ impl Params {
             ID_ACTIVE_CONNECTION_ID_LIMIT,
             self.active_connection_id_limit,
         )?;
-        if let Some(cid) = &self.initial_source_connection_id {
-            Self::put_bytes(out, ID_INITIAL_SOURCE_CONNECTION_ID, cid)?;
+        if let Some(cid) = ids.initial {
+            Self::put_bytes(out, ID_INITIAL_SOURCE_CONNECTION_ID, cid.as_slice())?;
         }
-        if let Some(cid) = &self.original_destination_connection_id {
-            Self::put_bytes(out, ID_ORIGINAL_DESTINATION_CONNECTION_ID, cid)?;
+        if let Some(cid) = ids.original {
+            Self::put_bytes(out, ID_ORIGINAL_DESTINATION_CONNECTION_ID, cid.as_slice())?;
         }
-        if let Some(cid) = &self.retry_source_connection_id {
-            Self::put_bytes(out, ID_RETRY_SOURCE_CONNECTION_ID, cid)?;
+        if let Some(cid) = ids.retry {
+            Self::put_bytes(out, ID_RETRY_SOURCE_CONNECTION_ID, cid.as_slice())?;
         }
         if let Some(size) = self.max_datagram_frame_size {
             Self::put_varint(out, ID_MAX_DATAGRAM_FRAME_SIZE, size)?;
@@ -237,10 +287,65 @@ impl Params {
         Ok(())
     }
 
+    fn connection_ids(&self) -> ConnectionIds<'_> {
+        ConnectionIds {
+            initial: self
+                .initial_source_connection_id
+                .as_ref()
+                .map(ConnectionId::as_ref_id),
+            original: self
+                .original_destination_connection_id
+                .as_ref()
+                .map(ConnectionId::as_ref_id),
+            retry: self
+                .retry_source_connection_id
+                .as_ref()
+                .map(ConnectionId::as_ref_id),
+        }
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), TransportParameterError> {
+        self.encode_to(out, self.connection_ids())
+    }
+
+    pub fn encode_retained(
+        &self,
+        out: &mut shin::connection::RetainedBytes<'_>,
+    ) -> Result<(), TransportParameterError> {
+        self.encode_to(out, self.connection_ids())
+    }
+
+    pub(crate) fn encode_connection_retained(
+        &self,
+        is_client: bool,
+        local_cid: &[u8],
+        original_dcid: &[u8],
+        retry_scid: Option<&[u8]>,
+        out: &mut shin::connection::RetainedBytes<'_>,
+    ) -> Result<(), TransportParameterError> {
+        let initial =
+            ConnectionIdRef::new(local_cid).map_err(|_| TransportParameterError::OutOfRange)?;
+        let original =
+            ConnectionIdRef::new(original_dcid).map_err(|_| TransportParameterError::OutOfRange)?;
+        let retry = retry_scid
+            .map(ConnectionIdRef::new)
+            .transpose()
+            .map_err(|_| TransportParameterError::OutOfRange)?;
+        self.encode_to(
+            out,
+            ConnectionIds {
+                initial: Some(initial),
+                original: (!is_client).then_some(original),
+                retry: (!is_client).then_some(retry).flatten(),
+            },
+        )
+    }
+
+    /// Decodes directly from the borrowed extension body without allocating.
     pub fn decode(input: &[u8]) -> Result<Self, TransportParameterError> {
         let mut params = Self::default();
         let mut pos = 0;
-        let mut seen: HashSet<u64> = HashSet::new();
+        let mut seen = CopyInline::<u64, MAX_PARAMETERS>::new();
         while pos < input.len() {
             let (id, n) = VarInt::decode(&input[pos..])?;
             pos += n;
@@ -259,13 +364,18 @@ impl Params {
             if Self::is_reserved(id) {
                 continue;
             }
-            if !seen.insert(id) {
-                return Err(TransportParameterError::Duplicate);
+            match seen.binary_search(&id) {
+                Ok(_) => return Err(TransportParameterError::Duplicate),
+                Err(position) => seen
+                    .insert(position, id)
+                    .map_err(|_| TransportParameterError::TooMany)?,
             }
 
             match id {
                 ID_ORIGINAL_DESTINATION_CONNECTION_ID => {
-                    params.original_destination_connection_id = Some(value.to_vec());
+                    params.original_destination_connection_id = Some(
+                        ConnectionId::new(value).ok_or(TransportParameterError::BadValueLength)?,
+                    );
                 }
                 ID_MAX_IDLE_TIMEOUT => {
                     params.max_idle_timeout_ms = Self::parse_varint(value)?;
@@ -339,10 +449,14 @@ impl Params {
                     params.active_connection_id_limit = v;
                 }
                 ID_INITIAL_SOURCE_CONNECTION_ID => {
-                    params.initial_source_connection_id = Some(value.to_vec());
+                    params.initial_source_connection_id = Some(
+                        ConnectionId::new(value).ok_or(TransportParameterError::BadValueLength)?,
+                    );
                 }
                 ID_RETRY_SOURCE_CONNECTION_ID => {
-                    params.retry_source_connection_id = Some(value.to_vec());
+                    params.retry_source_connection_id = Some(
+                        ConnectionId::new(value).ok_or(TransportParameterError::BadValueLength)?,
+                    );
                 }
                 ID_MAX_DATAGRAM_FRAME_SIZE => {
                     params.max_datagram_frame_size = Some(Self::parse_varint(value)?);

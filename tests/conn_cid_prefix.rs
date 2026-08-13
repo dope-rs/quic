@@ -3,19 +3,23 @@ pub mod support;
 use std::time::Instant;
 
 use dope_quic::conn::server;
-use dope_quic::{Connection, conn, transport_params};
+use dope_quic::{conn, conn::session::Connection, transport_params};
 
 const CID: [u8; 8] = [0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33];
 
-fn drain<R: support::Receiver>(from: &mut Connection, into: &mut R) {
+fn drain<R: support::Receiver>(
+    workspace: &mut conn::ReceiveWorkspace,
+    from: &mut Connection,
+    into: &mut R,
+) {
     let now = Instant::now();
-    for mut pkt in from.send_packets(now) {
-        into.receive(&mut pkt, now);
+    for mut pkt in from.transmit().send(now) {
+        into.receive(workspace, &mut pkt, now);
     }
 }
 
-fn cfg(cid_prefix: Option<u8>) -> conn::Config {
-    conn::Config {
+fn cfg(cid_prefix: Option<u8>) -> conn::config::Options {
+    conn::config::Options {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
             max_datagram_frame_size: Some(65535),
@@ -23,6 +27,7 @@ fn cfg(cid_prefix: Option<u8>) -> conn::Config {
             ..transport_params::Params::default()
         },
         cid_prefix,
+        stateless_reset_secret: Some([0x5c; 32]),
         ..Default::default()
     }
 }
@@ -34,7 +39,7 @@ fn make_pair(
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
 
-    let mut server = Connection::new_server(
+    let mut server = dope_quic::conn::setup::Server::<0>::accept(
         CID.to_vec(),
         CID.to_vec(),
         CID.to_vec(),
@@ -42,26 +47,28 @@ fn make_pair(
         cfg(server_prefix),
     )
     .unwrap();
-    let mut client = Connection::new_client(
+    let mut client = dope_quic::conn::setup::Client::<0>::connect(
         CID.to_vec(),
         CID.to_vec(),
         server_pubkey,
         cfg(client_prefix),
     )
     .unwrap();
+    let mut workspace = conn::ReceiveWorkspace::new();
 
-    drain(&mut client, &mut server);
-    drain(&mut server, &mut client);
-    drain(&mut client, &mut server);
-    drain(&mut server, &mut client);
-    drain(&mut client, &mut server);
+    drain(&mut workspace, &mut client, &mut server);
+    drain(&mut workspace, &mut server, &mut client);
+    drain(&mut workspace, &mut client, &mut server);
+    drain(&mut workspace, &mut server, &mut client);
+    drain(&mut workspace, &mut client, &mut server);
     (server, client)
 }
 
-fn issued_cids(conn: &Connection) -> Vec<&Vec<u8>> {
-    conn.local_cids()
-        .iter()
-        .filter(|(seq, _)| **seq > 0)
+fn issued_cids(conn: &Connection) -> Vec<&[u8]> {
+    conn.status()
+        .local_cids()
+        .entries()
+        .filter(|(seq, _)| *seq > 0)
         .map(|(_, c)| c)
         .collect()
 }
@@ -70,7 +77,7 @@ fn issued_cids(conn: &Connection) -> Vec<&Vec<u8>> {
 fn prefixed_cids_all_start_with_tag_byte() {
     const TAG: u8 = 0x77;
     let (server, _client) = make_pair(Some(TAG), None);
-    let cids: Vec<&Vec<u8>> = server.local_cids().values().collect();
+    let cids: Vec<&[u8]> = server.status().local_cids().values().collect();
     assert!(cids.len() >= 2, "expected ≥2 CIDs after handshake");
     let issued = issued_cids(&server);
     assert!(!issued.is_empty(), "no auto-issued CIDs found");
@@ -105,8 +112,8 @@ fn distinct_prefixes_separate_cleanly() {
     let (server_a, _) = make_pair(Some(TAG_A), None);
     let (server_b, _) = make_pair(Some(TAG_B), None);
 
-    let issued_a: Vec<&Vec<u8>> = issued_cids(&server_a);
-    let issued_b: Vec<&Vec<u8>> = issued_cids(&server_b);
+    let issued_a: Vec<&[u8]> = issued_cids(&server_a);
+    let issued_b: Vec<&[u8]> = issued_cids(&server_b);
     assert!(!issued_a.is_empty() && !issued_b.is_empty());
 
     for cid in &issued_a {
@@ -121,7 +128,10 @@ fn distinct_prefixes_separate_cleanly() {
 fn prefix_does_not_break_uniqueness_of_remaining_bytes() {
     const TAG: u8 = 0xC0;
     let (server, _client) = make_pair(Some(TAG), None);
-    let issued: Vec<Vec<u8>> = issued_cids(&server).into_iter().cloned().collect();
+    let issued: Vec<Vec<u8>> = issued_cids(&server)
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect();
     assert!(
         issued.len() >= 2,
         "need ≥2 CIDs to compare; got {}",

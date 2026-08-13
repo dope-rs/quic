@@ -3,18 +3,27 @@ pub mod support;
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use dope::runtime::executor::Executor;
-use dope::{Completion, DriverContext, driver};
+use dope::core::driver::settings;
+use dope::manifold::timing;
+use dope::runtime::{executor::Executor, shutdown};
 use dope_quic::conn::Handle;
 use dope_quic::conn::server;
-use dope_quic::{Connection, Endpoint, Handler, conn, endpoint, transport_params};
+use dope_quic::{Endpoint, Handler, conn, conn::session::Connection, endpoint, transport_params};
 use shin::server::config::NoGuard;
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
-const MAX_TICKS: usize = 100;
-const TICK_PARK: Duration = Duration::from_millis(5);
+const SERVER_ROUTE: u8 = 0;
+const CLIENT_ROUTE: u8 = 1;
+
+struct Timeout(Instant);
+
+impl timing::Schedule for Timeout {
+    fn deadline(&self) -> Option<Instant> {
+        Some(self.0)
+    }
+}
 
 const ENDPOINT: endpoint::Config = endpoint::Config {
     max_conns: 1,
@@ -22,8 +31,6 @@ const ENDPOINT: endpoint::Config = endpoint::Config {
     outgoing_bytes_capacity: 1 << 20,
     packet_buffer_slots: 64,
     packet_buffer_bytes: u16::MAX as u32,
-    completion_budget: 64,
-    flush_budget: 64,
 };
 
 #[derive(Default)]
@@ -32,42 +39,120 @@ struct Events {
     datagrams: Vec<(Handle, Vec<u8>)>,
 }
 
-#[derive(Clone, Default)]
 struct CapturingHandler {
     events: Rc<RefCell<Events>>,
+    established: Rc<RefCell<usize>>,
+    stop: Rc<RefCell<Option<shutdown::Trigger>>>,
+    connect: Option<Connect>,
+    timed_out: Rc<RefCell<bool>>,
 }
 
-impl Handler for CapturingHandler {
+struct Connect {
+    peer: SocketAddr,
+    public_key: [u8; 32],
+    params: transport_params::Params,
+}
+
+impl<const ID: u8> Handler<ID> for CapturingHandler {
     type Connection = ();
 
-    fn create_connection(&mut self, _conn: &mut Connection, _handle: Handle) {}
+    fn create_connection(&mut self, _conn: &mut Connection<ID>, _handle: Handle) {}
 
-    fn established(&mut self, _connection: &mut (), _conn: &mut Connection, h: Handle) {
+    fn established(&mut self, _connection: &mut (), _conn: &mut Connection<ID>, h: Handle) {
         self.events.borrow_mut().established.push(h);
+        let total = self.established.borrow().saturating_add(1);
+        *self.established.borrow_mut() = total;
+        if total == 2 {
+            self.stop
+                .borrow_mut()
+                .take()
+                .expect("loopback stop capability")
+                .fire()
+                .expect("stop completed loopback");
+        }
     }
-    fn datagram(&mut self, _connection: &mut (), _conn: &mut Connection, h: Handle, data: Vec<u8>) {
+    fn datagram(
+        &mut self,
+        _connection: &mut (),
+        _conn: &mut Connection<ID>,
+        h: Handle,
+        data: Vec<u8>,
+    ) {
         self.events.borrow_mut().datagrams.push((h, data.to_vec()));
     }
 }
 
-fn drive_both<'c, 's>(
-    mut client: std::pin::Pin<&mut Endpoint<'c, 0, CapturingHandler>>,
-    client_drv: &mut DriverContext<'_, 'c>,
-    mut server: std::pin::Pin<&mut Endpoint<'s, 0, CapturingHandler>>,
-    server_drv: &mut DriverContext<'_, 's>,
-    until: impl Fn() -> bool,
-) -> bool {
-    for _ in 0..MAX_TICKS {
-        client.as_mut().drive(client_drv);
-        let _ = client_drv.wait(Some(TICK_PARK));
-        server.as_mut().drive(server_drv);
-        let _ = server_drv.wait(Some(TICK_PARK));
+struct CapturingControl<'step>(&'step mut CapturingHandler);
 
-        if until() {
-            return true;
-        }
+impl CapturingControl<'_> {
+    fn stop_timed_out(&mut self) {
+        *self.0.timed_out.borrow_mut() = true;
+        self.0
+            .stop
+            .borrow_mut()
+            .take()
+            .expect("loopback timeout stop capability")
+            .fire()
+            .expect("stop timed-out loopback");
     }
-    false
+
+    fn take_connect(&mut self) -> Option<Connect> {
+        self.0.connect.take()
+    }
+}
+
+// SAFETY: the control moves only test-owned command/timer state and cannot
+// replace the handler installed beneath the endpoint.
+unsafe impl<'d, const ID: u8> endpoint::ControlHandler<'d, ID> for CapturingHandler {
+    type Control<'step>
+        = CapturingControl<'step>
+    where
+        Self: 'step,
+        'd: 'step;
+
+    unsafe fn control<'step>(handler: &'step mut Self) -> Self::Control<'step>
+    where
+        'd: 'step,
+    {
+        CapturingControl(handler)
+    }
+}
+
+#[pin_project::pin_project]
+#[derive(dope_gen::Application)]
+#[coordinate]
+struct App<'d> {
+    #[dispatcher(marker)]
+    marker: ::core::marker::PhantomData<fn(&'d ()) -> &'d ()>,
+    #[pin]
+    #[manifold]
+    server: Endpoint<'d, SERVER_ROUTE, CapturingHandler>,
+    #[pin]
+    #[manifold(control)]
+    client: Endpoint<'d, CLIENT_ROUTE, CapturingHandler>,
+    #[dispatcher(schedule)]
+    timeout: Timeout,
+}
+
+impl<'d> App<'d> {
+    fn coordinate(mut this: AppCoordinate<'_, '_, 'd>) -> dope::runtime::coordinate::Flow {
+        if this.timeout.0 <= this.step.now() {
+            this.client.handler_control().stop_timed_out();
+            return dope::runtime::coordinate::Flow::Idle;
+        }
+        let connect = this.client.handler_control().take_connect();
+        if let Some(connect) = connect {
+            this.client
+                .connect(
+                    connect.peer,
+                    connect.public_key,
+                    connect.params,
+                    CID.to_vec(),
+                )
+                .expect("connect loopback client");
+        }
+        dope::runtime::coordinate::Flow::Idle
+    }
 }
 
 #[test]
@@ -81,58 +166,76 @@ fn quic_datagram_handshake_completes_on_loopback() {
         ..transport_params::Params::default()
     };
 
-    let server_exec = Executor::new(driver::Config::for_quic_udp(64, 2048)).unwrap();
-    let client_exec = Executor::new(driver::Config::for_quic_udp(64, 2048)).unwrap();
-    server_exec.enter(|mut server_sess| {
-        client_exec.enter(|mut client_sess| {
-            let mut server_drv = server_sess.driver_access();
-            let mut client_drv = client_sess.driver_access();
-
-            let server_handler = CapturingHandler::default();
-            let server_events = server_handler.events.clone();
-            let mut server = std::pin::pin!(
-                Endpoint::<'_, 0, CapturingHandler, server::Standard>::build_server_with_policy(
-                    "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-                    signing,
-                    conn::Config::from(user_tp.clone()),
-                    NoGuard,
-                    server_handler,
-                    ENDPOINT,
-                    &mut server_drv,
-                )
-                .unwrap()
-            );
-            let server_addr = server.local_addr();
-
-            let client_handler = CapturingHandler::default();
-            let client_events = client_handler.events.clone();
-            let mut client = std::pin::pin!(
-                Endpoint::build_client(
-                    "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-                    client_handler,
-                    ENDPOINT,
-                    &mut client_drv,
-                )
-                .unwrap()
-            );
-
-            let _client_handle = client
-                .as_mut()
-                .connect(server_addr, server_pubkey, user_tp, CID.to_vec())
-                .unwrap();
-
-            let done = drive_both(
-                client.as_mut(),
-                &mut client_drv,
-                server.as_mut(),
-                &mut server_drv,
-                || {
-                    !client_events.borrow().established.is_empty()
-                        && !server_events.borrow().established.is_empty()
+    let (source, stop) = shutdown::Pair::new().unwrap().split();
+    let stop = Rc::new(RefCell::new(Some(stop)));
+    let executor =
+        Executor::new(settings::Config::for_quic_udp(128, 2048).expect("valid driver config"))
+            .unwrap()
+            .with_shutdown(source)
+            .unwrap();
+    executor.enter(|mut session| {
+        let established = Rc::new(RefCell::new(0));
+        let server_events = Rc::new(RefCell::new(Events::default()));
+        let client_events = Rc::new(RefCell::new(Events::default()));
+        let timed_out = Rc::new(RefCell::new(false));
+        let timeout = Timeout(Instant::now() + Duration::from_secs(2));
+        let (server, client) = {
+            let mut driver = session.driver_access();
+            let server = Endpoint::<'_, SERVER_ROUTE, CapturingHandler, server::Standard>::build_server_with_policy(
+                "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+                signing,
+                conn::config::Options::from(user_tp.clone()),
+                NoGuard,
+                CapturingHandler {
+                    events: server_events.clone(),
+                    established: established.clone(),
+                    stop: Rc::clone(&stop),
+                    connect: None,
+                    timed_out: timed_out.clone(),
                 },
-            );
+                ENDPOINT,
+                &mut driver,
+            )
+            .unwrap();
+            let server_addr = server.local_addr();
+            let client = Endpoint::<'_, CLIENT_ROUTE, CapturingHandler>::build_client(
+                "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+                CapturingHandler {
+                    events: client_events.clone(),
+                    established: established.clone(),
+                    stop: Rc::clone(&stop),
+                    connect: Some(Connect {
+                        peer: server_addr,
+                        public_key: server_pubkey,
+                        params: user_tp,
+                    }),
+                    timed_out: timed_out.clone(),
+                },
+                ENDPOINT,
+                &mut driver,
+            )
+            .unwrap();
+            (server, client)
+        };
 
-            assert!(done, "handshake did not complete within budget");
-        });
+        drop(
+            session
+            .with_app(
+                App {
+                    marker: ::core::marker::PhantomData,
+                    server,
+                    client,
+                    timeout,
+                },
+                |mut app| app.run(),
+            )
+            .expect("loopback teardown")
+            .expect("loopback runtime"),
+        );
+
+        assert!(!*timed_out.borrow(), "handshake deadline elapsed");
+        assert_eq!(*established.borrow(), 2);
+        assert_eq!(server_events.borrow().established.len(), 1);
+        assert_eq!(client_events.borrow().established.len(), 1);
     });
 }

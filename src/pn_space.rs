@@ -1,268 +1,273 @@
-use std::borrow::Borrow;
-use std::collections::{BTreeMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crate::frame::MAX_ACK_RANGES;
-use crate::rtt::PACKET_THRESHOLD;
+use crate::frame::MAX_ADDITIONAL_ACK_RANGES;
 
-#[derive(Debug, Default)]
+pub(crate) const MAX_ACK_INTERVALS: usize = MAX_ADDITIONAL_ACK_RANGES + 1;
+const RECEIVED_WINDOW_BITS: usize = MAX_ACK_INTERVALS * 2 - 1;
+const RECEIVED_WINDOW_WORDS: usize = RECEIVED_WINDOW_BITS.div_ceil(u64::BITS as usize);
+
+/// Fixed packet-number history shared by replay rejection and ACK generation.
+///
+/// A number below `base()` is retired, even if it was never observed. QUIC
+/// retransmits its frames in a new packet number, so bounding reordering this
+/// way cannot make an old authenticated packet fresh again.
+#[derive(Debug)]
 struct ReceivedPackets {
-    ranges: BTreeMap<u64, u64>,
+    words: [u64; RECEIVED_WINDOW_WORDS],
+    largest: u64,
+    first_smallest: u64,
+    ranges: u16,
 }
 
-pub(crate) struct AckRangeSet {
+impl Default for ReceivedPackets {
+    fn default() -> Self {
+        Self {
+            words: [0; RECEIVED_WINDOW_WORDS],
+            largest: 0,
+            first_smallest: 0,
+            ranges: 0,
+        }
+    }
+}
+
+/// Borrowed ACK description. Its lifetime prevents the receive window from
+/// advancing between range selection and wire encoding.
+pub(crate) struct AckView<'space> {
     pub(crate) largest: u64,
     pub(crate) first_range: u64,
-    pub(crate) additional: Vec<(u64, u64)>,
+    pub(crate) additional: GeneratedAckRanges<'space>,
 }
 
 impl ReceivedPackets {
+    fn bit_index(pn: u64) -> (usize, u64) {
+        let slot = (pn % RECEIVED_WINDOW_BITS as u64) as usize;
+        (slot / u64::BITS as usize, 1 << (slot % u64::BITS as usize))
+    }
+
+    fn bit(&self, pn: u64) -> bool {
+        let (word, bit) = Self::bit_index(pn);
+        self.words[word] & bit != 0
+    }
+
+    fn set_bit(&mut self, pn: u64) {
+        let (word, bit) = Self::bit_index(pn);
+        self.words[word] |= bit;
+    }
+
+    fn clear_bit(&mut self, pn: u64) {
+        let (word, bit) = Self::bit_index(pn);
+        self.words[word] &= !bit;
+    }
+
+    fn base(&self) -> u64 {
+        self.largest.saturating_sub(RECEIVED_WINDOW_BITS as u64 - 1)
+    }
+
     fn contains(&self, pn: u64) -> bool {
-        self.ranges
-            .range(..=pn)
-            .next_back()
-            .is_some_and(|(_, &largest)| pn <= largest)
-    }
-
-    fn insert(&mut self, pn: u64) -> bool {
-        if self.contains(pn) {
+        let Some(largest) = self.largest() else {
             return false;
-        }
-
-        let previous = self
-            .ranges
-            .range(..pn)
-            .next_back()
-            .map(|(&smallest, &largest)| (smallest, largest));
-        let next = self
-            .ranges
-            .range(pn..)
-            .next()
-            .map(|(&smallest, &largest)| (smallest, largest));
-        let joins_previous =
-            previous.is_some_and(|(_, largest)| largest.checked_add(1) == Some(pn));
-        let joins_next = next.is_some_and(|(smallest, _)| pn.checked_add(1) == Some(smallest));
-
-        match (previous, next, joins_previous, joins_next) {
-            (Some((previous_smallest, _)), Some((next_smallest, next_largest)), true, true) => {
-                self.ranges.insert(previous_smallest, next_largest);
-                self.ranges.remove(&next_smallest);
-            }
-            (Some((previous_smallest, _)), _, true, false) => {
-                self.ranges.insert(previous_smallest, pn);
-            }
-            (_, Some((next_smallest, next_largest)), false, true) => {
-                self.ranges.remove(&next_smallest);
-                self.ranges.insert(pn, next_largest);
-            }
-            _ => {
-                self.ranges.insert(pn, pn);
-            }
-        }
-
-        while self.ranges.len() > MAX_ACK_RANGES {
-            let Some(oldest) = self.ranges.first_key_value().map(|(&smallest, _)| smallest) else {
-                break;
-            };
-            self.ranges.remove(&oldest);
-        }
-        true
+        };
+        pn < self.base() || pn <= largest && self.bit(pn)
     }
 
-    fn ack_ranges(&self) -> Option<AckRangeSet> {
-        let mut ranges = self.ranges.iter().rev();
-        let (&first_smallest, &largest) = ranges.next()?;
-        let first_range = largest - first_smallest;
-        let mut previous_smallest = first_smallest;
-        let mut additional = Vec::with_capacity(self.ranges.len().saturating_sub(1));
-        for (&smallest, &range_largest) in ranges {
-            let gap = previous_smallest - range_largest - 2;
-            additional.push((gap, range_largest - smallest));
-            previous_smallest = smallest;
+    fn admits(&self, pn: u64) -> bool {
+        !self.contains(pn)
+    }
+
+    fn remove_bit(&mut self, pn: u64, largest: u64) {
+        if !self.bit(pn) {
+            return;
         }
-        Some(AckRangeSet {
+        let joins_previous = pn > self.base() && self.bit(pn - 1);
+        let joins_next = pn < largest && self.bit(pn + 1);
+        self.ranges = match (joins_previous, joins_next) {
+            (false, false) => self.ranges - 1,
+            (true, true) => self.ranges + 1,
+            _ => self.ranges,
+        };
+        self.clear_bit(pn);
+    }
+
+    fn add_bit(&mut self, pn: u64, largest: u64) {
+        debug_assert!(!self.bit(pn));
+        let joins_previous = pn > self.base() && self.bit(pn - 1);
+        let joins_next = pn < largest && self.bit(pn + 1);
+        self.ranges = match (joins_previous, joins_next) {
+            (false, false) => self.ranges + 1,
+            (true, true) => self.ranges - 1,
+            _ => self.ranges,
+        };
+        self.set_bit(pn);
+    }
+
+    fn insert(&mut self, pn: u64) {
+        debug_assert!(self.admits(pn));
+        let Some(previous_largest) = self.largest() else {
+            self.largest = pn;
+            self.first_smallest = pn;
+            self.ranges = 1;
+            self.set_bit(pn);
+            return;
+        };
+
+        if pn > previous_largest {
+            let new_base = pn.saturating_sub(RECEIVED_WINDOW_BITS as u64 - 1);
+            let old_base = self.base();
+            let retired = new_base.saturating_sub(old_base);
+            if retired >= RECEIVED_WINDOW_BITS as u64 {
+                self.words.fill(0);
+                self.ranges = 0;
+            } else {
+                for offset in 0..retired {
+                    self.remove_bit(old_base + offset, previous_largest);
+                }
+            }
+            self.largest = pn;
+            self.add_bit(pn, pn);
+            self.first_smallest = if previous_largest.checked_add(1) == Some(pn) {
+                self.first_smallest.max(new_base)
+            } else {
+                pn
+            };
+            return;
+        }
+
+        self.add_bit(pn, previous_largest);
+        if pn.checked_add(1) == Some(self.first_smallest) {
+            let mut first = pn;
+            while first > self.base() && self.bit(first - 1) {
+                first -= 1;
+            }
+            self.first_smallest = first;
+        }
+    }
+
+    fn largest(&self) -> Option<u64> {
+        (self.ranges != 0).then_some(self.largest)
+    }
+
+    fn ack_ranges(&self) -> Option<AckView<'_>> {
+        let largest = self.largest()?;
+        let additional = GeneratedAckRanges {
+            received: self,
+            cursor: self
+                .first_smallest
+                .checked_sub(1)
+                .filter(|&pn| pn >= self.base()),
+            previous_smallest: self.first_smallest,
+            remaining: usize::from(self.ranges.saturating_sub(1)),
+        };
+        Some(AckView {
             largest,
-            first_range,
+            first_range: largest - self.first_smallest,
             additional,
         })
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SentPacket {
-    pub pn: u64,
-    pub sent_time: Instant,
-    pub ack_eliciting: bool,
-    pub in_flight: bool,
-    pub bytes_sent: usize,
+#[derive(Clone)]
+pub(crate) struct GeneratedAckRanges<'space> {
+    received: &'space ReceivedPackets,
+    cursor: Option<u64>,
+    previous_smallest: u64,
+    remaining: usize,
 }
+
+impl Iterator for GeneratedAckRanges<'_> {
+    type Item = (u64, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            self.cursor = None;
+            return None;
+        }
+        let mut cursor = self.cursor?;
+        while !self.received.bit(cursor) {
+            if cursor == self.received.base() {
+                self.cursor = None;
+                self.remaining = 0;
+                return None;
+            }
+            cursor -= 1;
+        }
+        let largest = cursor;
+        while cursor > self.received.base() && self.received.bit(cursor - 1) {
+            cursor -= 1;
+        }
+        let smallest = cursor;
+        self.cursor = smallest
+            .checked_sub(1)
+            .filter(|&pn| pn >= self.received.base());
+        self.remaining -= 1;
+        let gap = self
+            .previous_smallest
+            .checked_sub(largest)
+            .and_then(|distance| distance.checked_sub(2))
+            .expect("disjoint received ranges");
+        self.previous_smallest = smallest;
+        Some((gap, largest - smallest))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for GeneratedAckRanges<'_> {}
 
 #[derive(Debug, Default)]
 pub struct PnSpace {
     pub next_pn: u64,
-    pub sent: BTreeMap<u64, SentPacket>,
-    received: ReceivedPackets,
-    pub largest_received: Option<u64>,
-    pub largest_received_time: Option<Instant>,
-    pub ack_eliciting_received: bool,
-    pub ack_pending: bool,
     pub largest_acked: Option<u64>,
-    pub crypto_inflight: BTreeMap<u64, (Vec<u8>, u64)>,
-    pub crypto_retransmit: Vec<(u64, Vec<u8>)>,
-    pub crypto_next_offset: u64,
-    pub stream_retransmit: Vec<(u64, u64, u64, bool)>,
     pub time_of_last_ack_eliciting: Option<Instant>,
     pub ack_eliciting_in_flight: usize,
 }
 
-impl PnSpace {
-    pub fn in_flight_bytes(&self) -> u64 {
-        self.sent
-            .values()
-            .filter(|p| p.in_flight)
-            .map(|p| p.bytes_sent as u64)
-            .sum()
-    }
+#[derive(Debug, Default)]
+pub(crate) struct Receive {
+    packets: ReceivedPackets,
+    pub(crate) largest_time: Option<Instant>,
+    pub(crate) ack_eliciting: bool,
+    pub(crate) ack_pending: bool,
+}
 
+#[must_use = "a fresh packet number is meaningful only inside a receive transaction"]
+#[repr(transparent)]
+pub(crate) struct Fresh(u64);
+
+impl Receive {
     pub fn expected_pn(&self) -> u64 {
-        self.largest_received
+        self.packets
+            .largest()
             .and_then(|pn| pn.checked_add(1))
             .unwrap_or(0)
     }
 
-    pub fn has_received(&self, pn: u64) -> bool {
-        self.received.contains(pn)
+    pub(crate) fn admit(&self, pn: u64) -> Option<Fresh> {
+        self.packets.admits(pn).then_some(Fresh(pn))
     }
 
-    pub fn record_received(&mut self, pn: u64, ack_eliciting: bool, now: Instant) -> bool {
-        if !self.received.insert(pn) {
-            return false;
-        }
-        match self.largest_received {
-            Some(prev) if prev >= pn => {}
-            _ => {
-                self.largest_received = Some(pn);
-                self.largest_received_time = Some(now);
-            }
+    pub(crate) fn commit(&mut self, Fresh(pn): Fresh, ack_eliciting: bool, now: Instant) {
+        debug_assert!(self.packets.admits(pn));
+        let previous_largest = self.packets.largest();
+        self.packets.insert(pn);
+        if previous_largest.is_none_or(|largest| pn > largest) {
+            self.largest_time = Some(now);
         }
         if ack_eliciting {
-            self.ack_eliciting_received = true;
+            self.ack_eliciting = true;
             self.ack_pending = true;
         }
-        true
     }
 
-    pub fn record_sent(&mut self, packet: SentPacket) {
-        if !packet.in_flight && !packet.ack_eliciting {
-            return;
-        }
-        if packet.ack_eliciting {
-            self.time_of_last_ack_eliciting = Some(packet.sent_time);
-            self.ack_eliciting_in_flight += 1;
-        }
-        self.sent.insert(packet.pn, packet);
-    }
-
-    pub(crate) fn build_ack_ranges(&self) -> Option<AckRangeSet> {
-        self.received.ack_ranges()
-    }
-
-    pub fn detect_lost(
-        &mut self,
-        loss_delay: Duration,
-        now: Instant,
-    ) -> (Vec<SentPacket>, Option<Instant>) {
-        let Some(largest_acked) = self.largest_acked else {
-            return (Vec::new(), None);
-        };
-        let lost_send_time = now.checked_sub(loss_delay).unwrap_or(now);
-
-        let mut lost_pns = Vec::new();
-        let mut earliest_loss_time: Option<Instant> = None;
-        for (&pn, p) in &self.sent {
-            if pn > largest_acked {
-                continue;
-            }
-            let by_pn = largest_acked.saturating_sub(pn) >= PACKET_THRESHOLD;
-            let by_time = p.sent_time <= lost_send_time;
-            if by_pn || by_time {
-                lost_pns.push(pn);
-            } else {
-                let when = p.sent_time + loss_delay;
-                earliest_loss_time = Some(match earliest_loss_time {
-                    Some(prev) if prev < when => prev,
-                    _ => when,
-                });
-            }
-        }
-
-        let mut lost = Vec::with_capacity(lost_pns.len());
-        for pn in lost_pns {
-            if let Some(p) = self.sent.remove(&pn) {
-                if p.ack_eliciting && p.in_flight {
-                    self.ack_eliciting_in_flight = self.ack_eliciting_in_flight.saturating_sub(1);
-                }
-                lost.push(p);
-            }
-        }
-        (lost, earliest_loss_time)
-    }
-
-    pub fn process_ack<I>(
-        &mut self,
-        largest: u64,
-        first_range: u64,
-        additional: I,
-    ) -> Vec<SentPacket>
-    where
-        I: IntoIterator,
-        I::Item: Borrow<(u64, u64)>,
-    {
-        let mut acked = Vec::new();
-
-        let first_smallest = largest.saturating_sub(first_range);
-        self.remove_sent_range(first_smallest, largest, &mut acked);
-
-        let mut prev_smallest = first_smallest;
-        for range in additional {
-            let &(gap, range_len) = range.borrow();
-            let next_largest = prev_smallest.saturating_sub(gap + 2);
-            let next_smallest = next_largest.saturating_sub(range_len);
-            self.remove_sent_range(next_smallest, next_largest, &mut acked);
-            prev_smallest = next_smallest;
-        }
-
-        if let Some(prev) = self.largest_acked {
-            self.largest_acked = Some(prev.max(largest));
-        } else {
-            self.largest_acked = Some(largest);
-        }
-
-        for p in &acked {
-            if p.ack_eliciting && p.in_flight {
-                self.ack_eliciting_in_flight = self.ack_eliciting_in_flight.saturating_sub(1);
-            }
-        }
-
-        let acked_pns: HashSet<u64> = acked.iter().map(|p| p.pn).collect();
-        self.crypto_inflight
-            .retain(|_, (_, pn)| !acked_pns.contains(pn));
-        acked
-    }
-
-    fn remove_sent_range(&mut self, smallest: u64, largest: u64, removed: &mut Vec<SentPacket>) {
-        loop {
-            let next = self
-                .sent
-                .range(smallest..=largest)
-                .next()
-                .map(|(&pn, _)| pn);
-            let Some(pn) = next else {
-                break;
-            };
-            if let Some(packet) = self.sent.remove(&pn) {
-                removed.push(packet);
-            }
-        }
+    pub(crate) fn build_ack_ranges(&self) -> Option<AckView<'_>> {
+        self.packets.ack_ranges()
     }
 }
+
+const _: () = assert!(std::mem::size_of::<ReceivedPackets>() <= 96);
+const _: () = assert!(!std::mem::needs_drop::<ReceivedPackets>());
+const _: () = assert!(std::mem::size_of::<Fresh>() == std::mem::size_of::<u64>());
+const _: () = assert!(!std::mem::needs_drop::<Fresh>());
+const _: () = assert!(MAX_ACK_INTERVALS <= u16::MAX as usize);
+const _: () = assert!(RECEIVED_WINDOW_BITS <= 16_384);

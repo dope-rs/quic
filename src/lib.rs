@@ -35,18 +35,24 @@ mod stream;
 pub mod transport_params;
 pub mod varint;
 
-pub use client::{BackoffPolicy, Client, EndpointSpec, PathStats, Protocol, SlotId};
-pub use conn::Connection;
-pub use endpoint::Endpoint;
+pub use client::{
+    BackoffPolicy, Client, EndpointSpec, PathStats, PooledClient, PooledEndpointSpec, Protocol,
+    SlotId,
+};
+pub use endpoint::{
+    Endpoint, PooledControl, PooledEndpoint, PooledRetainedControl, PooledRetainedEndpoint,
+    RetainedControl, RetainedEndpoint,
+};
 pub use errors::{ConnectError, TrySendError};
-pub use mux::{Handler, Mux};
-pub use o3::buffer::{CapacityError, InlineBytes};
-pub use stream::{INLINE_SEND_CAPACITY, SendBuffer};
+pub use mux::{Handler, Mux, PooledMux};
+pub use o3::buffer::CapacityError;
+pub use stream::{INLINE_SEND_CAPACITY, ReceiveBuffer, RecvBuffer, SendBuffer};
 pub use transport_params::TransportParameterError;
 
 pub mod client_auth {
-    pub use shin::client::config::ClientCertSource;
+    pub use shin::client::config::Identity;
     pub use shin::server::{
-        config::ClientAuth, config::ClientCertVerifier, config::ClientIdentity,
+        config::ClientAuth, config::ClientAuthVerifier, config::ClientCertVerifier,
+        config::ClientIdentity,
     };
 }

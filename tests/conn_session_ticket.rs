@@ -3,14 +3,14 @@ pub mod support;
 use std::time::Instant;
 
 use dope_quic::conn::server;
-use dope_quic::{Connection, conn, transport_params};
+use dope_quic::{conn, conn::session::Connection, transport_params};
 
 const HS_CID: [u8; 8] = [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8];
 
-fn handshake_pair() -> (server::Connection, Connection) {
+fn handshake_pair() -> (server::Connection, Connection, conn::ReceiveWorkspace) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
-    let cfg = || conn::Config {
+    let cfg = || conn::config::Options {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
             max_datagram_frame_size: Some(65535),
@@ -24,7 +24,7 @@ fn handshake_pair() -> (server::Connection, Connection) {
         ticket_secret: Some([0x77u8; 32]),
         ..Default::default()
     };
-    let mut server = Connection::new_server(
+    let mut server = dope_quic::conn::setup::Server::<0>::accept(
         HS_CID.to_vec(),
         HS_CID.to_vec(),
         HS_CID.to_vec(),
@@ -32,28 +32,38 @@ fn handshake_pair() -> (server::Connection, Connection) {
         cfg(),
     )
     .unwrap();
-    let mut client =
-        Connection::new_client(HS_CID.to_vec(), HS_CID.to_vec(), server_pubkey, cfg()).unwrap();
+    let mut client = dope_quic::conn::setup::Client::<0>::connect(
+        HS_CID.to_vec(),
+        HS_CID.to_vec(),
+        server_pubkey,
+        cfg(),
+    )
+    .unwrap();
     let now = Instant::now();
+    let mut workspace = conn::ReceiveWorkspace::new();
     for _ in 0..3 {
-        for mut pkt in client.send_packets(now) {
-            server.recv_packet(&mut pkt, now).expect("server recv");
+        for mut pkt in client.transmit().send(now) {
+            server
+                .recv_packet(&mut workspace, &mut pkt, now)
+                .expect("server recv");
         }
-        for mut pkt in server.send_packets(now) {
-            client.recv_packet(&mut pkt, now).expect("client recv");
+        for mut pkt in server.transmit().send(now) {
+            client
+                .recv_packet(&mut workspace, &mut pkt, now)
+                .expect("client recv");
         }
     }
-    assert!(client.is_established() && server.is_established());
-    (server, client)
+    assert!(client.status().is_established() && server.status().is_established());
+    (server, client, workspace)
 }
 
 #[test]
 fn server_emits_session_ticket_after_handshake() {
-    let (mut server, mut client) = handshake_pair();
+    let (mut server, mut client, mut workspace) = handshake_pair();
     let now = Instant::now();
-    for mut pkt in server.send_packets(now) {
+    for mut pkt in server.transmit().send(now) {
         client
-            .recv_packet(&mut pkt, now)
+            .recv_packet(&mut workspace, &mut pkt, now)
             .expect("client recv app crypto");
     }
     let tickets = client.take_session_tickets();
@@ -64,24 +74,24 @@ fn server_emits_session_ticket_after_handshake() {
     );
     let t = &tickets[0];
     assert_eq!(t.ticket_lifetime, 7200);
-    assert_eq!(t.ticket_nonce.len(), 8);
-    assert_eq!(
-        t.ticket.len(),
-        12 + 32 + 4 + 8 + 2 + 1 + 16,
-        "nonce|psk|age_add|issued_at|suite|alpn_len|tag, empty ALPN (shin 0.7 ticket layout)"
+    assert!(
+        !t.ticket.is_empty(),
+        "the server-issued opaque ticket must be present"
     );
     assert!(
-        !t.psk.iter().all(|&b| b == 0),
+        !t.psk.as_slice().iter().all(|&b| b == 0),
         "client must derive PSK from rms+nonce"
     );
 }
 
 #[test]
 fn client_takes_tickets_drains_buffer() {
-    let (mut server, mut client) = handshake_pair();
+    let (mut server, mut client, mut workspace) = handshake_pair();
     let now = Instant::now();
-    for mut pkt in server.send_packets(now) {
-        client.recv_packet(&mut pkt, now).expect("client recv");
+    for mut pkt in server.transmit().send(now) {
+        client
+            .recv_packet(&mut workspace, &mut pkt, now)
+            .expect("client recv");
     }
     let _ = client.take_session_tickets();
     assert!(

@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use shin::crypto::aead::AeadKey;
+use shin::crypto::aead::Key;
 
 use crate::hp::HeaderProtectionKey;
 use crate::qkdf::PacketKeys;
@@ -23,7 +23,7 @@ impl_error!(PacketProtectionError {
 });
 
 pub struct PacketProtection {
-    aead: AeadKey,
+    aead: Key,
     hp: HeaderProtectionKey,
 }
 
@@ -34,7 +34,7 @@ const MAX_PACKET_NUMBER: u64 = (1 << 62) - 1;
 impl PacketProtection {
     pub fn aes_128(keys: &PacketKeys) -> Result<Self, PacketProtectionError> {
         Ok(Self {
-            aead: AeadKey::aes_128_gcm(&keys.key, keys.iv)
+            aead: Key::aes_128_gcm(&keys.key, keys.iv)
                 .map_err(|_| PacketProtectionError::InvalidKey)?,
             hp: HeaderProtectionKey::aes_128(&keys.hp)
                 .map_err(|_| PacketProtectionError::InvalidKey)?,

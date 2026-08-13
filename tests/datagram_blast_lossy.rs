@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use dope_quic::conn::server;
 use dope_quic::conn::{self, datagram::CongestionControl};
-use dope_quic::{Connection, transport_params};
+use dope_quic::{conn::session::Connection, transport_params};
 
 const CID: [u8; 8] = [0x88; 8];
 
@@ -19,8 +19,8 @@ impl Lcg {
     }
 }
 
-fn cfg(mode: CongestionControl) -> conn::Config {
-    conn::Config {
+fn cfg(mode: CongestionControl) -> conn::config::Options {
+    conn::config::Options {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 60_000,
             max_datagram_frame_size: Some(65535),
@@ -28,17 +28,17 @@ fn cfg(mode: CongestionControl) -> conn::Config {
         },
         datagram_congestion_control: mode,
         pending_datagrams_capacity: 4096,
-        ..conn::Config::default()
+        ..conn::config::Options::default()
     }
 }
 
 fn handshake_pair(
-    client_cfg: conn::Config,
-    server_cfg: conn::Config,
-) -> (Connection, server::Connection) {
+    client_cfg: conn::config::Options,
+    server_cfg: conn::config::Options,
+) -> (Connection, server::Connection, conn::ReceiveWorkspace) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
-    let mut server = Connection::new_server(
+    let mut server = dope_quic::conn::setup::Server::<0>::accept(
         CID.to_vec(),
         CID.to_vec(),
         CID.to_vec(),
@@ -46,23 +46,29 @@ fn handshake_pair(
         server_cfg,
     )
     .unwrap();
-    let mut client =
-        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, client_cfg).unwrap();
+    let mut client = dope_quic::conn::setup::Client::<0>::connect(
+        CID.to_vec(),
+        CID.to_vec(),
+        server_pubkey,
+        client_cfg,
+    )
+    .unwrap();
     let now = Instant::now();
+    let mut workspace = conn::ReceiveWorkspace::new();
     for _ in 0..6 {
-        for mut pkt in client.send_packets(now) {
-            let _ = server.recv_packet(&mut pkt, now);
+        for mut pkt in client.transmit().send(now) {
+            let _ = server.recv_packet(&mut workspace, &mut pkt, now);
         }
-        for mut pkt in server.send_packets(now) {
-            let _ = client.recv_packet(&mut pkt, now);
+        for mut pkt in server.transmit().send(now) {
+            let _ = client.recv_packet(&mut workspace, &mut pkt, now);
         }
-        if client.is_established() && server.is_established() {
+        if client.status().is_established() && server.status().is_established() {
             break;
         }
     }
-    assert!(client.is_established());
-    assert!(server.is_established());
-    (client, server)
+    assert!(client.status().is_established());
+    assert!(server.status().is_established());
+    (client, server, workspace)
 }
 
 fn blast_drain(
@@ -70,12 +76,13 @@ fn blast_drain(
     drop_per_million: u32,
     n: usize,
 ) -> (usize, usize, Duration) {
-    let (mut client, mut server) = handshake_pair(cfg(mode), cfg(mode));
+    let (mut client, mut server, mut workspace) = handshake_pair(cfg(mode), cfg(mode));
     let mut rng = Lcg(0xDEAD_BEEF_CAFE_BABE);
 
     for i in 0..n {
         client
-            .try_send_datagram(format!("dg-{i:06}").into_bytes())
+            .datagrams()
+            .try_send(format!("dg-{i:06}").into_bytes())
             .expect("queue");
     }
 
@@ -88,30 +95,30 @@ fn blast_drain(
     while received < n && iterations < max_iter {
         let mut any_progress = false;
 
-        for mut pkt in client.send_packets(now) {
+        for mut pkt in client.transmit().send(now) {
             if rng.next() % 1_000_000 >= drop_per_million {
-                let _ = server.recv_packet(&mut pkt, now);
+                let _ = server.recv_packet(&mut workspace, &mut pkt, now);
                 any_progress = true;
             }
         }
-        while let Some(_dg) = server.recv_datagram() {
+        while let Some(_dg) = server.datagrams().recv() {
             received += 1;
         }
-        for mut pkt in server.send_packets(now) {
+        for mut pkt in server.transmit().send(now) {
             if rng.next() % 1_000_000 >= drop_per_million {
-                let _ = client.recv_packet(&mut pkt, now);
+                let _ = client.recv_packet(&mut workspace, &mut pkt, now);
                 any_progress = true;
             }
         }
 
-        client.check_loss(now);
-        server.check_loss(now);
+        conn::recovery::Loss::new(&mut client).check_loss(now);
+        conn::recovery::Loss::new(&mut server).check_loss(now);
 
         iterations += 1;
         now += Duration::from_micros(100);
         if !any_progress
-            && client.send_packets(now).is_empty()
-            && server.send_packets(now).is_empty()
+            && client.transmit().send(now).is_empty()
+            && server.transmit().send(now).is_empty()
         {
             break;
         }
@@ -159,17 +166,18 @@ fn standard_under_30pct_loss() {
 
 #[test]
 fn uncongested_bursts_are_bounded_without_dropping_the_queue() {
-    let (mut client, _server) = handshake_pair(
+    let (mut client, _server, _workspace) = handshake_pair(
         cfg(CongestionControl::Uncongested),
         cfg(CongestionControl::Uncongested),
     );
     for i in 0..1000usize {
         client
-            .try_send_datagram(format!("dg-{i:06}").into_bytes())
+            .datagrams()
+            .try_send(format!("dg-{i:06}").into_bytes())
             .expect("queue");
     }
-    let first = client.send_packets(Instant::now());
+    let first = client.transmit().send(Instant::now());
     assert_eq!(first.len(), 64);
-    let second = client.send_packets(Instant::now());
+    let second = client.transmit().send(Instant::now());
     assert_eq!(second.len(), 64);
 }

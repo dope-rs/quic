@@ -7,12 +7,12 @@ use shin::crypto::sig::SigningKey;
 
 #[derive(Default)]
 struct NoopHandler;
-impl Handler for NoopHandler {
+impl Handler<0> for NoopHandler {
     type Connection = ();
 
     fn create_connection(
         &mut self,
-        _conn: &mut dope_quic::Connection,
+        _conn: &mut dope_quic::conn::session::Connection,
         _handle: dope_quic::conn::Handle,
     ) {
     }
@@ -35,8 +35,8 @@ fn make_initial(dcid: &[u8], scid: &[u8]) -> Vec<u8> {
 
 fn server_mux() -> Mux<NoopHandler> {
     let signing = SigningKey::from_seed(&[0x11u8; 32]).unwrap();
-    let cfg: conn::Config = transport_params::Params::default().into();
-    Mux::server(NoopHandler, signing, cfg).unwrap()
+    let cfg: conn::config::Options = transport_params::Params::default().into();
+    dope_quic::mux::setup::Server::accept(NoopHandler, signing, cfg).unwrap()
 }
 
 #[test]
@@ -48,10 +48,14 @@ fn fragmented_initials_with_same_dcid_route_to_one_conn() {
     let dcid = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
     let scid = [0xaa, 0xbb, 0xcc, 0xdd];
 
-    let _ = mux.recv(from, &mut make_initial(&dcid, &scid), now);
+    let _ = mux
+        .protocol()
+        .recv(from, &mut make_initial(&dcid, &scid), now);
     assert_eq!(mux.active_conns(), 1, "first Initial opens one connection");
 
-    let _ = mux.recv(from, &mut make_initial(&dcid, &scid), now);
+    let _ = mux
+        .protocol()
+        .recv(from, &mut make_initial(&dcid, &scid), now);
     assert_eq!(
         mux.active_conns(),
         1,
@@ -65,12 +69,12 @@ fn initials_with_distinct_dcids_open_distinct_conns() {
     let from: SocketAddr = "127.0.0.1:55556".parse().unwrap();
     let now = Instant::now();
 
-    let _ = mux.recv(
+    let _ = mux.protocol().recv(
         from,
         &mut make_initial(&[1, 1, 1, 1, 1, 1, 1, 1], &[9, 9]),
         now,
     );
-    let _ = mux.recv(
+    let _ = mux.protocol().recv(
         from,
         &mut make_initial(&[2, 2, 2, 2, 2, 2, 2, 2], &[9, 9]),
         now,

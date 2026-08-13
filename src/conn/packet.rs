@@ -1,5 +1,4 @@
-use std::num::NonZeroU16;
-use std::ops::{Deref, DerefMut};
+use std::{num, ops};
 
 pub(super) struct Payload<'a> {
     out: &'a mut Vec<u8>,
@@ -20,7 +19,7 @@ impl<'a> Payload<'a> {
     }
 }
 
-impl Deref for Payload<'_> {
+impl ops::Deref for Payload<'_> {
     type Target = Vec<u8>;
 
     fn deref(&self) -> &Self::Target {
@@ -28,7 +27,7 @@ impl Deref for Payload<'_> {
     }
 }
 
-impl DerefMut for Payload<'_> {
+impl ops::DerefMut for Payload<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.out
     }
@@ -147,33 +146,33 @@ impl Sink for Batch {
 
 pub(crate) struct Gso {
     pub(crate) buf: Vec<u8>,
-    segment_size: Option<NonZeroU16>,
+    limits: dope::core::io::datagram::GsoLimits,
+    segment_size: Option<num::NonZeroU16>,
     packets: u8,
     sealed: bool,
 }
 
 impl Gso {
-    pub(crate) const fn new() -> Self {
+    pub(crate) const fn new(limits: dope::core::io::datagram::GsoLimits) -> Self {
         Self {
             buf: Vec::new(),
+            limits,
             segment_size: None,
             packets: 0,
             sealed: false,
         }
     }
 
-    pub(crate) fn take(&mut self) -> Option<(Vec<u8>, NonZeroU16, usize)> {
+    pub(crate) const fn limits(&self) -> dope::core::io::datagram::GsoLimits {
+        self.limits
+    }
+
+    pub(crate) fn take(&mut self) -> Option<(Vec<u8>, num::NonZeroU16, usize)> {
         let segment_size = self.segment_size.take()?;
         let packets = usize::from(self.packets);
         self.packets = 0;
         self.sealed = false;
         Some((core::mem::take(&mut self.buf), segment_size, packets))
-    }
-}
-
-impl Default for Gso {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -192,10 +191,10 @@ impl Sink for Gso {
         max_packet_bytes: usize,
         build: impl FnOnce(&mut Vec<u8>, usize) -> Option<(usize, T)>,
     ) -> Option<T> {
-        if self.sealed || usize::from(self.packets) >= dope::manifold::datagram::MAX_GSO_SEGMENTS {
+        if self.sealed || usize::from(self.packets) >= self.limits.max_segments {
             return None;
         }
-        let remaining = dope::manifold::datagram::MAX_GSO_BYTES.saturating_sub(self.buf.len());
+        let remaining = self.limits.max_bytes.saturating_sub(self.buf.len());
         let limit = self
             .segment_size
             .map_or(max_packet_bytes, |size| {
@@ -210,18 +209,18 @@ impl Sink for Gso {
             self.buf.truncate(start);
             return None;
         };
-        let segment_size = self
+        let Some(segment_size) = self
             .segment_size
-            .or_else(|| u16::try_from(bytes).ok().and_then(NonZeroU16::new));
-        let valid = bytes != 0
-            && bytes <= limit
-            && self.buf.len().saturating_sub(start) == bytes
-            && segment_size.is_some();
+            .or_else(|| u16::try_from(bytes).ok().and_then(num::NonZeroU16::new))
+        else {
+            self.buf.truncate(start);
+            return None;
+        };
+        let valid = bytes != 0 && bytes <= limit && self.buf.len().saturating_sub(start) == bytes;
         if !valid {
             self.buf.truncate(start);
             return None;
         }
-        let segment_size = segment_size.unwrap_or_else(|| unreachable!());
         self.segment_size = Some(segment_size);
         self.packets += 1;
         self.sealed = bytes < usize::from(segment_size.get());

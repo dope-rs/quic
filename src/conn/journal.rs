@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
-use o3::collections::{FixedIndexTable, StackArena, StackDrain};
+use o3::collections::fixed::{arena, index};
 
-use crate::frame::AckRanges;
+use crate::frame::ack_ranges::Ranges;
 use crate::rtt::PACKET_THRESHOLD;
 
 use super::Epoch;
@@ -21,8 +21,8 @@ pub(super) struct Packet {
     pub(super) crypto: Option<Handle<delivery::Crypto>>,
 }
 
-pub(super) type ControlDrain<'a> = StackDrain<'a, Handle<delivery::Control>>;
-pub(super) type StreamDrain<'a> = StackDrain<'a, Handle<delivery::Stream>>;
+pub(super) type ControlDrain<'a> = arena::StackDrain<'a, Handle<delivery::Control>>;
+pub(super) type StreamDrain<'a> = arena::StackDrain<'a, Handle<delivery::Stream>>;
 
 #[derive(Clone, Copy)]
 pub(super) struct PacketKey {
@@ -31,9 +31,9 @@ pub(super) struct PacketKey {
 }
 
 struct Ring {
-    slots: FixedIndexTable<Packet>,
-    controls: StackArena<Handle<delivery::Control>>,
-    streams: StackArena<Handle<delivery::Stream>>,
+    slots: index::Slots<Packet>,
+    controls: arena::Stack<Handle<delivery::Control>>,
+    streams: arena::Stack<Handle<delivery::Stream>>,
     lowest: Option<u64>,
     highest: Option<u64>,
 }
@@ -52,9 +52,9 @@ impl Ring {
             capacity
         };
         Self {
-            slots: FixedIndexTable::with_capacity(capacity),
-            controls: StackArena::with_capacity(control_capacity, carrier_lanes),
-            streams: StackArena::with_capacity(stream_capacity, carrier_lanes),
+            slots: index::Slots::with_capacity(capacity),
+            controls: arena::Stack::with_capacity(control_capacity, carrier_lanes),
+            streams: arena::Stack::with_capacity(stream_capacity, carrier_lanes),
             lowest: None,
             highest: None,
         }
@@ -100,33 +100,6 @@ impl Ring {
             .filter(|journal| journal.pn == pn)
     }
 
-    fn remove(
-        &mut self,
-        pn: u64,
-        mut emit: impl FnMut(Packet, ControlDrain<'_>, StreamDrain<'_>),
-    ) -> bool {
-        let Some((slot, journal)) = self.remove_unindexed(pn) else {
-            return false;
-        };
-        if self.slots.is_empty() {
-            self.lowest = None;
-            self.highest = None;
-        } else {
-            if self.lowest == Some(pn) {
-                self.lowest = self.scan_up(pn + 1, self.highest.unwrap_or(pn));
-            }
-            if self.highest == Some(pn) {
-                self.highest = self.scan_down(self.lowest.unwrap_or(pn), pn.saturating_sub(1));
-            }
-            if self.lowest.is_none() || self.highest.is_none() {
-                debug_assert!(false, "journal bounds lost with {} entries", self.len());
-                self.reindex();
-            }
-        }
-        self.emit(slot, journal, &mut emit);
-        true
-    }
-
     fn remove_unindexed(&mut self, pn: u64) -> Option<(usize, Packet)> {
         if self.slots.capacity() == 0 {
             return None;
@@ -156,12 +129,12 @@ impl Ring {
         }
     }
 
-    /// First present pn in `from..=to`, one slot probe per pn.
+    /// First present packet number in `from..=to`, one slot probe per number.
     fn scan_up(&self, from: u64, to: u64) -> Option<u64> {
         (from..=to).find(|&pn| self.get(pn).is_some())
     }
 
-    /// Last present pn in `from..=to`, one slot probe per pn.
+    /// Last present packet number in `from..=to`, one slot probe per number.
     fn scan_down(&self, from: u64, to: u64) -> Option<u64> {
         (from..=to).rev().find(|&pn| self.get(pn).is_some())
     }
@@ -305,27 +278,15 @@ impl Table {
         self.ring_mut(key.epoch).push_stream(key.slot, handle)
     }
 
-    pub(super) fn remove(
+    pub(super) fn drain_ack(
         &mut self,
         epoch: Epoch,
-        pn: u64,
-        emit: impl FnMut(Packet, ControlDrain<'_>, StreamDrain<'_>),
-    ) -> bool {
-        if !self.ring_mut(epoch).remove(pn, emit) {
-            return false;
-        }
-        self.len -= 1;
-        true
-    }
-
-    pub(super) fn drain_application_ack(
-        &mut self,
         largest: u64,
         first_range: u64,
-        additional: AckRanges<'_>,
+        additional: Ranges<'_>,
         mut emit: impl FnMut(Packet, ControlDrain<'_>, StreamDrain<'_>),
     ) {
-        let ring = self.ring_mut(Epoch::Application);
+        let ring = self.ring_mut(epoch);
         let first_smallest = largest.saturating_sub(first_range);
         ring.drain_range(first_smallest, largest, &mut emit);
         let mut previous_smallest = first_smallest;
@@ -338,13 +299,14 @@ impl Table {
         self.recount();
     }
 
-    pub(super) fn drain_application_lost(
+    pub(super) fn drain_lost(
         &mut self,
+        epoch: Epoch,
         largest_acked: u64,
         lost_send_time: Instant,
         mut emit: impl FnMut(Packet, ControlDrain<'_>, StreamDrain<'_>),
     ) {
-        let ring = self.ring_mut(Epoch::Application);
+        let ring = self.ring_mut(epoch);
         let Some(lowest) = ring.lowest else {
             return;
         };
@@ -382,18 +344,19 @@ impl Table {
         self.recount();
     }
 
-    pub(super) fn application_iter_mut(&mut self) -> impl Iterator<Item = &mut Packet> {
-        self.ring_mut(Epoch::Application).iter_mut()
+    pub(super) fn iter_mut(&mut self, epoch: Epoch) -> impl Iterator<Item = &mut Packet> {
+        self.ring_mut(epoch).iter_mut()
     }
 
-    pub(super) fn application_loss_candidate(
+    pub(super) fn loss_candidate(
         &self,
+        epoch: Epoch,
         largest_acked: u64,
         loss_delay: Duration,
     ) -> Option<Instant> {
         let lowest = largest_acked.saturating_sub(PACKET_THRESHOLD - 1);
         (lowest..=largest_acked)
-            .filter_map(|pn| self.ring(Epoch::Application).get(pn))
+            .filter_map(|pn| self.ring(epoch).get(pn))
             .filter(|journal| !journal.pto_protected)
             .map(|journal| journal.sent_time + loss_delay)
             .min()
@@ -413,98 +376,16 @@ impl Table {
         self.ring(epoch).len()
     }
 
+    pub(super) fn in_flight_bytes(&self, epoch: Epoch) -> u64 {
+        self.ring(epoch)
+            .slots
+            .values()
+            .filter(|packet| packet.in_flight)
+            .map(|packet| packet.bytes_sent as u64)
+            .sum()
+    }
+
     fn recount(&mut self) {
         self.len = self.rings.iter().map(Ring::len).sum();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::delivery::{Control, Stream, Tracker};
-    use super::*;
-
-    fn packet(pn: u64) -> Packet {
-        Packet {
-            epoch: Epoch::Application,
-            pn,
-            early_data: false,
-            sent_time: Instant::now(),
-            ack_eliciting: true,
-            in_flight: true,
-            bytes_sent: 1_200,
-            pto_protected: false,
-            crypto: None,
-        }
-    }
-
-    #[test]
-    fn typed_carriers_follow_the_packet_slot_and_return_capacity() {
-        let mut controls = Tracker::new(2);
-        let control_a = controls
-            .insert(Epoch::Application, Control::MaxData(1))
-            .unwrap();
-        let control_b = controls
-            .insert(Epoch::Application, Control::MaxData(2))
-            .unwrap();
-        let mut streams = Tracker::new(1);
-        let stream = streams
-            .insert(
-                Epoch::Application,
-                Stream {
-                    stream_id: 0,
-                    offset: 0,
-                    len: 1,
-                    fin: false,
-                    retransmit: false,
-                },
-            )
-            .unwrap();
-        let mut table = Table::new(4, 2, 1);
-
-        assert!(table.has_room_for(Epoch::Application, 5, 1));
-        assert!(table.has_carrier_room(2, 1));
-        let key = table.insert(packet(5)).unwrap();
-        assert!(table.push_control(key, control_a));
-        assert!(table.push_control(key, control_b));
-        assert!(table.push_stream(key, stream));
-        assert!(!table.has_room_for(Epoch::Application, 9, 1));
-        assert!(!table.has_carrier_room(1, 0));
-
-        let mut drained_controls = Vec::new();
-        let mut drained_streams = Vec::new();
-        assert!(
-            table.remove(Epoch::Application, 5, |packet, controls, streams| {
-                assert_eq!(packet.pn, 5);
-                drained_controls.extend(controls);
-                drained_streams.extend(streams);
-            })
-        );
-        assert_eq!(drained_controls, [control_b, control_a]);
-        assert_eq!(drained_streams, [stream]);
-        assert!(table.has_room_for(Epoch::Application, 9, 1));
-        assert!(table.has_carrier_room(2, 1));
-    }
-
-    #[test]
-    fn crypto_rings_have_no_carrier_storage_or_cross_epoch_lane_aliases() {
-        let mut table = Table::new(4, 1, 1);
-        assert!(
-            table
-                .insert(Packet {
-                    epoch: Epoch::Initial,
-                    ..packet(1)
-                })
-                .is_some()
-        );
-        assert!(table.insert(packet(1)).is_some());
-
-        let mut initial = 0;
-        assert!(table.remove(Epoch::Initial, 1, |_, controls, streams| {
-            initial += 1;
-            assert_eq!(controls.count(), 0);
-            assert_eq!(streams.count(), 0);
-        }));
-        assert_eq!(initial, 1);
-        assert_eq!(table.count_epoch(Epoch::Application), 1);
     }
 }

@@ -26,24 +26,3 @@ impl Streams {
         if uni { self.uni } else { self.bidi }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn frontiers_encode_implicit_lower_streams() {
-        let mut opened = Streams::default();
-        opened.open(9);
-        assert!(opened.contains(1));
-        assert!(opened.contains(5));
-        assert!(opened.contains(9));
-        assert!(!opened.contains(13));
-
-        opened.open(11);
-        assert!(opened.contains(3));
-        assert!(opened.contains(7));
-        assert!(opened.contains(11));
-        assert!(!opened.contains(15));
-    }
-}

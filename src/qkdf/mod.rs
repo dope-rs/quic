@@ -1,7 +1,7 @@
-use shin::crypto::hash::HashAlg;
+use shin::crypto::hash::Algorithm;
 use shin::crypto::kdf::{Hkdf, HkdfError};
 
-const ALG: HashAlg = HashAlg::Sha256;
+const ALG: Algorithm = Algorithm::Sha256;
 
 pub const INITIAL_SALT_V1: [u8; 20] = [
     0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,

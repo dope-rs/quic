@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use dope_quic::conn::{Handle, stream::Event};
-use dope_quic::{Connection, Handler, Mux, transport_params};
+use dope_quic::{Handler, Mux, conn::session::Connection, transport_params};
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
@@ -23,7 +23,7 @@ struct CapturingHandler {
     events: Rc<RefCell<Events>>,
 }
 
-impl Handler for CapturingHandler {
+impl Handler<0> for CapturingHandler {
     type Connection = Handle;
 
     fn create_connection(&mut self, _conn: &mut Connection, handle: Handle) -> Handle {
@@ -66,11 +66,14 @@ fn relay_once(
     src_addr: SocketAddr,
 ) -> usize {
     let now = Instant::now();
-    let pkts: Vec<_> = src.drain_outgoing().collect();
+    let pkts: Vec<_> = src.output().drain().collect();
     let n = pkts.len();
     for mut out in pkts {
-        dst.recv(src_addr, out.payload_mut(), now).expect("recv");
+        dst.protocol()
+            .recv(src_addr, out.payload_mut(), now)
+            .expect("recv");
     }
+    dst.output().drive_bounded(now);
     n
 }
 
@@ -93,17 +96,22 @@ fn quic_datagram_handshake_and_app_traffic() {
 
     let server_handler = CapturingHandler::default();
     let server_events = server_handler.events.clone();
-    let mut server = Mux::server(server_handler, signing, user_tp.clone().into()).unwrap();
+    let mut server =
+        dope_quic::mux::setup::Server::accept(server_handler, signing, user_tp.clone().into())
+            .unwrap();
 
     let client_handler = CapturingHandler::default();
     let client_events = client_handler.events.clone();
-    let mut client = Mux::client(client_handler).unwrap();
+    let mut client = dope_quic::mux::setup::Client::new(client_handler)
+        .build()
+        .unwrap();
 
     let server_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
     let client_addr: SocketAddr = "10.0.0.1:50000".parse().unwrap();
 
     let now = Instant::now();
     let client_handle = client
+        .protocol()
         .connect(
             server_addr,
             server_pubkey,
@@ -116,6 +124,8 @@ fn quic_datagram_handshake_and_app_traffic() {
     relay_once(&mut client, &mut server, client_addr);
     relay_once(&mut server, &mut client, server_addr);
     relay_once(&mut client, &mut server, client_addr);
+    server.output().drive_bounded(now);
+    client.output().drive_bounded(now);
 
     let server_handle = {
         let evs = server_events.borrow();
@@ -129,6 +139,7 @@ fn quic_datagram_handshake_and_app_traffic() {
     }
 
     client
+        .protocol()
         .try_send_datagram(client_handle, b"hello server".to_vec(), now)
         .unwrap();
     relay_once(&mut client, &mut server, client_addr);
@@ -140,6 +151,7 @@ fn quic_datagram_handshake_and_app_traffic() {
     }
 
     server
+        .protocol()
         .try_send_datagram(server_handle, b"hello client".to_vec(), now)
         .unwrap();
     relay_once(&mut server, &mut client, server_addr);
@@ -151,32 +163,40 @@ fn quic_datagram_handshake_and_app_traffic() {
     }
 
     let stream_id = {
-        let conn = client.conn_mut(client_handle).expect("client conn");
-        let stream_id = conn.open_bidi_stream().unwrap();
-        conn.stream_send(stream_id, b"hello stream").unwrap();
-        conn.stream_send_fin(stream_id).unwrap();
+        let mut conn = client
+            .protocol()
+            .conn_mut(client_handle)
+            .expect("client conn");
+        let stream_id = conn.streams().open_bidi().unwrap();
+        conn.streams().send(stream_id, b"hello stream").unwrap();
+        conn.streams().finish(stream_id).unwrap();
         stream_id
     };
     let stream_now = Instant::now();
-    client.flush(client_handle, stream_now);
+    client.protocol().flush(client_handle, stream_now);
     assert!(relay_once(&mut client, &mut server, client_addr) > 0);
     {
         let evs = server_events.borrow();
         assert!(
             evs.streams
-                .contains(&(server_handle, Event::Data { stream_id })),
+                .contains(&(server_handle, Event::Readable { stream_id })),
             "streams={:?} expected handle={:?} stream_id={}",
             evs.streams,
             server_handle,
             stream_id
         );
-        assert!(
+        assert_eq!(
             evs.streams
-                .contains(&(server_handle, Event::Finished { stream_id }))
+                .iter()
+                .filter(|(handle, event)| {
+                    *handle == server_handle && *event == Event::Readable { stream_id }
+                })
+                .count(),
+            1,
         );
     }
 
-    client.close(client_handle);
+    client.protocol().close(client_handle);
     assert_eq!(client_events.borrow().closed, vec![client_handle]);
 }
 
@@ -194,8 +214,10 @@ fn accept_flood_is_bounded_by_max_conns() {
         initial_max_data: 1 << 20,
         ..transport_params::Params::default()
     };
-    let mut server = Mux::server(CapturingHandler::default(), signing, user_tp.into()).unwrap();
-    assert!(server.set_max_conns(4));
+    let mut server =
+        dope_quic::mux::setup::Server::accept(CapturingHandler::default(), signing, user_tp.into())
+            .unwrap();
+    assert!(server.configuration().set_max_connections(4));
 
     let now = Instant::now();
     for i in 0u32..16 {
@@ -229,7 +251,7 @@ fn accept_flood_is_bounded_by_max_conns() {
             .encrypt_long(&hdr, &payload, 0, pn_off, pn_len as usize)
             .unwrap();
         let from: SocketAddr = format!("10.0.0.{}:5000", (i % 250) + 1).parse().unwrap();
-        let _ = server.recv(from, &mut wire, now);
+        let _ = server.protocol().recv(from, &mut wire, now);
     }
 
     assert_eq!(server.active_conns(), 4, "accept-flood capped at max_conns");
@@ -238,28 +260,33 @@ fn accept_flood_is_bounded_by_max_conns() {
 #[test]
 fn client_egress_stops_at_fixed_capacity_without_dropping_conn_work() {
     let handler = CapturingHandler::default();
-    let mut client = Mux::client_with_outgoing_capacity(handler, 2).unwrap();
+    let mut client = dope_quic::mux::setup::Client::new(handler)
+        .outgoing_capacity(2)
+        .build()
+        .unwrap();
     let addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
     let handles = (0..4)
         .map(|index| {
             client
+                .protocol()
                 .connect(
                     addr,
                     [7; 32],
-                    dope_quic::conn::Config::default(),
+                    dope_quic::conn::config::Options::default(),
                     vec![index as u8; 8],
                     Instant::now(),
                 )
                 .unwrap()
         })
         .collect::<Vec<_>>();
-    assert_eq!(client.outgoing_capacity(), 2);
-    assert_eq!(client.outgoing_len(), 2);
-    let mut sent = client.drain_outgoing().count();
+    client.output().drive_bounded(Instant::now());
+    assert_eq!(client.output().capacity(), 2);
+    assert_eq!(client.output().len(), 2);
+    let mut sent = client.output().drain().count();
     for handle in handles {
-        client.flush(handle, Instant::now());
-        assert!(client.outgoing_len() <= client.outgoing_capacity());
-        sent += client.drain_outgoing().count();
+        client.protocol().flush(handle, Instant::now());
+        assert!(client.output().len() <= client.output().capacity());
+        sent += client.output().drain().count();
     }
     assert!(sent >= 4);
 }
@@ -267,109 +294,129 @@ fn client_egress_stops_at_fixed_capacity_without_dropping_conn_work() {
 #[test]
 fn client_egress_byte_budget_uses_encoded_packet_sizes() {
     let addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
-    let mut tight =
-        Mux::client_with_outgoing_limits(CapturingHandler::default(), 4, 4 * 1200).unwrap();
+    let mut tight = dope_quic::mux::setup::Client::new(CapturingHandler::default())
+        .outgoing_limits(4, 4 * 1200)
+        .build()
+        .unwrap();
     for index in 0..4 {
         tight
+            .protocol()
             .connect(
                 addr,
                 [7; 32],
-                dope_quic::conn::Config::default(),
+                dope_quic::conn::config::Options::default(),
                 vec![index; 8],
                 Instant::now(),
             )
             .unwrap();
     }
-    assert_eq!(tight.outgoing_len(), 4);
-    assert_eq!(tight.outgoing_bytes(), 4 * 1200);
+    tight.output().drive_bounded(Instant::now());
+    assert_eq!(tight.output().len(), 4);
+    assert_eq!(tight.output().bytes(), 4 * 1200);
 
-    let mut defaults = Mux::client(CapturingHandler::default()).unwrap();
+    let mut defaults = dope_quic::mux::setup::Client::new(CapturingHandler::default())
+        .build()
+        .unwrap();
     for index in 0..300u16 {
         defaults
+            .protocol()
             .connect(
                 addr,
                 [7; 32],
-                dope_quic::conn::Config::default(),
+                dope_quic::conn::config::Options::default(),
                 index.to_be_bytes().repeat(4),
                 Instant::now(),
             )
             .unwrap();
     }
-    assert_eq!(defaults.outgoing_capacity(), 4096);
-    assert_eq!(defaults.outgoing_len(), 300);
-    assert_eq!(defaults.outgoing_bytes(), 300 * 1200);
+    while defaults.output().drive_bounded(Instant::now()) != 0 {}
+    assert_eq!(defaults.output().capacity(), 4096);
+    assert_eq!(defaults.output().len(), 300);
+    assert_eq!(defaults.output().bytes(), 300 * 1200);
 }
 
 #[test]
 fn packet_larger_than_total_byte_capacity_is_rejected() {
     let handler = CapturingHandler::default();
     let events = handler.events.clone();
-    let mut client = Mux::client_with_outgoing_limits(handler, 4, 1199).unwrap();
-    let error = client.connect(
+    let mut client = dope_quic::mux::setup::Client::new(handler)
+        .outgoing_limits(4, 1199)
+        .build()
+        .unwrap();
+    let error = client.protocol().connect(
         "10.0.0.2:443".parse().unwrap(),
         [7; 32],
-        dope_quic::conn::Config::default(),
+        dope_quic::conn::config::Options::default(),
         CID.to_vec(),
         Instant::now(),
     );
     assert_eq!(error, Err(dope_quic::ConnectError::InvalidConfig));
-    assert_eq!(client.outgoing_len(), 0);
-    assert_eq!(client.outgoing_bytes(), 0);
+    assert_eq!(client.output().len(), 0);
+    assert_eq!(client.output().bytes(), 0);
     assert_eq!(client.active_conns(), 0);
     assert!(events.borrow().closed.is_empty());
 }
 
 #[test]
 fn thirteen_hundred_byte_cap_round_robins_two_connections() {
-    let mut client =
-        Mux::client_with_outgoing_limits(CapturingHandler::default(), 2, 1300).unwrap();
+    let mut client = dope_quic::mux::setup::Client::new(CapturingHandler::default())
+        .outgoing_limits(2, 1300)
+        .build()
+        .unwrap();
     let addr = "10.0.0.2:443".parse().unwrap();
     client
+        .protocol()
         .connect(
             addr,
             [7; 32],
-            dope_quic::conn::Config::default(),
+            dope_quic::conn::config::Options::default(),
             vec![1; 8],
             Instant::now(),
         )
         .unwrap();
     client
+        .protocol()
         .connect(
             addr,
             [7; 32],
-            dope_quic::conn::Config::default(),
+            dope_quic::conn::config::Options::default(),
             vec![2; 8],
             Instant::now(),
         )
         .unwrap();
+    client.output().drive_bounded(Instant::now());
     assert_eq!(client.active_conns(), 2);
-    assert_eq!(client.outgoing_len(), 1);
-    assert_eq!(client.outgoing_bytes(), 1200);
-    let packets = client.drain_outgoing().collect::<Vec<_>>();
+    assert_eq!(client.output().len(), 1);
+    assert_eq!(client.output().bytes(), 1200);
+    let packets = client.output().drain().collect::<Vec<_>>();
     assert_eq!(packets.len(), 2);
     assert!(packets.iter().all(|packet| packet.payload().len() == 1200));
-    assert_eq!(client.outgoing_len(), 0);
-    assert_eq!(client.outgoing_bytes(), 0);
+    assert_eq!(client.output().len(), 0);
+    assert_eq!(client.output().bytes(), 0);
     assert_eq!(client.active_conns(), 2);
 }
 
 #[test]
 fn client_connection_capacity_is_fallible() {
-    let mut client = Mux::client_with_limits(CapturingHandler::default(), 1, 8, 16 << 10).unwrap();
+    let mut client = dope_quic::mux::setup::Client::new(CapturingHandler::default())
+        .limits(1, 8, 16 << 10)
+        .build()
+        .unwrap();
     let addr = "10.0.0.2:443".parse().unwrap();
     client
+        .protocol()
         .connect(
             addr,
             [7; 32],
-            dope_quic::conn::Config::default(),
+            dope_quic::conn::config::Options::default(),
             vec![1; 8],
             Instant::now(),
         )
         .unwrap();
-    let second = client.connect(
+    let second = client.protocol().connect(
         addr,
         [7; 32],
-        dope_quic::conn::Config::default(),
+        dope_quic::conn::config::Options::default(),
         vec![2; 8],
         Instant::now(),
     );
@@ -389,20 +436,29 @@ fn reap_shares_global_packet_budget_between_connections() {
     };
     let server_handler = CapturingHandler::default();
     let server_events = server_handler.events.clone();
-    let mut server =
-        Mux::server_with_outgoing_capacity(server_handler, signing, params.clone().into(), 10)
-            .unwrap();
+    let mut server = dope_quic::mux::setup::Server::with_outgoing_capacity(
+        server_handler,
+        signing,
+        params.clone().into(),
+        10,
+    )
+    .unwrap();
     let first_handler = CapturingHandler::default();
     let first_events = first_handler.events.clone();
     let second_handler = CapturingHandler::default();
     let second_events = second_handler.events.clone();
-    let mut first = Mux::client(first_handler).unwrap();
-    let mut second = Mux::client(second_handler).unwrap();
+    let mut first = dope_quic::mux::setup::Client::new(first_handler)
+        .build()
+        .unwrap();
+    let mut second = dope_quic::mux::setup::Client::new(second_handler)
+        .build()
+        .unwrap();
     let server_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
     let first_addr: SocketAddr = "10.0.0.1:50001".parse().unwrap();
     let second_addr: SocketAddr = "10.0.0.1:50002".parse().unwrap();
     let mut now = Instant::now();
     first
+        .protocol()
         .connect(
             server_addr,
             server_pubkey,
@@ -412,26 +468,31 @@ fn reap_shares_global_packet_budget_between_connections() {
         )
         .unwrap();
     second
+        .protocol()
         .connect(server_addr, server_pubkey, params.into(), vec![2; 8], now)
         .unwrap();
     for _ in 0..12 {
-        for mut outgoing in first.drain_outgoing().collect::<Vec<_>>() {
+        for mut outgoing in first.output().drain().collect::<Vec<_>>() {
             server
+                .protocol()
                 .recv(first_addr, outgoing.payload_mut(), now)
                 .unwrap();
         }
-        for mut outgoing in second.drain_outgoing().collect::<Vec<_>>() {
+        for mut outgoing in second.output().drain().collect::<Vec<_>>() {
             server
+                .protocol()
                 .recv(second_addr, outgoing.payload_mut(), now)
                 .unwrap();
         }
-        for mut outgoing in server.drain_outgoing().collect::<Vec<_>>() {
+        for mut outgoing in server.output().drain().collect::<Vec<_>>() {
             if outgoing.addr() == first_addr {
                 first
+                    .protocol()
                     .recv(server_addr, outgoing.payload_mut(), now)
                     .unwrap();
             } else {
                 second
+                    .protocol()
                     .recv(server_addr, outgoing.payload_mut(), now)
                     .unwrap();
             }
@@ -447,15 +508,16 @@ fn reap_shares_global_packet_budget_between_connections() {
     let handles = server_events.borrow().established.clone();
     assert_eq!(handles.len(), 2);
     for handle in handles {
-        let conn = server.conn_mut(handle).unwrap();
-        let stream = conn.open_uni_stream().unwrap();
-        conn.stream_send(stream, &[7; 128 * 1024]).unwrap();
-        conn.stream_send_fin(stream).unwrap();
+        let mut conn = server.protocol().conn_mut(handle).unwrap();
+        let stream = conn.streams().open_uni().unwrap();
+        conn.streams().send(stream, &[7; 128 * 1024]).unwrap();
+        conn.streams().finish(stream).unwrap();
     }
     now += Duration::from_millis(100);
-    server.reap_closed(now);
+    server.output().drive_bounded(now);
     let destinations = server
-        .drain_outgoing()
+        .output()
+        .drain()
         .map(|outgoing| outgoing.addr())
         .collect::<Vec<_>>();
     assert!(destinations.len() >= 2);

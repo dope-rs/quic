@@ -2,8 +2,8 @@ use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use dope_quic::Connection;
 use dope_quic::conn::server;
+use dope_quic::conn::session::Connection;
 use dope_quic::conn::{self, datagram::CongestionControl, packet::Batch};
 use dope_quic::transport_params;
 use shin::crypto::sig::SigningKey;
@@ -24,24 +24,38 @@ impl Pair {
     fn established() -> Self {
         let signing = SigningKey::from_seed(&SEED).expect("seed");
         let server_pubkey = *signing.pubkey().expect("public key");
-        let mut server =
-            Connection::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, config())
-                .expect("server configuration");
-        let mut client =
-            Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, config())
-                .expect("client configuration");
+        let mut server = dope_quic::conn::setup::Server::accept(
+            CID.to_vec(),
+            CID.to_vec(),
+            CID.to_vec(),
+            signing,
+            config(),
+        )
+        .expect("server configuration");
+        let mut client = dope_quic::conn::setup::Client::connect(
+            CID.to_vec(),
+            CID.to_vec(),
+            server_pubkey,
+            config(),
+        )
+        .expect("client configuration");
+        let mut workspace = conn::ReceiveWorkspace::new();
         for _ in 0..32 {
             let now = Instant::now();
-            let mut client_packets = client.send_packets(now);
+            let mut client_packets = client.transmit().send(now);
             for packet in &mut client_packets {
-                server.recv_packet(packet, now).expect("server receive");
+                server
+                    .recv_packet(&mut workspace, packet, now)
+                    .expect("server receive");
             }
-            let mut server_packets = server.send_packets(now);
+            let mut server_packets = server.transmit().send(now);
             for packet in &mut server_packets {
-                client.recv_packet(packet, now).expect("client receive");
+                client
+                    .recv_packet(&mut workspace, packet, now)
+                    .expect("client receive");
             }
-            if client.is_established()
-                && server.is_established()
+            if client.status().is_established()
+                && server.status().is_established()
                 && client_packets.is_empty()
                 && server_packets.is_empty()
             {
@@ -55,8 +69,8 @@ impl Pair {
     }
 }
 
-fn config() -> conn::Config {
-    conn::Config {
+fn config() -> conn::config::Options {
+    conn::config::Options {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
             max_datagram_frame_size: Some(65_535),
@@ -68,7 +82,7 @@ fn config() -> conn::Config {
         },
         datagram_congestion_control: CongestionControl::Uncongested,
         pending_datagrams_capacity: 8_192,
-        ..conn::Config::default()
+        ..conn::config::Options::default()
     }
 }
 
@@ -94,7 +108,9 @@ fn print_distribution(name: &str, mut values: Vec<Duration>) {
 
 fn emit_one(connection: &mut Connection, batch: &mut Batch, min_bytes: usize) -> Duration {
     let started = Instant::now();
-    connection.send_batch(batch, Instant::now(), 1, 1_200);
+    connection
+        .transmit()
+        .send_batch(batch, Instant::now(), 1, 1_200);
     let elapsed = started.elapsed();
     assert_eq!(batch.packets(), 1);
     assert!(batch.byte_len() >= min_bytes);
@@ -103,10 +119,15 @@ fn emit_one(connection: &mut Connection, batch: &mut Batch, min_bytes: usize) ->
 
 fn arm_control_probe(connection: &mut Connection, batch: &mut Batch, token: u64) {
     connection.send_path_challenge(token.to_ne_bytes());
-    connection.send_batch(batch, Instant::now(), 1, 1_200);
+    connection
+        .transmit()
+        .send_batch(batch, Instant::now(), 1, 1_200);
     assert_eq!(batch.packets(), 1);
-    let deadline = connection.next_timer().expect("control packet timer");
-    connection.check_loss(deadline);
+    let deadline = connection
+        .status()
+        .next_timer()
+        .expect("control packet timer");
+    conn::recovery::Loss::new(connection).check_loss(deadline);
 }
 
 fn main() {
@@ -117,7 +138,8 @@ fn main() {
     let mut warmup = Pair::established();
     warmup
         .client
-        .try_send_datagram(vec![0; PAYLOAD])
+        .datagrams()
+        .try_send(vec![0; PAYLOAD])
         .expect("warmup queue");
     let _ = emit_one(&mut warmup.client, &mut batch, PAYLOAD);
 
@@ -134,15 +156,21 @@ fn main() {
 
     for _ in 0..groups {
         let started = Instant::now();
-        let client = Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, config())
-            .expect("client configuration");
+        let client = dope_quic::conn::setup::Client::<0>::connect(
+            CID.to_vec(),
+            CID.to_vec(),
+            server_pubkey,
+            config(),
+        )
+        .expect("client configuration");
         construct.push(started.elapsed());
         black_box(&client);
         drop(client);
         let mut pairs = std::array::from_fn::<_, CONNECTIONS, _>(|_| Pair::established());
         for pair in &mut pairs {
             pair.client
-                .try_send_datagram(vec![0; PAYLOAD])
+                .datagrams()
+                .try_send(vec![0; PAYLOAD])
                 .expect("first queue");
         }
         for (position, pair) in pairs.iter_mut().enumerate() {
@@ -150,16 +178,18 @@ fn main() {
         }
         for pair in &mut pairs {
             pair.client
-                .try_send_datagram(vec![0; PAYLOAD])
+                .datagrams()
+                .try_send(vec![0; PAYLOAD])
                 .expect("second queue");
         }
         for (position, pair) in pairs.iter_mut().enumerate() {
             second[position].push(emit_one(&mut pair.client, &mut batch, PAYLOAD));
         }
         for pair in &mut pairs {
-            let stream_id = pair.client.open_bidi_stream().expect("stream credit");
+            let stream_id = pair.client.streams().open_bidi().expect("stream credit");
             pair.client
-                .stream_send(stream_id, &[0; PAYLOAD])
+                .streams()
+                .send(stream_id, &[0; PAYLOAD])
                 .expect("stream payload");
         }
         for (position, pair) in pairs.iter_mut().enumerate() {
