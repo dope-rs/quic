@@ -89,8 +89,8 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Loss<'a, DOMAIN, B> {
                 .packet_journals
                 .iter_mut(conn::Epoch::Application)
             {
-                if journal.in_flight {
-                    journal.pto_protected = true;
+                if journal.transmission.in_flight() {
+                    journal.transmission.protect_pto();
                 }
             }
         }

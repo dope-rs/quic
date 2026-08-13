@@ -70,7 +70,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer, C: conn::control::Write>
                     };
                     self.deliveries.egress.rtt.update(sample, delay);
                 }
-                if journal.ack_eliciting {
+                if journal.transmission.ack_eliciting() {
                     self.deliveries.egress.pto_count = 0;
                 }
                 self.deliveries

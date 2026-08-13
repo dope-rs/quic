@@ -61,12 +61,13 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
         let mut journal = journal::Packet {
             epoch,
             pn,
-            early_data: commit.early_data,
             sent_time: now,
-            ack_eliciting: commit.ack_eliciting,
-            in_flight: commit.in_flight,
             bytes_sent: commit.bytes,
-            pto_protected: false,
+            transmission: journal::Transmission::new(
+                commit.early_data,
+                commit.ack_eliciting,
+                commit.in_flight,
+            ),
             crypto: None,
         };
         self.connection.egress.spaces[epoch as usize].next_pn = pn.saturating_add(1);

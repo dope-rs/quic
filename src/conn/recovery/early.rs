@@ -33,9 +33,9 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer, C: conn::control::Write>
     pub(in crate::conn) fn reject(mut self) {
         let mut journals = mem::take(&mut self.deliveries.egress.packet_journals);
         journals.drain_where(
-            |journal| journal.early_data,
+            |journal| journal.transmission.early_data(),
             |journal, controls, streams| {
-                if journal.ack_eliciting && journal.in_flight {
+                if journal.transmission.ack_eliciting() && journal.transmission.in_flight() {
                     self.deliveries.egress.spaces[conn::Epoch::Application as usize]
                         .ack_eliciting_in_flight = self.deliveries.egress.spaces
                         [conn::Epoch::Application as usize]

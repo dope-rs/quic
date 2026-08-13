@@ -41,12 +41,12 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer, C: conn::control::Write>
     ) {
         self.egress
             .cc
-            .packet_acked(journal.bytes_sent as u64, journal.in_flight);
+            .packet_acked(journal.bytes_sent as u64, journal.transmission.in_flight());
         if epoch == conn::Epoch::Application && Some(journal.pn) == self.egress.pmtud_probe_pn {
             self.egress.pmtud.probe_acked();
             self.egress.pmtud_probe_pn = None;
         }
-        if journal.ack_eliciting && journal.in_flight {
+        if journal.transmission.ack_eliciting() && journal.transmission.in_flight() {
             self.egress.spaces[epoch as usize].ack_eliciting_in_flight = self.egress.spaces
                 [epoch as usize]
                 .ack_eliciting_in_flight

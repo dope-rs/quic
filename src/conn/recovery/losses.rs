@@ -78,7 +78,7 @@ impl<'operation, 'state, const DOMAIN: u8, B: stream::ReceiveBuffer, C: conn::co
             largest_acked,
             lost_send_time,
             |journal, controls, streams| {
-                if journal.ack_eliciting && journal.in_flight {
+                if journal.transmission.ack_eliciting() && journal.transmission.in_flight() {
                     self.deliveries.egress.spaces[epoch as usize].ack_eliciting_in_flight =
                         self.deliveries.egress.spaces[epoch as usize]
                             .ack_eliciting_in_flight

@@ -9,15 +9,51 @@ use crate::conn;
 use crate::conn::delivery;
 
 #[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+pub(super) struct Transmission(u8);
+
+impl Transmission {
+    const EARLY_DATA: u8 = 1 << 0;
+    const ACK_ELICITING: u8 = 1 << 1;
+    const IN_FLIGHT: u8 = 1 << 2;
+    const PTO_PROTECTED: u8 = 1 << 3;
+
+    pub(super) fn new(early_data: bool, ack_eliciting: bool, in_flight: bool) -> Self {
+        Self(
+            (u8::from(early_data) * Self::EARLY_DATA)
+                | (u8::from(ack_eliciting) * Self::ACK_ELICITING)
+                | (u8::from(in_flight) * Self::IN_FLIGHT),
+        )
+    }
+
+    pub(super) fn early_data(self) -> bool {
+        self.0 & Self::EARLY_DATA != 0
+    }
+
+    pub(super) fn ack_eliciting(self) -> bool {
+        self.0 & Self::ACK_ELICITING != 0
+    }
+
+    pub(super) fn in_flight(self) -> bool {
+        self.0 & Self::IN_FLIGHT != 0
+    }
+
+    pub(super) fn pto_protected(self) -> bool {
+        self.0 & Self::PTO_PROTECTED != 0
+    }
+
+    pub(super) fn protect_pto(&mut self) {
+        self.0 |= Self::PTO_PROTECTED;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct Packet {
     pub(super) epoch: conn::Epoch,
     pub(super) pn: u64,
-    pub(super) early_data: bool,
     pub(super) sent_time: time::Instant,
-    pub(super) ack_eliciting: bool,
-    pub(super) in_flight: bool,
     pub(super) bytes_sent: usize,
-    pub(super) pto_protected: bool,
+    pub(super) transmission: Transmission,
     pub(super) crypto: Option<delivery::Handle<delivery::Crypto>>,
 }
 
@@ -321,13 +357,13 @@ impl Table {
                 continue;
             };
             let lost = largest_acked.saturating_sub(pn) >= rtt::PACKET_THRESHOLD
-                || (!journal.pto_protected && journal.sent_time <= lost_send_time);
+                || (!journal.transmission.pto_protected() && journal.sent_time <= lost_send_time);
             if lost {
                 if let Some((slot, journal)) = ring.remove_unindexed(pn) {
                     removed = true;
                     ring.emit(slot, journal, &mut emit);
                 }
-            } else if !journal.pto_protected {
+            } else if !journal.transmission.pto_protected() {
                 break;
             }
         }
@@ -361,7 +397,7 @@ impl Table {
         let lowest = largest_acked.saturating_sub(rtt::PACKET_THRESHOLD - 1);
         (lowest..=largest_acked)
             .filter_map(|pn| self.ring(epoch).get(pn))
-            .filter(|journal| !journal.pto_protected)
+            .filter(|journal| !journal.transmission.pto_protected())
             .map(|journal| journal.sent_time + loss_delay)
             .min()
     }
@@ -384,7 +420,7 @@ impl Table {
         self.ring(epoch)
             .slots
             .values()
-            .filter(|packet| packet.in_flight)
+            .filter(|packet| packet.transmission.in_flight())
             .map(|packet| packet.bytes_sent as u64)
             .sum()
     }
