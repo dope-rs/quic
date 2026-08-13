@@ -31,22 +31,33 @@ fn cfg() -> conn::config::Options {
 }
 
 fn handshake() -> (server::Connection, Connection, conn::ReceiveWorkspace) {
+    handshake_with_control_capacity(cfg().control_journal_capacity)
+}
+
+fn handshake_with_control_capacity(
+    control_journal_capacity: usize,
+) -> (server::Connection, Connection, conn::ReceiveWorkspace) {
     let signing = support::signing_key(0x39);
     let server_pubkey = *signing.pubkey().unwrap();
+
+    let mut server_config = cfg();
+    server_config.control_journal_capacity = control_journal_capacity;
+    let mut client_config = cfg();
+    client_config.control_journal_capacity = control_journal_capacity;
 
     let mut server = dope_quic::conn::setup::Server::<0>::accept(
         CID.to_vec(),
         CID.to_vec(),
         CID.to_vec(),
         signing,
-        cfg(),
+        server_config,
     )
     .unwrap();
     let mut client = dope_quic::conn::setup::Client::<0>::connect(
         CID.to_vec(),
         CID.to_vec(),
         server_pubkey,
-        cfg(),
+        client_config,
     )
     .unwrap();
     let mut workspace = conn::ReceiveWorkspace::new();
@@ -150,6 +161,39 @@ fn multiple_outstanding_challenges_validate_independently() {
     drain(&mut workspace, &mut client, &mut server);
     assert!(server.status().path_validated(&a));
     assert!(server.status().path_validated(&b));
+}
+
+#[test]
+fn bounded_control_backpressure_preserves_every_path_challenge() {
+    const TOKENS: usize = 64;
+    const CONTROL_CAPACITY: usize = 32;
+    let (mut server, mut client, mut workspace) = handshake_with_control_capacity(CONTROL_CAPACITY);
+    let tokens: Vec<_> = (0..TOKENS)
+        .map(|token| (token as u64).to_ne_bytes())
+        .collect();
+
+    for &token in &tokens {
+        client.send_path_challenge(token);
+    }
+
+    for _ in 0..16 {
+        drain(&mut workspace, &mut client, &mut server);
+        drain(&mut workspace, &mut server, &mut client);
+        drain(&mut workspace, &mut client, &mut server);
+        if tokens
+            .iter()
+            .all(|token| client.status().path_validated(token))
+        {
+            break;
+        }
+    }
+
+    assert!(
+        tokens
+            .iter()
+            .all(|token| client.status().path_validated(token)),
+        "control journal pressure must defer rather than drop path challenges",
+    );
 }
 
 #[test]

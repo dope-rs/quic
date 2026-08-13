@@ -174,7 +174,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                 payload_limit,
             );
             let has_control = track_delivery && !self.packet.connection.control.is_empty();
-            if has_control && let Some(cursor) = self.packet.connection.control.prefix() {
+            if has_control && let Some(cursor) = self.packet.connection.control.ready().prefix() {
                 crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_pending_controls(
                     &self.packet.connection.control,
                     &self.packet.connection.path,
@@ -205,7 +205,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                 commit.properties.ack_eliciting = true;
             }
             if has_control
-                && let Some(records) = self.packet.connection.control.only_path_responses()
+                && let Some(records) = self.packet.connection.control.ready().only_path_responses()
             {
                 crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_path_controls(
                     &self.packet.connection.control,
@@ -216,7 +216,12 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                     &mut commit,
                 );
             } else if has_control
-                && let Some(records) = self.packet.connection.control.only_path_challenges()
+                && let Some(records) = self
+                    .packet
+                    .connection
+                    .control
+                    .ready()
+                    .only_path_challenges()
             {
                 crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_path_controls(
                     &self.packet.connection.control,
@@ -226,7 +231,9 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                     payload_limit,
                     &mut commit,
                 );
-            } else if has_control && let Some(cursor) = self.packet.connection.control.suffix() {
+            } else if has_control
+                && let Some(cursor) = self.packet.connection.control.ready().suffix()
+            {
                 crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_pending_controls(
                     &self.packet.connection.control,
                     &self.packet.connection.path,
@@ -349,6 +356,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                             .packet
                             .connection
                             .control
+                            .ready()
                             .data_blocked_sendable(&transmit.peer_data_credit)
                         && !commit.contains_control(delivery::Control::DataBlocked(
                             transmit.peer_data_credit.limit(),
@@ -383,6 +391,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                             .packet
                             .connection
                             .control
+                            .ready()
                             .stream_data_blocked_sendable(&entry.credit, id)
                     {
                         let record = delivery::Control::StreamDataBlocked(id, stream_limit);

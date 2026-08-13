@@ -137,6 +137,7 @@ fn warmed_one_rtt_send_and_decrypt_do_not_allocate() {
     first_send_stream_state_does_not_allocate();
     recycled_send_stream_state_does_not_allocate();
     recurring_control_delivery_does_not_allocate();
+    control_pto_probe_does_not_allocate();
 }
 
 fn maximal_receive_plan_does_not_allocate() {
@@ -242,6 +243,45 @@ fn recurring_control_delivery_does_not_allocate() {
         "recurring control allocation size {}",
         LAST_SIZE.load(Ordering::Relaxed)
     );
+}
+
+fn control_pto_probe_does_not_allocate() {
+    let (mut client, mut server, mut workspace) = established();
+    let token = 3u64.to_ne_bytes();
+    let mut batch = Batch::default();
+    let sent_at = Instant::now() + Duration::from_secs(20);
+
+    client.send_path_challenge(token);
+    client.transmit().send_batch(&mut batch, sent_at, 2, 1200);
+    assert!(!batch.is_empty());
+    let deadline = client.status().next_timer().expect("control PTO");
+    let probe_at = deadline + Duration::from_millis(1);
+
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    COUNTING.set(true);
+    conn::recovery::Loss::new(&mut client).check_loss(probe_at);
+    client.transmit().send_batch(&mut batch, probe_at, 2, 1200);
+    COUNTING.set(false);
+
+    assert!(!batch.is_empty());
+    assert_eq!(
+        ALLOCATIONS.load(Ordering::Relaxed),
+        0,
+        "control PTO allocation size {}",
+        LAST_SIZE.load(Ordering::Relaxed)
+    );
+
+    for packet in batch.iter_mut() {
+        server
+            .recv_packet(&mut workspace, packet, probe_at)
+            .unwrap();
+    }
+    for mut packet in server.transmit().send(probe_at) {
+        client
+            .recv_packet(&mut workspace, &mut packet, probe_at)
+            .unwrap();
+    }
+    assert!(client.status().path_validated(&token));
 }
 
 fn first_send_stream_state_does_not_allocate() {

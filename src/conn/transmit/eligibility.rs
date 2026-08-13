@@ -149,10 +149,12 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility<'_, DOMAIN, B> {
                     || (connection_budget == 0
                         && connection
                             .control
+                            .ready()
                             .data_blocked_sendable(&connection.streams.transmit.peer_data_credit))
                     || (stream_budget == 0
                         && connection
                             .control
+                            .ready()
                             .stream_data_blocked_sendable(&entry.credit, stream_id))
             })
     }
@@ -198,7 +200,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility<'_, DOMAIN, B> {
                         .streams
                         .state
                         .receive_controls_sendable(&connection.control)
-                    || connection.control.has_sendable()
+                    || connection.control.ready().has_sendable()
                     || connection
                         .handshake
                         .crypto()

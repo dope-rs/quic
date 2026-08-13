@@ -9,6 +9,7 @@ pub(super) mod delivery;
 pub(super) mod encode;
 mod linkage;
 mod records;
+mod tests;
 
 use crate::conn::control::linkage::Linkage as _;
 use crate::conn::control::records::Records as _;
@@ -220,6 +221,14 @@ pub(super) struct Pending {
     lanes: Lanes,
     flights: Flights,
     handshake_done: Option<OwnerKey<kind::HandshakeDone>>,
+}
+
+/// Read-only send capability tied to the pending-control owner.
+/// It adds no storage or allocation: cursors retain the original owner borrow.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub(super) struct Ready<'pending> {
+    pending: &'pending Pending,
 }
 
 /// Linear budget for new records. Reserving temporarily lowers the ordinary
@@ -798,31 +807,8 @@ impl Pending {
         })
     }
 
-    pub(super) fn only_path_responses(&self) -> Option<cursor::Cursor<'_, PATH_RESPONSE>> {
-        (self.lanes.bits == PATH_RESPONSE).then(|| cursor::Cursor::new(self))
-    }
-
-    pub(super) fn only_path_challenges(&self) -> Option<cursor::Cursor<'_, PATH_CHALLENGE>> {
-        (self.lanes.bits == PATH_CHALLENGE).then(|| cursor::Cursor::new(self))
-    }
-
-    pub(super) fn prefix(&self) -> Option<cursor::Cursor<'_, PREFIX>> {
-        (self.lanes.ready_bits & PREFIX != 0).then(|| cursor::Cursor::new(self))
-    }
-
-    pub(super) fn suffix(&self) -> Option<cursor::Cursor<'_, SUFFIX>> {
-        (self.lanes.ready_bits & SUFFIX != 0).then(|| cursor::Cursor::new(self))
-    }
-
-    pub(super) fn has_sendable(&self) -> bool {
-        self.lanes.ready_bits & (PREFIX | SUFFIX) != 0
-    }
-
-    pub(super) fn data_blocked_sendable(&self, credit: &send::Credit<kind::DataBlocked>) -> bool {
-        self.blocked_sendable(
-            credit.blocked(),
-            crate::conn::delivery::Control::DataBlocked(credit.limit()),
-        )
+    pub(super) fn ready(&self) -> Ready<'_> {
+        Ready { pending: self }
     }
 
     pub(super) fn queue_data_blocked(
@@ -831,17 +817,6 @@ impl Pending {
     ) -> Option<crate::conn::delivery::Handle<crate::conn::delivery::Control>> {
         let record = crate::conn::delivery::Control::DataBlocked(credit.limit());
         self.queue_blocked(credit.blocked_mut(), record)
-    }
-
-    pub(super) fn stream_data_blocked_sendable(
-        &self,
-        credit: &send::Credit<kind::StreamDataBlocked>,
-        stream_id: u64,
-    ) -> bool {
-        self.blocked_sendable(
-            credit.blocked(),
-            crate::conn::delivery::Control::StreamDataBlocked(stream_id, credit.limit()),
-        )
     }
 
     pub(super) fn queue_stream_data_blocked(
@@ -949,6 +924,46 @@ impl Pending {
     }
 }
 
+impl<'pending> Ready<'pending> {
+    pub(super) fn only_path_responses(self) -> Option<cursor::Cursor<'pending, PATH_RESPONSE>> {
+        (self.pending.lanes.bits == PATH_RESPONSE).then(|| cursor::Cursor::new(self.pending))
+    }
+
+    pub(super) fn only_path_challenges(self) -> Option<cursor::Cursor<'pending, PATH_CHALLENGE>> {
+        (self.pending.lanes.bits == PATH_CHALLENGE).then(|| cursor::Cursor::new(self.pending))
+    }
+
+    pub(super) fn prefix(self) -> Option<cursor::Cursor<'pending, PREFIX>> {
+        (self.pending.lanes.ready_bits & PREFIX != 0).then(|| cursor::Cursor::new(self.pending))
+    }
+
+    pub(super) fn suffix(self) -> Option<cursor::Cursor<'pending, SUFFIX>> {
+        (self.pending.lanes.ready_bits & SUFFIX != 0).then(|| cursor::Cursor::new(self.pending))
+    }
+
+    pub(super) fn has_sendable(self) -> bool {
+        self.pending.lanes.ready_bits & (PREFIX | SUFFIX) != 0
+    }
+
+    pub(super) fn data_blocked_sendable(self, credit: &send::Credit<kind::DataBlocked>) -> bool {
+        self.pending.blocked_sendable(
+            credit.blocked(),
+            crate::conn::delivery::Control::DataBlocked(credit.limit()),
+        )
+    }
+
+    pub(super) fn stream_data_blocked_sendable(
+        self,
+        credit: &send::Credit<kind::StreamDataBlocked>,
+        stream_id: u64,
+    ) -> bool {
+        self.pending.blocked_sendable(
+            credit.blocked(),
+            crate::conn::delivery::Control::StreamDataBlocked(stream_id, credit.limit()),
+        )
+    }
+}
+
 fn lane(bit: u16) -> usize {
     bit.trailing_zeros() as usize
 }
@@ -973,3 +988,4 @@ fn kind_bit(record: crate::conn::delivery::Control) -> u16 {
 
 const _: () = assert!(std::mem::size_of::<Option<OwnerKey<kind::MaxData>>>() == 8);
 const _: () = assert!(std::mem::size_of::<Signal<kind::ResetStream>>() == 8);
+const _: () = assert!(std::mem::size_of::<Ready<'static>>() == std::mem::size_of::<&Pending>());
