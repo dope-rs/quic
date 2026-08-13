@@ -10,6 +10,7 @@ use crate::range_buffer;
 
 use crate::conn::control::Write as _;
 use crate::conn::streams;
+use crate::conn::streams::incoming;
 use crate::conn::streams::table;
 use crate::conn::streams::transmit::Transmit as _;
 
@@ -37,28 +38,6 @@ impl super::ReceiveCredits {
     fn clear(&mut self, credit: u8) {
         self.0 &= !credit;
     }
-}
-
-pub(in crate::conn) trait Incoming<B: crate::stream::ReceiveBuffer> {
-    fn len(&self) -> usize;
-    fn insert(
-        self,
-        stream: &mut crate::stream::Receiver<B>,
-        ranges: &mut crate::range_buffer::Arena<B>,
-        parts: &mut Vec<(u64, std::ops::Range<usize>)>,
-        offset: u64,
-        fin: bool,
-    ) -> Result<(), crate::stream::RecvError>;
-}
-
-pub(in crate::conn) struct Copied<'a>(pub(in crate::conn) &'a [u8]);
-
-pub(in crate::conn) enum RetainedIncoming<'d> {
-    Driver(crate::stream::RecvBuffer<'d>),
-    Compact {
-        bytes: o3::buffer::storage::Shared,
-        original_len: usize,
-    },
 }
 
 pub(in crate::conn) struct AdmissionImpact {
@@ -304,66 +283,6 @@ impl<'a, B: crate::stream::ReceiveBuffer> ReceiveControlDrain<'a, B> {
     }
 }
 
-impl<B: crate::stream::ReceiveBuffer> Incoming<B> for Copied<'_> {
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    fn insert(
-        self,
-        stream: &mut crate::stream::Receiver<B>,
-        ranges: &mut crate::range_buffer::Arena<B>,
-        parts: &mut Vec<(u64, std::ops::Range<usize>)>,
-        offset: u64,
-        fin: bool,
-    ) -> Result<(), crate::stream::RecvError> {
-        B::insert_copied(stream, ranges, parts, offset, self.0, fin)
-    }
-}
-
-impl<'d> Incoming<crate::stream::RecvBuffer<'d>> for RetainedIncoming<'d> {
-    fn len(&self) -> usize {
-        match self {
-            Self::Driver(bytes) => bytes.len(),
-            Self::Compact { original_len, .. } => *original_len,
-        }
-    }
-
-    fn insert(
-        self,
-        stream: &mut crate::stream::Receiver<crate::stream::RecvBuffer<'d>>,
-        ranges: &mut crate::range_buffer::Arena<crate::stream::RecvBuffer<'d>>,
-        parts: &mut Vec<(u64, std::ops::Range<usize>)>,
-        offset: u64,
-        fin: bool,
-    ) -> Result<(), crate::stream::RecvError> {
-        match self {
-            Self::Driver(bytes) => stream.insert_retained(ranges, parts, offset, bytes, fin),
-            Self::Compact {
-                bytes,
-                original_len,
-            } => stream.insert_compact(ranges, parts, offset, original_len, bytes, fin),
-        }
-    }
-}
-
-impl<B: crate::stream::ReceiveBuffer> Incoming<B> for B {
-    fn len(&self) -> usize {
-        self.as_ref().len()
-    }
-
-    fn insert(
-        self,
-        stream: &mut crate::stream::Receiver<B>,
-        ranges: &mut crate::range_buffer::Arena<B>,
-        parts: &mut Vec<(u64, std::ops::Range<usize>)>,
-        offset: u64,
-        fin: bool,
-    ) -> Result<(), crate::stream::RecvError> {
-        stream.insert(ranges, parts, offset, self, fin)
-    }
-}
-
 impl<B: crate::stream::ReceiveBuffer> streams::State<B> {
     pub(in crate::conn) fn receive_controls_pending(&self) -> bool {
         self.receive_credits.any() || !self.receive.control_schedule.is_empty()
@@ -514,7 +433,7 @@ impl<B: crate::stream::ReceiveBuffer> streams::State<B> {
         }
     }
 
-    pub(in crate::conn) fn ingest_stream_reserved<D: Incoming<B>>(
+    pub(in crate::conn) fn ingest_stream_reserved<D: incoming::Incoming<B>>(
         &mut self,
         incoming: IncomingStream,
         data: D,

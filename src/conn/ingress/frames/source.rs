@@ -6,7 +6,7 @@ use crate::conn::streams;
 use crate::stream;
 
 pub(in crate::conn::ingress) trait Source<B: stream::ReceiveBuffer> {
-    type Stream<'a>: streams::receive::Incoming<B>
+    type Stream<'a>: streams::incoming::Incoming<B>
     where
         Self: 'a;
 
@@ -43,7 +43,7 @@ impl<B> Copied<B> {
 
 impl<B: stream::ReceiveBuffer> Source<B> for Copied<B> {
     type Stream<'a>
-        = streams::receive::Copied<'a>
+        = streams::incoming::Copied<'a>
     where
         Self: 'a;
 
@@ -62,7 +62,7 @@ impl<B: stream::ReceiveBuffer> Source<B> for Copied<B> {
         _payload: receive_workspace::ReceivePayloadPlan,
         bytes: &'a [u8],
     ) -> Self::Stream<'a> {
-        streams::receive::Copied(bytes)
+        streams::incoming::Copied(bytes)
     }
 }
 
@@ -92,7 +92,7 @@ impl<'a, 'turn, 'retainer, 'd> Retained<'a, 'turn, 'retainer, 'd> {
 
 impl<'d> Source<stream::RecvBuffer<'d>> for Retained<'_, '_, '_, 'd> {
     type Stream<'a>
-        = streams::receive::RetainedIncoming<'d>
+        = streams::incoming::RetainedIncoming<'d>
     where
         Self: 'a;
 
@@ -164,9 +164,9 @@ impl<'d> Source<stream::RecvBuffer<'d>> for Retained<'_, '_, '_, 'd> {
         bytes: &'a [u8],
     ) -> Self::Stream<'a> {
         if self.retained.is_some() {
-            streams::receive::RetainedIncoming::Driver(self.take_datagram(range, payload, bytes))
+            streams::incoming::RetainedIncoming::Driver(self.take_datagram(range, payload, bytes))
         } else {
-            streams::receive::RetainedIncoming::Compact {
+            streams::incoming::RetainedIncoming::Compact {
                 bytes: self
                     .compact
                     .as_ref()
