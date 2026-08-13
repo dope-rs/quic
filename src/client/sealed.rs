@@ -11,6 +11,8 @@ use o3::cell::region;
 
 use crate::client;
 
+pub trait Authority {}
+
 // SAFETY: `Control` exposes only protocol borrows and slot commands inside one
 // step. It cannot move, replace, or drop the client or its retained endpoint.
 unsafe impl<'d, 'tls, const ID: u8, P, B, A, C> dispatch::raw::Controlled<'d>

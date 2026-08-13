@@ -17,7 +17,7 @@ mod clock;
 pub mod conn;
 pub mod early_data;
 pub mod endpoint;
-mod errors;
+pub mod errors;
 pub mod frame;
 mod hp;
 pub mod mux;
@@ -28,10 +28,12 @@ pub mod packet_protection;
 mod pmtud;
 mod pn_space;
 pub mod qkdf;
-mod range_buffer;
+#[doc(hidden)]
+pub mod range_buffer;
 mod rtt;
 mod secrets;
-mod stream;
+#[doc(hidden)]
+pub mod stream;
 pub mod transport_params;
 pub mod varint;
 

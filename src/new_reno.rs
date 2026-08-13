@@ -1,19 +1,19 @@
 use std::time::Instant;
 
-pub const MAX_DATAGRAM_SIZE: u64 = 1200;
+pub(crate) const MAX_DATAGRAM_SIZE: u64 = 1200;
 
-pub const INITIAL_WINDOW: u64 = 12_000;
+pub(crate) const INITIAL_WINDOW: u64 = 12_000;
 
-pub const MINIMUM_WINDOW: u64 = 2_400;
+pub(crate) const MINIMUM_WINDOW: u64 = 2_400;
 
 const LOSS_REDUCTION_DENOMINATOR: u64 = 2;
 
 #[derive(Debug, Clone)]
-pub struct NewReno {
-    pub cwnd: u64,
-    pub ssthresh: u64,
-    pub bytes_in_flight: u64,
-    pub last_congestion_event: Option<Instant>,
+pub(crate) struct NewReno {
+    pub(crate) cwnd: u64,
+    pub(crate) ssthresh: u64,
+    pub(crate) bytes_in_flight: u64,
+    pub(crate) last_congestion_event: Option<Instant>,
 }
 
 impl Default for NewReno {

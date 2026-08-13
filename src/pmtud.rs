@@ -1,11 +1,11 @@
-pub const BASE_PMTU: u64 = 1200;
-pub const DEFAULT_MAX_PMTU: u64 = 1500;
-pub const MAX_PMTU: u64 = 65_527;
+pub(crate) const BASE_PMTU: u64 = 1200;
+pub(crate) const DEFAULT_MAX_PMTU: u64 = 1500;
+pub(crate) const MAX_PMTU: u64 = 65_527;
 const MAX_PROBES_PER_SIZE: u32 = 3;
 const SEARCH_DONE_INTERVAL: u64 = 4;
 
 #[derive(Debug, Clone)]
-pub struct Pmtud {
+pub(crate) struct Pmtud {
     current: u64,
     upper_bound: u64,
     in_flight_size: Option<u64>,

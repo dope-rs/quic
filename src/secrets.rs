@@ -8,7 +8,7 @@ use subtle::ConstantTimeEq;
 use crate::packet::{ConnectionId, ConnectionIdRef};
 
 #[derive(Clone, Copy)]
-pub struct StatelessResetSecret(pub [u8; 32]);
+pub(crate) struct StatelessResetSecret(pub(crate) [u8; 32]);
 
 impl From<[u8; 32]> for StatelessResetSecret {
     fn from(b: [u8; 32]) -> Self {
@@ -30,7 +30,7 @@ impl StatelessResetSecret {
 }
 
 #[derive(Clone, Copy)]
-pub struct RetryTokenSecret(pub [u8; 32]);
+pub(crate) struct RetryTokenSecret(pub(crate) [u8; 32]);
 
 impl From<[u8; 32]> for RetryTokenSecret {
     fn from(b: [u8; 32]) -> Self {

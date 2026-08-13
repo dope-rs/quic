@@ -67,10 +67,8 @@ pub struct PooledEndpointSpec<'tls> {
     pub pool: &'tls conn::tls::ClientPool,
 }
 
-mod authority;
-
 #[doc(hidden)]
-pub trait EndpointAuthority<'tls>: Copy + authority::Sealed {
+pub trait EndpointAuthority<'tls>: Copy + sealed::Authority {
     fn connect<'d, const ID: u8, H: Handler<ID>>(
         self,
         endpoint: Pin<&mut PooledEndpoint<'d, 'tls, ID, H>>,
@@ -80,7 +78,7 @@ pub trait EndpointAuthority<'tls>: Copy + authority::Sealed {
     ) -> Result<Handle, crate::ConnectError>;
 }
 
-impl authority::Sealed for [u8; 32] {}
+impl sealed::Authority for [u8; 32] {}
 
 impl<'tls> EndpointAuthority<'tls> for [u8; 32] {
     #[inline]
@@ -95,7 +93,7 @@ impl<'tls> EndpointAuthority<'tls> for [u8; 32] {
     }
 }
 
-impl authority::Sealed for &conn::tls::ClientPool {}
+impl sealed::Authority for &conn::tls::ClientPool {}
 
 impl<'tls> EndpointAuthority<'tls> for &'tls conn::tls::ClientPool {
     #[inline]

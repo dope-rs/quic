@@ -12,11 +12,11 @@ use crate::range_buffer::{Arena, InsertError, MAX_RANGES, RangeBuffer, ReadySegm
 
 const MAX_RECV_SEGMENTS: usize = MAX_RANGES;
 
-mod receive_buffer;
+mod sealed;
 
 /// Receive storage that can preserve a packet owner's lifetime while exposing
 /// only the accepted byte range.
-pub trait ReceiveBuffer: receive_buffer::Sealed + AsRef<[u8]> + Sized {
+pub trait ReceiveBuffer: sealed::Buffer + AsRef<[u8]> + Sized {
     #[doc(hidden)]
     type Ready: ReadyBuffer<Self>;
     #[doc(hidden)]
@@ -52,6 +52,9 @@ pub trait ReceiveBuffer: receive_buffer::Sealed + AsRef<[u8]> + Sized {
 pub trait ReadyBuffer<B: ReceiveBuffer>: Default {
     fn clear(&mut self, arena: &mut Arena<B>);
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn segment_count(&self) -> usize;
     fn try_push_back(&mut self, arena: &mut Arena<B>, buffer: B) -> Result<(), B>;
     fn read_into(&mut self, arena: &mut Arena<B>, destination: &mut Vec<u8>) -> usize;
@@ -59,7 +62,7 @@ pub trait ReadyBuffer<B: ReceiveBuffer>: Default {
     fn pop_front(&mut self, arena: &mut Arena<B>) -> Option<B>;
 }
 
-impl receive_buffer::Sealed for Vec<u8> {}
+impl sealed::Buffer for Vec<u8> {}
 
 impl ReceiveBuffer for Vec<u8> {
     type Ready = Vec<u8>;
@@ -204,7 +207,7 @@ impl<'d> RecvBuffer<'d> {
     }
 }
 
-impl receive_buffer::Sealed for RecvBuffer<'_> {}
+impl sealed::Buffer for RecvBuffer<'_> {}
 
 impl std::fmt::Debug for RecvBuffer<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

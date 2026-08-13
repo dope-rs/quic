@@ -1,20 +1,20 @@
 use std::time::Duration;
 
-pub const GRANULARITY: Duration = Duration::from_millis(1);
+pub(crate) const GRANULARITY: Duration = Duration::from_millis(1);
 
-pub const INITIAL_RTT: Duration = Duration::from_millis(333);
+pub(crate) const INITIAL_RTT: Duration = Duration::from_millis(333);
 
-pub const PACKET_THRESHOLD: u64 = 3;
+pub(crate) const PACKET_THRESHOLD: u64 = 3;
 
-pub const TIME_THRESHOLD_NUMERATOR: u32 = 9;
-pub const TIME_THRESHOLD_DENOMINATOR: u32 = 8;
+pub(crate) const TIME_THRESHOLD_NUMERATOR: u32 = 9;
+pub(crate) const TIME_THRESHOLD_DENOMINATOR: u32 = 8;
 
 #[derive(Debug, Default, Clone)]
-pub struct RttTracker {
-    pub latest_rtt: Option<Duration>,
-    pub min_rtt: Option<Duration>,
-    pub smoothed_rtt: Option<Duration>,
-    pub rttvar: Duration,
+pub(crate) struct RttTracker {
+    pub(crate) latest_rtt: Option<Duration>,
+    pub(crate) min_rtt: Option<Duration>,
+    pub(crate) smoothed_rtt: Option<Duration>,
+    pub(crate) rttvar: Duration,
 }
 
 impl RttTracker {

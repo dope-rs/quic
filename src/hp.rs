@@ -1,11 +1,11 @@
 use ring::aead::quic;
 
-pub struct HeaderProtectionKey {
+pub(crate) struct HeaderProtectionKey {
     inner: quic::HeaderProtectionKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeaderProtectionError {
+pub(crate) enum HeaderProtectionError {
     InvalidKey,
     InvalidSample,
 }
