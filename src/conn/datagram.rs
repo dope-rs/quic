@@ -20,20 +20,20 @@ impl<'conn, const DOMAIN: u8, B: ReceiveBuffer> Datagrams<'conn, DOMAIN, B> {
         Self { connection }
     }
 
-    pub fn try_send(&mut self, data: Vec<u8>) -> Result<(), errors::TrySendError<Vec<u8>>> {
+    pub fn try_send(&mut self, data: Vec<u8>) -> Result<(), errors::SendFailure<Vec<u8>>> {
         if self.connection.egress.state == conn::State::Closed {
-            return Err(errors::TrySendError::Closed(data));
+            return Err(errors::SendFailure::Closed(data));
         }
         let Some(max) = self.max_payload() else {
-            return Err(errors::TrySendError::Unsupported(data));
+            return Err(errors::SendFailure::Unsupported(data));
         };
         if data.len() > max {
-            return Err(errors::TrySendError::TooLarge(data));
+            return Err(errors::SendFailure::TooLarge(data));
         }
         if self.connection.egress.pending_datagrams.len()
             >= self.connection.egress.pending_datagrams_capacity
         {
-            return Err(errors::TrySendError::Full(data));
+            return Err(errors::SendFailure::Full(data));
         }
         self.connection.egress.pending_datagrams.push_back(data);
         Ok(())

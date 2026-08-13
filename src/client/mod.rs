@@ -11,10 +11,10 @@ use o3::collections::{heap::Min, queue::slot::Fifo};
 use pin_project::pin_project;
 use ring::rand::{SecureRandom, SystemRandom};
 
-use crate::TrySendError;
+use crate::SendFailure;
 use crate::conn::session::Connection;
 use crate::conn::{self, Handle};
-use crate::endpoint::{self, PooledEndpoint};
+use crate::endpoint::{self, PooledSocket};
 use crate::mux::Handler;
 use crate::packet::ConnectionId;
 use std::io::Error;
@@ -74,11 +74,11 @@ mod authority;
 pub trait EndpointAuthority<'tls>: Copy + authority::Authority {
     fn connect<'d, const ID: u8, H: Handler<ID>>(
         self,
-        endpoint: Pin<&mut PooledEndpoint<'d, 'tls, ID, H>>,
+        endpoint: Pin<&mut PooledSocket<'d, 'tls, ID, H>>,
         addr: SocketAddr,
         config: conn::config::Options,
         dcid: ConnectionId,
-    ) -> Result<Handle, crate::ConnectError>;
+    ) -> Result<Handle, crate::ConnectFailure>;
 }
 
 impl authority::Authority for [u8; 32] {}
@@ -87,11 +87,11 @@ impl<'tls> EndpointAuthority<'tls> for [u8; 32] {
     #[inline]
     fn connect<'d, const ID: u8, H: Handler<ID>>(
         self,
-        endpoint: Pin<&mut PooledEndpoint<'d, 'tls, ID, H>>,
+        endpoint: Pin<&mut PooledSocket<'d, 'tls, ID, H>>,
         addr: SocketAddr,
         config: conn::config::Options,
         dcid: ConnectionId,
-    ) -> Result<Handle, crate::ConnectError> {
+    ) -> Result<Handle, crate::ConnectFailure> {
         endpoint.connect_with_config_id(addr, self, config, dcid)
     }
 }
@@ -102,11 +102,11 @@ impl<'tls> EndpointAuthority<'tls> for &'tls conn::tls::ClientPool {
     #[inline]
     fn connect<'d, const ID: u8, H: Handler<ID>>(
         self,
-        endpoint: Pin<&mut PooledEndpoint<'d, 'tls, ID, H>>,
+        endpoint: Pin<&mut PooledSocket<'d, 'tls, ID, H>>,
         addr: SocketAddr,
         config: conn::config::Options,
         dcid: ConnectionId,
-    ) -> Result<Handle, crate::ConnectError> {
+    ) -> Result<Handle, crate::ConnectFailure> {
         endpoint.connect_pooled_with_config_id(addr, self, config, dcid)
     }
 }
@@ -219,7 +219,7 @@ impl<const DOMAIN: u8, P: Protocol> Handler<DOMAIN> for Bridge<P> {
 }
 
 #[pin_project]
-pub struct ClientInner<
+pub struct Dialer<
     'd,
     'tls,
     const ID: u8,
@@ -229,7 +229,7 @@ pub struct ClientInner<
     C: ConfigProvider = StaticConfig,
 > {
     #[pin]
-    inner: PooledEndpoint<'d, 'tls, ID, Bridge<P>>,
+    inner: PooledSocket<'d, 'tls, ID, Bridge<P>>,
     endpoints: Vec<EndpointSlot<A>>,
     retries: Min<Instant>,
     backoff: B,
@@ -240,16 +240,16 @@ pub struct ClientInner<
 }
 
 pub type Client<'d, const ID: u8, P, B, C = StaticConfig> =
-    ClientInner<'d, 'static, ID, P, B, [u8; 32], C>;
+    Dialer<'d, 'static, ID, P, B, [u8; 32], C>;
 
 /// High-level client whose active TLS handshakes cannot outlive their pools.
 ///
 /// ```compile_fail
-/// use dope_quic::client::{BackoffPolicy, ConfigProvider, PooledClient, Protocol};
+/// use dope_quic::client::{BackoffPolicy, ConfigProvider, PooledDialer, Protocol};
 ///
 /// fn erase_pool_lifetime<'d, 'tls, const ID: u8, P, B, C>(
-///     client: PooledClient<'d, 'tls, ID, P, B, C>,
-/// ) -> PooledClient<'d, 'static, ID, P, B, C>
+///     client: PooledDialer<'d, 'tls, ID, P, B, C>,
+/// ) -> PooledDialer<'d, 'static, ID, P, B, C>
 /// where
 ///     P: Protocol,
 ///     B: BackoffPolicy,
@@ -258,8 +258,8 @@ pub type Client<'d, const ID: u8, P, B, C = StaticConfig> =
 ///     client
 /// }
 /// ```
-pub type PooledClient<'d, 'tls, const ID: u8, P, B, C = StaticConfig> =
-    ClientInner<'d, 'tls, ID, P, B, &'tls conn::tls::ClientPool, C>;
+pub type PooledDialer<'d, 'tls, const ID: u8, P, B, C = StaticConfig> =
+    Dialer<'d, 'tls, ID, P, B, &'tls conn::tls::ClientPool, C>;
 
 /// Lifecycle-preserving client operations for one application step.
 pub struct ControlInner<'step, 'd, 'tls, const ID: u8, P, B, A, C = StaticConfig>
@@ -270,7 +270,7 @@ where
     A: EndpointAuthority<'tls>,
     C: ConfigProvider,
 {
-    inner: Pin<&'step mut ClientInner<'d, 'tls, ID, P, B, A, C>>,
+    inner: Pin<&'step mut Dialer<'d, 'tls, ID, P, B, A, C>>,
 }
 
 pub type Control<'step, 'd, const ID: u8, P, B, C = StaticConfig> =
@@ -303,13 +303,13 @@ where
         &mut self,
         slot: SlotId,
         data: Vec<u8>,
-    ) -> Result<(), TrySendError<Vec<u8>>> {
+    ) -> Result<(), SendFailure<Vec<u8>>> {
         self.inner.as_mut().try_send_datagram(slot, data)
     }
 }
 
 impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy>
-    ClientInner<'d, 'static, ID, P, B, [u8; 32], StaticConfig>
+    Dialer<'d, 'static, ID, P, B, [u8; 32], StaticConfig>
 {
     pub fn build(
         bind: SocketAddr,
@@ -338,7 +338,7 @@ impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy>
     }
 }
 
-impl<'d, const ID: u8, P, B, C> ClientInner<'d, 'static, ID, P, B, [u8; 32], C>
+impl<'d, const ID: u8, P, B, C> Dialer<'d, 'static, ID, P, B, [u8; 32], C>
 where
     P: Protocol,
     B: BackoffPolicy,
@@ -375,7 +375,7 @@ where
 }
 
 impl<'d, 'tls, const ID: u8, P: Protocol, B: BackoffPolicy>
-    ClientInner<'d, 'tls, ID, P, B, &'tls conn::tls::ClientPool, StaticConfig>
+    Dialer<'d, 'tls, ID, P, B, &'tls conn::tls::ClientPool, StaticConfig>
 {
     pub fn build_pooled(
         bind: SocketAddr,
@@ -404,8 +404,7 @@ impl<'d, 'tls, const ID: u8, P: Protocol, B: BackoffPolicy>
     }
 }
 
-impl<'d, 'tls, const ID: u8, P, B, C>
-    ClientInner<'d, 'tls, ID, P, B, &'tls conn::tls::ClientPool, C>
+impl<'d, 'tls, const ID: u8, P, B, C> Dialer<'d, 'tls, ID, P, B, &'tls conn::tls::ClientPool, C>
 where
     P: Protocol,
     B: BackoffPolicy,
@@ -441,7 +440,7 @@ where
     }
 }
 
-impl<'d, 'tls, const ID: u8, P, B, A, C> ClientInner<'d, 'tls, ID, P, B, A, C>
+impl<'d, 'tls, const ID: u8, P, B, A, C> Dialer<'d, 'tls, ID, P, B, A, C>
 where
     P: Protocol,
     B: BackoffPolicy,
@@ -485,7 +484,7 @@ where
             pending_close: Fifo::with_capacity(capacity),
             pending_established: Fifo::with_capacity(capacity),
         };
-        let inner = PooledEndpoint::build_client_pooled(bind, bridge, endpoint_config, driver)?;
+        let inner = PooledSocket::build_client_pooled(bind, bridge, endpoint_config, driver)?;
         let now = Instant::now();
         let mut retries = Min::with_capacity(capacity);
         for index in 0..capacity {
@@ -550,18 +549,18 @@ where
         self: Pin<&mut Self>,
         slot: SlotId,
         data: Vec<u8>,
-    ) -> Result<(), TrySendError<Vec<u8>>> {
+    ) -> Result<(), SendFailure<Vec<u8>>> {
         let mut this = self.project();
         let index = slot.index() as usize;
         let Some(ep) = this.endpoints.get_mut(index) else {
-            return Err(TrySendError::Closed(data));
+            return Err(SendFailure::Closed(data));
         };
         let Some(handle) = ep.handle else {
-            return Err(TrySendError::Closed(data));
+            return Err(SendFailure::Closed(data));
         };
         match this.inner.as_mut().try_send_datagram(handle, data) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Closed(data)) => {
+            Err(SendFailure::Closed(data)) => {
                 this.inner.as_mut().close(handle);
                 this.inner.as_mut().handler_mut().unbind(handle);
                 ep.handle = None;
@@ -569,7 +568,7 @@ where
                 let retry_at = this.backoff.next_retry_at(ep.attempt, Instant::now());
                 this.retries.remove(index);
                 let _ = this.retries.insert(index, retry_at);
-                Err(TrySendError::Closed(data))
+                Err(SendFailure::Closed(data))
             }
             Err(error) => Err(error),
         }

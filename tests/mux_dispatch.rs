@@ -350,7 +350,7 @@ fn packet_larger_than_total_byte_capacity_is_rejected() {
         CID.to_vec(),
         Instant::now(),
     );
-    assert_eq!(error, Err(dope_quic::ConnectError::InvalidConfig));
+    assert_eq!(error, Err(dope_quic::ConnectFailure::InvalidConfig));
     assert_eq!(client.output().len(), 0);
     assert_eq!(client.output().bytes(), 0);
     assert_eq!(client.active_conns(), 0);
@@ -420,7 +420,7 @@ fn client_connection_capacity_is_fallible() {
         vec![2; 8],
         Instant::now(),
     );
-    assert_eq!(second, Err(dope_quic::ConnectError::Capacity));
+    assert_eq!(second, Err(dope_quic::ConnectFailure::Capacity));
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use dope_quic::Handler;
 use dope_quic::client_auth::{ClientAuth, ClientCertVerifier, ClientIdentity};
 use dope_quic::conn::server;
-use dope_quic::early_data::EarlyDataReplayCache;
+use dope_quic::early_data::ReplayCache;
 use shin::crypto::sig::SigningKey;
 use shin::crypto::ticket::Keys;
 use shin::server::config::NoGuard;
@@ -37,7 +37,7 @@ fn lane_owned_security_policies_are_concrete() {
         Noop,
         signing(),
         Default::default(),
-        EarlyDataReplayCache::new().unwrap(),
+        ReplayCache::new().unwrap(),
     )
     .unwrap();
     assert!(
@@ -60,7 +60,7 @@ fn lane_owned_security_policies_are_concrete() {
         signing(),
         Default::default(),
         server::Authentication::with_early_data_guard(
-            EarlyDataReplayCache::new().unwrap(),
+            ReplayCache::new().unwrap(),
             ClientAuth::Required,
             Accept,
         ),
@@ -96,12 +96,12 @@ fn generic_policy_paths_cover_conn_and_mux() {
     .unwrap();
 
     let authentication = server::Authentication::with_early_data_guard(
-        EarlyDataReplayCache::new().unwrap(),
+        ReplayCache::new().unwrap(),
         ClientAuth::Required,
         Accept,
     );
     let mut mux =
-        dope_quic::mux::setup::Server::<server::Mutual<EarlyDataReplayCache, Accept>>::with_policy(
+        dope_quic::mux::setup::Server::<server::Mutual<ReplayCache, Accept>>::with_policy(
             Noop,
             signing(),
             Default::default(),

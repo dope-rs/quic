@@ -9,7 +9,7 @@ use dope::core::driver::settings;
 use dope::manifold::timing;
 use dope::runtime::{executor::Executor, shutdown};
 use dope_quic::conn::{self, Handle, server, session::Connection};
-use dope_quic::{Handler, RecvBuffer, RetainedEndpoint, endpoint, transport_params};
+use dope_quic::{Handler, RecvBuffer, RetainedSocket, endpoint, transport_params};
 use shin::crypto::sig::SigningKey;
 use shin::server::config::NoGuard;
 
@@ -136,10 +136,10 @@ struct App<'d> {
     marker: ::core::marker::PhantomData<fn(&'d ()) -> &'d ()>,
     #[pin]
     #[manifold]
-    server: RetainedEndpoint<'d, SERVER_ROUTE, Capture>,
+    server: RetainedSocket<'d, SERVER_ROUTE, Capture>,
     #[pin]
     #[manifold(control)]
-    client: RetainedEndpoint<'d, CLIENT_ROUTE, Capture>,
+    client: RetainedSocket<'d, CLIENT_ROUTE, Capture>,
     #[dispatcher(schedule)]
     timeout: Timeout,
 }
@@ -195,7 +195,7 @@ fn receive(payload: Vec<u8>) -> (Vec<u8>, usize) {
         let timeout = Timeout(Instant::now() + Duration::from_secs(2));
         let (server, client) = {
             let mut driver = session.driver_access();
-            let server = RetainedEndpoint::<'_, SERVER_ROUTE, Capture, server::Standard>::build_server_with_policy(
+            let server = RetainedSocket::<'_, SERVER_ROUTE, Capture, server::Standard>::build_server_with_policy(
                 "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
                 signing,
                 conn::config::Options::from(parameters.clone()),
@@ -210,7 +210,7 @@ fn receive(payload: Vec<u8>) -> (Vec<u8>, usize) {
             )
             .unwrap();
             let server_addr = server.local_addr();
-            let client = RetainedEndpoint::<'_, CLIENT_ROUTE, Capture>::build_client(
+            let client = RetainedSocket::<'_, CLIENT_ROUTE, Capture>::build_client(
                 "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
                 Capture {
                     client: true,

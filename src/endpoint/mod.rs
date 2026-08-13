@@ -14,8 +14,8 @@ use shin::crypto::sig::SigningKey;
 use shin::crypto::ticket::Keys;
 use shin::server::{config::ClientCertVerifier, config::NoGuard};
 
-use crate::ConnectError;
-use crate::TrySendError;
+use crate::ConnectFailure;
+use crate::SendFailure;
 use crate::conn::session::Connection;
 use crate::conn::{self, Handle, config::Validated};
 use crate::mux;
@@ -27,7 +27,7 @@ use std::io::Error;
 use std::io::ErrorKind;
 
 #[pin_project]
-pub struct EndpointInner<
+pub struct Socket<
     'd,
     'tls,
     const ID: u8,
@@ -42,16 +42,16 @@ pub struct EndpointInner<
 
 /// Endpoint whose receive payloads may retain driver-owned packet storage.
 pub type Endpoint<'d, const ID: u8, H, P = conn::server::Standard, B = Vec<u8>> =
-    EndpointInner<'d, 'static, ID, H, P, B>;
+    Socket<'d, 'static, ID, H, P, B>;
 
-pub type PooledEndpoint<'d, 'tls, const ID: u8, H, P = conn::server::Standard, B = Vec<u8>> =
-    EndpointInner<'d, 'tls, ID, H, P, B>;
+pub type PooledSocket<'d, 'tls, const ID: u8, H, P = conn::server::Standard, B = Vec<u8>> =
+    Socket<'d, 'tls, ID, H, P, B>;
 
-pub type RetainedEndpoint<'d, const ID: u8, H, P = conn::server::Standard> =
+pub type RetainedSocket<'d, const ID: u8, H, P = conn::server::Standard> =
     Endpoint<'d, ID, H, P, RecvBuffer<'d>>;
 
-pub type PooledRetainedEndpoint<'d, 'tls, const ID: u8, H, P = conn::server::Standard> =
-    PooledEndpoint<'d, 'tls, ID, H, P, RecvBuffer<'d>>;
+pub type PooledRetainedSocket<'d, 'tls, const ID: u8, H, P = conn::server::Standard> =
+    PooledSocket<'d, 'tls, ID, H, P, RecvBuffer<'d>>;
 
 /// Lifecycle-preserving endpoint operations for one application step.
 pub struct ControlInner<'step, 'd, 'tls, const ID: u8, H, P = conn::server::Standard, B = Vec<u8>>
@@ -59,9 +59,9 @@ where
     'd: 'step,
     H: mux::Handler<ID, B>,
     P: conn::server::Policy,
-    B: EndpointBuffer<'d>,
+    B: Storage<'d>,
 {
-    inner: Pin<&'step mut PooledEndpoint<'d, 'tls, ID, H, P, B>>,
+    inner: Pin<&'step mut PooledSocket<'d, 'tls, ID, H, P, B>>,
 }
 
 pub type Control<'step, 'd, const ID: u8, H, P = conn::server::Standard, B = Vec<u8>> =
@@ -70,11 +70,11 @@ pub type Control<'step, 'd, const ID: u8, H, P = conn::server::Standard, B = Vec
 pub type PooledControl<'step, 'd, 'tls, const ID: u8, H, P = conn::server::Standard, B = Vec<u8>> =
     ControlInner<'step, 'd, 'tls, ID, H, P, B>;
 
-/// Lifecycle control for a [`RetainedEndpoint`].
+/// Lifecycle control for a [`RetainedSocket`].
 pub type RetainedControl<'step, 'd, const ID: u8, H, P = conn::server::Standard> =
     Control<'step, 'd, ID, H, P, RecvBuffer<'d>>;
 
-/// Lifecycle control for a [`PooledRetainedEndpoint`].
+/// Lifecycle control for a [`PooledRetainedSocket`].
 pub type PooledRetainedControl<'step, 'd, 'tls, const ID: u8, H, P = conn::server::Standard> =
     PooledControl<'step, 'd, 'tls, ID, H, P, RecvBuffer<'d>>;
 
@@ -83,7 +83,7 @@ where
     'd: 'step,
     H: mux::Handler<ID, B>,
     P: conn::server::Policy,
-    B: EndpointBuffer<'d>,
+    B: Storage<'d>,
 {
     pub fn handler(&self) -> &H {
         self.inner.as_ref().get_ref().handler()
@@ -95,7 +95,7 @@ where
         server_pubkey: [u8; 32],
         client_tp: transport_params::Params,
         initial_dcid: Vec<u8>,
-    ) -> Result<Handle, ConnectError> {
+    ) -> Result<Handle, ConnectFailure> {
         self.inner
             .as_mut()
             .connect(peer_addr, server_pubkey, client_tp, initial_dcid)
@@ -107,7 +107,7 @@ where
         pool: &'tls conn::tls::ClientPool,
         client_tp: transport_params::Params,
         initial_dcid: Vec<u8>,
-    ) -> Result<Handle, ConnectError> {
+    ) -> Result<Handle, ConnectFailure> {
         self.inner
             .as_mut()
             .connect_pooled(peer_addr, pool, client_tp, initial_dcid)
@@ -124,7 +124,7 @@ where
         &mut self,
         handle: Handle,
         data: Vec<u8>,
-    ) -> Result<(), TrySendError<Vec<u8>>> {
+    ) -> Result<(), SendFailure<Vec<u8>>> {
         self.inner.as_mut().try_send_datagram(handle, data)
     }
 }
@@ -176,11 +176,11 @@ impl Config {
 /// back to one exact shared owner for all packet payload bytes that escape.
 /// Dispatch is statically resolved for each endpoint type.
 #[doc(hidden)]
-pub trait EndpointBuffer<'d>: ReceiveBuffer {
+pub trait Storage<'d>: ReceiveBuffer {
     fn datagram_config(config: Config) -> io::Result<datagram::Config>;
 
     fn receive_packet<'turn, 'tls, const ID: u8, H, P>(
-        mux: &mut mux::PooledMux<'tls, H, P, ID, Self>,
+        mux: &mut mux::PooledRouter<'tls, H, P, ID, Self>,
         addr: SocketAddr,
         packet: datagram::packet::Packet<'turn, 'd>,
         socket: Pin<&'turn mut datagram::Socket<'d, ID>>,
@@ -191,13 +191,13 @@ pub trait EndpointBuffer<'d>: ReceiveBuffer {
         P: conn::server::Policy;
 }
 
-impl<'d> EndpointBuffer<'d> for Vec<u8> {
+impl<'d> Storage<'d> for Vec<u8> {
     fn datagram_config(config: Config) -> io::Result<datagram::Config> {
         config.datagram(0)
     }
 
     fn receive_packet<'turn, 'tls, const ID: u8, H, P>(
-        mux: &mut mux::PooledMux<'tls, H, P, ID, Self>,
+        mux: &mut mux::PooledRouter<'tls, H, P, ID, Self>,
         addr: SocketAddr,
         mut packet: datagram::packet::Packet<'turn, 'd>,
         _socket: Pin<&'turn mut datagram::Socket<'d, ID>>,
@@ -211,7 +211,7 @@ impl<'d> EndpointBuffer<'d> for Vec<u8> {
     }
 }
 
-impl<'d> EndpointBuffer<'d> for RecvBuffer<'d> {
+impl<'d> Storage<'d> for RecvBuffer<'d> {
     fn datagram_config(config: Config) -> io::Result<datagram::Config> {
         let retained_receive_bytes = (config.packet_buffer_slots as usize)
             .checked_mul(config.packet_buffer_bytes as usize)
@@ -220,7 +220,7 @@ impl<'d> EndpointBuffer<'d> for RecvBuffer<'d> {
     }
 
     fn receive_packet<'turn, 'tls, const ID: u8, H, P>(
-        mux: &mut mux::PooledMux<'tls, H, P, ID, Self>,
+        mux: &mut mux::PooledRouter<'tls, H, P, ID, Self>,
         addr: SocketAddr,
         packet: datagram::packet::Packet<'turn, 'd>,
         socket: Pin<&'turn mut datagram::Socket<'d, ID>>,
@@ -238,7 +238,7 @@ impl<'d> EndpointBuffer<'d> for RecvBuffer<'d> {
 impl<'d, const ID: u8, H, B> Endpoint<'d, ID, H, conn::server::Standard, B>
 where
     H: mux::Handler<ID, B>,
-    B: EndpointBuffer<'d>,
+    B: Storage<'d>,
 {
     pub fn build_server(
         bind: SocketAddr,
@@ -302,7 +302,7 @@ impl<'d, const ID: u8, H, G, B> Endpoint<'d, ID, H, conn::server::Standard<G>, B
 where
     H: mux::Handler<ID, B>,
     G: conn::server::ReplayGuard + 'static,
-    B: EndpointBuffer<'d>,
+    B: Storage<'d>,
 {
     pub fn build_server_with_early_data_guard(
         bind: SocketAddr,
@@ -349,7 +349,7 @@ impl<'d, const ID: u8, H, V, B> Endpoint<'d, ID, H, conn::server::Mutual<NoGuard
 where
     H: mux::Handler<ID, B>,
     V: ClientCertVerifier + 'static,
-    B: EndpointBuffer<'d>,
+    B: Storage<'d>,
 {
     pub fn build_server_mutual(
         bind: SocketAddr,
@@ -377,7 +377,7 @@ where
     H: mux::Handler<ID, B>,
     G: conn::server::ReplayGuard + 'static,
     V: ClientCertVerifier + 'static,
-    B: EndpointBuffer<'d>,
+    B: Storage<'d>,
 {
     pub fn build_server_mutual_with_early_data_guard(
         bind: SocketAddr,
@@ -404,7 +404,7 @@ impl<'d, const ID: u8, H, P, B> Endpoint<'d, ID, H, P, B>
 where
     H: mux::Handler<ID, B>,
     P: conn::server::Policy,
-    B: EndpointBuffer<'d>,
+    B: Storage<'d>,
 {
     pub fn build_server_with_policy(
         bind: SocketAddr,
@@ -444,11 +444,11 @@ where
     }
 }
 
-impl<'d, 'tls, const ID: u8, H, P, B> EndpointInner<'d, 'tls, ID, H, P, B>
+impl<'d, 'tls, const ID: u8, H, P, B> Socket<'d, 'tls, ID, H, P, B>
 where
     H: mux::Handler<ID, B>,
     P: conn::server::Policy,
-    B: EndpointBuffer<'d>,
+    B: Storage<'d>,
 {
     pub fn local_addr(&self) -> SocketAddr {
         self.udp.local_addr()
@@ -486,7 +486,7 @@ where
         server_pubkey: [u8; 32],
         client_tp: transport_params::Params,
         initial_dcid: Vec<u8>,
-    ) -> Result<Handle, ConnectError> {
+    ) -> Result<Handle, ConnectFailure> {
         self.connect_with_config(peer_addr, server_pubkey, client_tp.into(), initial_dcid)
     }
 
@@ -496,9 +496,9 @@ where
         server_pubkey: [u8; 32],
         client_config: conn::config::Options,
         initial_dcid: Vec<u8>,
-    ) -> Result<Handle, ConnectError> {
+    ) -> Result<Handle, ConnectFailure> {
         let initial_dcid =
-            ConnectionId::try_from(initial_dcid).map_err(|_| ConnectError::InvalidConfig)?;
+            ConnectionId::try_from(initial_dcid).map_err(|_| ConnectFailure::InvalidConfig)?;
         self.connect_with_config_id(peer_addr, server_pubkey, client_config, initial_dcid)
     }
 
@@ -508,7 +508,7 @@ where
         server_pubkey: [u8; 32],
         mut client_config: conn::config::Options,
         initial_dcid: ConnectionId,
-    ) -> Result<Handle, ConnectError> {
+    ) -> Result<Handle, ConnectFailure> {
         let now = Instant::now();
         client_config.max_pmtu = client_config
             .max_pmtu
@@ -543,7 +543,7 @@ where
         self: Pin<&mut Self>,
         handle: Handle,
         data: Vec<u8>,
-    ) -> Result<(), TrySendError<Vec<u8>>> {
+    ) -> Result<(), SendFailure<Vec<u8>>> {
         let now = Instant::now();
         self.project()
             .udp
@@ -572,10 +572,10 @@ where
     }
 }
 
-impl<'d, 'tls, const ID: u8, H, B> EndpointInner<'d, 'tls, ID, H, conn::server::Standard, B>
+impl<'d, 'tls, const ID: u8, H, B> Socket<'d, 'tls, ID, H, conn::server::Standard, B>
 where
     H: mux::Handler<ID, B>,
-    B: EndpointBuffer<'d>,
+    B: Storage<'d>,
 {
     /// Builds a client endpoint whose connection slots may borrow external TLS
     /// pools for exactly `'tls`.
@@ -607,11 +607,11 @@ where
     }
 }
 
-impl<'d, 'tls, const ID: u8, H, P, B> EndpointInner<'d, 'tls, ID, H, P, B>
+impl<'d, 'tls, const ID: u8, H, P, B> Socket<'d, 'tls, ID, H, P, B>
 where
     H: mux::Handler<ID, B>,
     P: conn::server::Policy,
-    B: EndpointBuffer<'d>,
+    B: Storage<'d>,
 {
     /// Builds a server endpoint over one externally owned, shard-bound TLS
     /// pool. The endpoint cannot outlive either borrowed authority.
@@ -657,7 +657,7 @@ where
         pool: &'tls conn::tls::ClientPool,
         client_tp: transport_params::Params,
         initial_dcid: Vec<u8>,
-    ) -> Result<Handle, ConnectError> {
+    ) -> Result<Handle, ConnectFailure> {
         self.connect_pooled_with_config(peer_addr, pool, client_tp.into(), initial_dcid)
     }
 
@@ -667,9 +667,9 @@ where
         pool: &'tls conn::tls::ClientPool,
         client_config: conn::config::Options,
         initial_dcid: Vec<u8>,
-    ) -> Result<Handle, ConnectError> {
+    ) -> Result<Handle, ConnectFailure> {
         let initial_dcid =
-            ConnectionId::try_from(initial_dcid).map_err(|_| ConnectError::InvalidConfig)?;
+            ConnectionId::try_from(initial_dcid).map_err(|_| ConnectFailure::InvalidConfig)?;
         self.connect_pooled_with_config_id(peer_addr, pool, client_config, initial_dcid)
     }
 
@@ -679,7 +679,7 @@ where
         pool: &'tls conn::tls::ClientPool,
         mut client_config: conn::config::Options,
         initial_dcid: ConnectionId,
-    ) -> Result<Handle, ConnectError> {
+    ) -> Result<Handle, ConnectFailure> {
         let now = Instant::now();
         client_config.max_pmtu = client_config
             .max_pmtu

@@ -17,10 +17,11 @@ impl<const DOMAIN: u8> Client<DOMAIN> {
         local_cid: Vec<u8>,
         pool: &'pool conn::tls::ClientPool,
         options: conn::config::Options,
-    ) -> Result<conn::tls::Connection<'pool, DOMAIN>, errors::ConnectError> {
+    ) -> Result<conn::tls::Connection<'pool, DOMAIN>, errors::ConnectFailure> {
         let initial_dcid =
-            ConnectionId::new(&initial_dcid).ok_or(errors::ConnectError::InvalidConfig)?;
-        let local_cid = ConnectionId::new(&local_cid).ok_or(errors::ConnectError::InvalidConfig)?;
+            ConnectionId::new(&initial_dcid).ok_or(errors::ConnectFailure::InvalidConfig)?;
+        let local_cid =
+            ConnectionId::new(&local_cid).ok_or(errors::ConnectFailure::InvalidConfig)?;
         Self::connect_pooled_buffer(initial_dcid, local_cid, pool, options)
     }
 
@@ -29,7 +30,7 @@ impl<const DOMAIN: u8> Client<DOMAIN> {
         local_cid: ConnectionId,
         pool: &'pool conn::tls::ClientPool,
         options: conn::config::Options,
-    ) -> Result<conn::tls::Connection<'pool, DOMAIN, B>, errors::ConnectError> {
+    ) -> Result<conn::tls::Connection<'pool, DOMAIN, B>, errors::ConnectFailure> {
         options.validate_pooled_client()?;
         let built = build::Builder::<
             shin::server::config::NoGuard,
@@ -38,7 +39,7 @@ impl<const DOMAIN: u8> Client<DOMAIN> {
         >::client_pooled(initial_dcid, local_cid, pool, options)
         .finish::<B>()?;
         let build::Built::ClientPooled { connection, tls } = built else {
-            return Err(errors::ConnectError::InvalidConfig);
+            return Err(errors::ConnectFailure::InvalidConfig);
         };
         Ok(conn::tls::Connection::new(connection, tls))
     }
@@ -48,10 +49,11 @@ impl<const DOMAIN: u8> Client<DOMAIN> {
         local_cid: Vec<u8>,
         server_pubkey: [u8; 32],
         options: conn::config::Options,
-    ) -> Result<conn::session::Connection<DOMAIN>, errors::ConnectError> {
+    ) -> Result<conn::session::Connection<DOMAIN>, errors::ConnectFailure> {
         let initial_dcid =
-            ConnectionId::new(&initial_dcid).ok_or(errors::ConnectError::InvalidConfig)?;
-        let local_cid = ConnectionId::new(&local_cid).ok_or(errors::ConnectError::InvalidConfig)?;
+            ConnectionId::new(&initial_dcid).ok_or(errors::ConnectFailure::InvalidConfig)?;
+        let local_cid =
+            ConnectionId::new(&local_cid).ok_or(errors::ConnectFailure::InvalidConfig)?;
         Self::connect_buffer(initial_dcid, local_cid, server_pubkey, options)
     }
 
@@ -60,7 +62,7 @@ impl<const DOMAIN: u8> Client<DOMAIN> {
         local_cid: ConnectionId,
         server_pubkey: [u8; 32],
         options: conn::config::Options,
-    ) -> Result<conn::session::Connection<DOMAIN, B>, errors::ConnectError> {
+    ) -> Result<conn::session::Connection<DOMAIN, B>, errors::ConnectFailure> {
         let setup = Self {
             initial_dcid,
             local_cid,
@@ -72,7 +74,7 @@ impl<const DOMAIN: u8> Client<DOMAIN> {
 
     fn finish_buffer<B: crate::stream::ReceiveBuffer>(
         self,
-    ) -> Result<conn::session::Connection<DOMAIN, B>, errors::ConnectError> {
+    ) -> Result<conn::session::Connection<DOMAIN, B>, errors::ConnectFailure> {
         self.options.validate()?;
         let built = build::Builder::<
             shin::server::config::NoGuard,
@@ -86,12 +88,12 @@ impl<const DOMAIN: u8> Client<DOMAIN> {
         )
         .finish::<B>()?;
         let build::Built::Client(mut connection) = built else {
-            return Err(errors::ConnectError::InvalidConfig);
+            return Err(errors::ConnectFailure::InvalidConfig);
         };
         let outcome = connection
             .handshake
             .start_client()
-            .map_err(|_| errors::ConnectError::Tls)?;
+            .map_err(|_| errors::ConnectFailure::Tls)?;
         conn::handshake::apply_outcome(outcome, &mut connection);
         Ok(connection)
     }
@@ -108,7 +110,7 @@ impl<const DOMAIN: u8> Server<DOMAIN> {
         ids: conn::server::Ids,
         options: conn::config::Options,
         pool: &'pool shin::server::workspace::QuicPool<conn::handshake::Clock, V, DOMAIN, G>,
-    ) -> Result<conn::tls::ServerConnection<'pool, G, V, DOMAIN>, errors::ConnectError>
+    ) -> Result<conn::tls::ServerConnection<'pool, G, V, DOMAIN>, errors::ConnectFailure>
     where
         G: shin::server::config::EarlyDataGuard,
         V: shin::server::config::ClientCertVerifier,
@@ -116,7 +118,7 @@ impl<const DOMAIN: u8> Server<DOMAIN> {
         let options = conn::config::Validated::new_pooled_server(options)?;
         let built = build::Builder::server_pooled(ids, options, pool).finish()?;
         let build::Built::ServerPooled { connection, tls } = built else {
-            return Err(errors::ConnectError::InvalidConfig);
+            return Err(errors::ConnectFailure::InvalidConfig);
         };
         Ok(conn::tls::ServerConnection::new(connection, tls))
     }
@@ -127,13 +129,13 @@ impl<const DOMAIN: u8> Server<DOMAIN> {
         peer_cid: Vec<u8>,
         signing_key: crypto::sig::SigningKey,
         options: conn::config::Options,
-    ) -> Result<Self, errors::ConnectError> {
+    ) -> Result<Self, errors::ConnectFailure> {
         let initial_dcid = ConnectionId::try_from(initial_dcid)
-            .map_err(|_| errors::ConnectError::InvalidConfig)?;
+            .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
         let local_cid =
-            ConnectionId::try_from(local_cid).map_err(|_| errors::ConnectError::InvalidConfig)?;
+            ConnectionId::try_from(local_cid).map_err(|_| errors::ConnectFailure::InvalidConfig)?;
         let peer_cid =
-            ConnectionId::try_from(peer_cid).map_err(|_| errors::ConnectError::InvalidConfig)?;
+            ConnectionId::try_from(peer_cid).map_err(|_| errors::ConnectFailure::InvalidConfig)?;
         Ok(Self {
             ids: conn::server::Ids::initial(initial_dcid, local_cid, peer_cid),
             signing_key,
@@ -153,7 +155,7 @@ impl<const DOMAIN: u8> Server<DOMAIN> {
             shin::server::config::NoClientAuth,
             DOMAIN,
         >,
-        errors::ConnectError,
+        errors::ConnectFailure,
     > {
         let setup = Self::initial(initial_dcid, local_cid, peer_cid, signing_key, options)?;
         setup.finish::<conn::server::Standard>(shin::server::config::NoGuard)
@@ -173,18 +175,18 @@ impl<const DOMAIN: u8> Server<DOMAIN> {
             shin::server::config::NoClientAuth,
             DOMAIN,
         >,
-        errors::ConnectError,
+        errors::ConnectFailure,
     > {
         let initial_dcid = ConnectionId::try_from(initial_dcid)
-            .map_err(|_| errors::ConnectError::InvalidConfig)?;
+            .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
         let local_cid =
-            ConnectionId::try_from(local_cid).map_err(|_| errors::ConnectError::InvalidConfig)?;
+            ConnectionId::try_from(local_cid).map_err(|_| errors::ConnectFailure::InvalidConfig)?;
         let peer_cid =
-            ConnectionId::try_from(peer_cid).map_err(|_| errors::ConnectError::InvalidConfig)?;
+            ConnectionId::try_from(peer_cid).map_err(|_| errors::ConnectFailure::InvalidConfig)?;
         let original_dcid = ConnectionId::try_from(original_dcid)
-            .map_err(|_| errors::ConnectError::InvalidConfig)?;
-        let retry_scid =
-            ConnectionId::try_from(retry_scid).map_err(|_| errors::ConnectError::InvalidConfig)?;
+            .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
+        let retry_scid = ConnectionId::try_from(retry_scid)
+            .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
         let setup = Self {
             ids: conn::server::Ids::retry(
                 initial_dcid,
@@ -208,7 +210,7 @@ impl<const DOMAIN: u8> Server<DOMAIN> {
         guard: G,
     ) -> Result<
         conn::server::Connection<G, shin::server::config::NoClientAuth, DOMAIN>,
-        errors::ConnectError,
+        errors::ConnectFailure,
     >
     where
         G: conn::server::ReplayGuard + 'static,
@@ -230,7 +232,7 @@ impl<const DOMAIN: u8> Server<DOMAIN> {
             shin::server::config::ClientAuthVerifier<V>,
             DOMAIN,
         >,
-        errors::ConnectError,
+        errors::ConnectFailure,
     >
     where
         V: shin::server::config::ClientCertVerifier + 'static,
@@ -248,7 +250,7 @@ impl<const DOMAIN: u8> Server<DOMAIN> {
         authentication: conn::server::Authentication<V, G>,
     ) -> Result<
         conn::server::Connection<G, shin::server::config::ClientAuthVerifier<V>, DOMAIN>,
-        errors::ConnectError,
+        errors::ConnectFailure,
     >
     where
         G: conn::server::ReplayGuard + 'static,
@@ -263,7 +265,7 @@ impl<const DOMAIN: u8> Server<DOMAIN> {
         signing_key: crypto::sig::SigningKey,
         options: conn::config::Options,
         policy: P::Setup,
-    ) -> Result<conn::server::Connection<P::Guard, P::Verifier, DOMAIN>, errors::ConnectError>
+    ) -> Result<conn::server::Connection<P::Guard, P::Verifier, DOMAIN>, errors::ConnectFailure>
     where
         P: conn::server::Policy,
     {
@@ -278,18 +280,18 @@ impl<const DOMAIN: u8> Server<DOMAIN> {
     fn finish<P>(
         self,
         policy: P::Setup,
-    ) -> Result<conn::server::Connection<P::Guard, P::Verifier, DOMAIN>, errors::ConnectError>
+    ) -> Result<conn::server::Connection<P::Guard, P::Verifier, DOMAIN>, errors::ConnectFailure>
     where
         P: conn::server::Policy,
     {
         let mut options = conn::config::Validated::new(self.options)?;
         let shard_config = options.take_server_config(self.signing_key)?;
         let shard =
-            P::build::<DOMAIN>(shard_config, policy).map_err(|_| errors::ConnectError::Tls)?;
+            P::build::<DOMAIN>(shard_config, policy).map_err(|_| errors::ConnectFailure::Tls)?;
         let (connection, tls) = build::Builder::server(self.ids, options, &shard)
             .finish()?
             .into_server()
-            .ok_or(errors::ConnectError::InvalidConfig)?;
+            .ok_or(errors::ConnectFailure::InvalidConfig)?;
         Ok(conn::server::Connection::new(connection, tls, shard))
     }
 }

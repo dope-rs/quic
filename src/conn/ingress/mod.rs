@@ -6,7 +6,7 @@ pub(crate) use retained::Retained;
 
 use std::time::Instant;
 
-use crate::packet::{LongType, ParsedLongPacket, RetryPacketRef, ShortHeader};
+use crate::packet::{LongType, ParsedLong, RetryRef, ShortHeader};
 use crate::packet_protection::PacketProtection;
 use crate::qkdf::{InitialSecrets, PacketKeys};
 
@@ -118,7 +118,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
                 self.recv_retry(rest)?;
                 break;
             }
-            let parsed = ParsedLongPacket::parse(rest).map_err(|_| Error::HeaderDecode)?;
+            let parsed = ParsedLong::parse(rest).map_err(|_| Error::HeaderDecode)?;
             let kind = parsed.kind();
             let (packet, tail) = parsed.split_first().map_err(|_| Error::HeaderDecode)?;
             match kind {
@@ -134,7 +134,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
 
     fn recv_zero_rtt<R>(
         &mut self,
-        packet: ParsedLongPacket<&mut [u8]>,
+        packet: ParsedLong<&mut [u8]>,
         now: Instant,
         read: &mut R,
     ) -> Result<(), Error>
@@ -171,7 +171,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
         {
             return Ok(());
         }
-        let retry = RetryPacketRef::decode(wire).map_err(|_| Error::HeaderDecode)?;
+        let retry = RetryRef::decode(wire).map_err(|_| Error::HeaderDecode)?;
         let original_dcid = self.connection.path.original_dcid;
         let local_cid = self.connection.path.local_cid_id();
         let Some((peer_cid, token_len)) = retry
@@ -242,7 +242,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
 
     fn recv_initial<R>(
         &mut self,
-        packet: ParsedLongPacket<&mut [u8]>,
+        packet: ParsedLong<&mut [u8]>,
         now: Instant,
         read: &mut R,
     ) -> Result<(), Error>
@@ -271,7 +271,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
 
     fn recv_handshake<R>(
         &mut self,
-        packet: ParsedLongPacket<&mut [u8]>,
+        packet: ParsedLong<&mut [u8]>,
         now: Instant,
         read: &mut R,
     ) -> Result<(), Error>

@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConnectError {
+pub enum ConnectFailure {
     Closed,
     Capacity,
     InvalidConfig,
@@ -10,7 +10,7 @@ pub enum ConnectError {
     Tls,
 }
 
-impl fmt::Display for ConnectError {
+impl fmt::Display for ConnectFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Closed => "multiplexer is shutting down",
@@ -24,7 +24,7 @@ impl fmt::Display for ConnectError {
     }
 }
 
-impl Error for ConnectError {
+impl Error for ConnectFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidTlsConfig(error) => Some(error),
@@ -34,14 +34,14 @@ impl Error for ConnectError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum TrySendError<T> {
+pub enum SendFailure<T> {
     Closed(T),
     Full(T),
     TooLarge(T),
     Unsupported(T),
 }
 
-impl<T> TrySendError<T> {
+impl<T> SendFailure<T> {
     pub fn into_inner(self) -> T {
         match self {
             Self::Closed(value)
@@ -52,7 +52,7 @@ impl<T> TrySendError<T> {
     }
 }
 
-impl<T> fmt::Display for TrySendError<T> {
+impl<T> fmt::Display for SendFailure<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Closed(_) => "connection closed",
@@ -63,4 +63,4 @@ impl<T> fmt::Display for TrySendError<T> {
     }
 }
 
-impl<T: fmt::Debug> Error for TrySendError<T> {}
+impl<T: fmt::Debug> Error for SendFailure<T> {}

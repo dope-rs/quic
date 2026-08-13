@@ -38,15 +38,15 @@ pub mod transport_params;
 pub mod varint;
 
 pub use client::{
-    BackoffPolicy, Client, EndpointSpec, PathStats, PooledClient, PooledEndpointSpec, Protocol,
+    BackoffPolicy, Client, EndpointSpec, PathStats, PooledDialer, PooledEndpointSpec, Protocol,
     SlotId,
 };
 pub use endpoint::{
-    Endpoint, PooledControl, PooledEndpoint, PooledRetainedControl, PooledRetainedEndpoint,
-    RetainedControl, RetainedEndpoint,
+    Endpoint, PooledControl, PooledRetainedControl, PooledRetainedSocket, PooledSocket,
+    RetainedControl, RetainedSocket,
 };
-pub use errors::{ConnectError, TrySendError};
-pub use mux::{Handler, Mux, PooledMux};
+pub use errors::{ConnectFailure, SendFailure};
+pub use mux::{Handler, Mux, PooledRouter};
 pub use o3::buffer::CapacityError;
 pub use stream::{INLINE_SEND_CAPACITY, ReceiveBuffer, RecvBuffer, SendBuffer};
 pub use transport_params::TransportParameterError;

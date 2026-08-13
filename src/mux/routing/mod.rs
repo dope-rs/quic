@@ -15,7 +15,7 @@ use crate::stream::ReceiveBuffer;
 use self::reset::ResetOps as _;
 use super::drive::{DriveOps as _, QueueOps as _};
 use super::{
-    CidLink, CidRecord, Handler, MAX_CIDS_PER_CONN, MuxInner, NONE, QueueKind, RoutedCid,
+    CidLink, CidRecord, Handler, MAX_CIDS_PER_CONN, NONE, QueueKind, RoutedCid, Router,
     ServerShard, Slot, TlsSession,
 };
 
@@ -80,7 +80,7 @@ where
 }
 
 impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    AcceptOps for MuxInner<'tls, H, P, DOMAIN, B>
+    AcceptOps for Router<'tls, H, P, DOMAIN, B>
 {
     fn try_accept(
         &mut self,
@@ -159,7 +159,7 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
 }
 
 impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    CidOps for MuxInner<'tls, H, P, DOMAIN, B>
+    CidOps for Router<'tls, H, P, DOMAIN, B>
 {
     fn cid_hash(&self, value: &[u8]) -> u64 {
         self.registry.indexes.cid_hasher.hash_one(value)
@@ -266,7 +266,7 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
 }
 
 impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    MuxInner<'tls, H, P, DOMAIN, B>
+    Router<'tls, H, P, DOMAIN, B>
 {
     fn register_cid_at(
         &mut self,
@@ -348,7 +348,7 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
 }
 
 impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    DeadlineOps<H, P, DOMAIN, B> for MuxInner<'tls, H, P, DOMAIN, B>
+    DeadlineOps<H, P, DOMAIN, B> for Router<'tls, H, P, DOMAIN, B>
 {
     fn deadline_peek(&self) -> Option<(usize, Instant)> {
         self.registry
@@ -454,7 +454,7 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
 }
 
 impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    SlotOps<'tls, H, P, DOMAIN, B> for MuxInner<'tls, H, P, DOMAIN, B>
+    SlotOps<'tls, H, P, DOMAIN, B> for Router<'tls, H, P, DOMAIN, B>
 {
     fn insert_connection(
         &mut self,

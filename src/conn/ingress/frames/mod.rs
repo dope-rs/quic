@@ -95,7 +95,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> ProcessFrames<DOMAIN, B> for Ingress<'_
                 parse_error = Some(Error::FrameDecode);
                 break;
             }
-            let decoded = crate::frame::decode::FrameDecoder::new(
+            let decoded = crate::frame::decode::Decoder::new(
                 &body[position..],
                 |data: &[u8]| {
                     let start = data.as_ptr() as usize - body_start;

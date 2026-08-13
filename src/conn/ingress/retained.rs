@@ -3,7 +3,7 @@ use std::time::Instant;
 use dope::manifold::datagram;
 
 use crate::conn::{Epoch, Error, ReceiveWorkspace, handshake};
-use crate::packet::{LongType, ParsedLongPacket, ShortHeader};
+use crate::packet::{LongType, ParsedLong, ShortHeader};
 use crate::stream::RecvBuffer;
 
 use super::Ingress;
@@ -134,7 +134,7 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
                 self.ingress.recv_retry(packet.as_ref())?;
                 break;
             }
-            let parsed = ParsedLongPacket::parse(packet).map_err(|_| Error::HeaderDecode)?;
+            let parsed = ParsedLong::parse(packet).map_err(|_| Error::HeaderDecode)?;
             let kind = parsed.kind();
             let (packet, tail) = parsed.split_first().map_err(|_| Error::HeaderDecode)?;
             match kind {
@@ -150,7 +150,7 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
 
     fn recv_zero_rtt_datagram<'turn, R>(
         &mut self,
-        packet: ParsedLongPacket<datagram::packet::Split<'turn, 'd>>,
+        packet: ParsedLong<datagram::packet::Split<'turn, 'd>>,
         retainer: datagram::packet::Retainer<'_, 'd>,
         now: Instant,
         read: &mut R,
@@ -178,7 +178,7 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
 
     fn recv_initial_datagram<'turn, R>(
         &mut self,
-        packet: ParsedLongPacket<datagram::packet::Split<'turn, 'd>>,
+        packet: ParsedLong<datagram::packet::Split<'turn, 'd>>,
         now: Instant,
         read: &mut R,
     ) -> Result<(), Error>
@@ -213,7 +213,7 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
 
     fn recv_handshake_datagram<'turn, R>(
         &mut self,
-        packet: ParsedLongPacket<datagram::packet::Split<'turn, 'd>>,
+        packet: ParsedLong<datagram::packet::Split<'turn, 'd>>,
         now: Instant,
         read: &mut R,
     ) -> Result<(), Error>

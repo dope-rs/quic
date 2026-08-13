@@ -1,7 +1,7 @@
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 
-use crate::stream::{ReceiveBuffer, RecvStream};
+use crate::stream::{ReceiveBuffer, Receiver};
 
 use super::control;
 use super::streams::table;
@@ -168,7 +168,7 @@ impl ControlSchedule {
 }
 
 pub(super) struct State<B: ReceiveBuffer> {
-    stream: RecvStream<B>,
+    stream: Receiver<B>,
     limit: u64,
     control_link: ControlLink,
     pub(super) max_stream_data: Option<control::OwnerKey<control::kind::MaxStreamData>>,
@@ -194,7 +194,7 @@ impl<B: ReceiveBuffer> table::Reusable for State<B> {
 impl<B: ReceiveBuffer> State<B> {
     fn new(limit: u64) -> Self {
         Self {
-            stream: RecvStream::default(),
+            stream: Receiver::default(),
             limit,
             control_link: ControlLink::none(),
             max_stream_data: None,
@@ -245,7 +245,7 @@ impl<B: ReceiveBuffer> State<B> {
 }
 
 impl<B: ReceiveBuffer> Deref for State<B> {
-    type Target = RecvStream<B>;
+    type Target = Receiver<B>;
 
     fn deref(&self) -> &Self::Target {
         &self.stream
@@ -258,6 +258,5 @@ impl<B: ReceiveBuffer> DerefMut for State<B> {
     }
 }
 
-const _: () =
-    assert!(size_of::<State<Vec<u8>>>() == size_of::<RecvStream>() + 4 * size_of::<u64>());
+const _: () = assert!(size_of::<State<Vec<u8>>>() == size_of::<Receiver>() + 4 * size_of::<u64>());
 const _: () = assert!(size_of::<ControlLink>() == size_of::<u64>());

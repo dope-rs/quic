@@ -397,7 +397,7 @@ impl<'tls, P: conn::server::Policy, const DOMAIN: u8> ServerRuntime<'tls, P, DOM
     }
 }
 
-pub struct MuxInner<
+pub struct Router<
     'tls,
     H: Handler<DOMAIN, B>,
     P: conn::server::Policy = conn::server::Standard,
@@ -414,13 +414,13 @@ pub struct MuxInner<
 }
 
 pub type Mux<H, P = conn::server::Standard, const DOMAIN: u8 = 0, B = Vec<u8>> =
-    MuxInner<'static, H, P, DOMAIN, B>;
+    Router<'static, H, P, DOMAIN, B>;
 
-pub type PooledMux<'tls, H, P = conn::server::Standard, const DOMAIN: u8 = 0, B = Vec<u8>> =
-    MuxInner<'tls, H, P, DOMAIN, B>;
+pub type PooledRouter<'tls, H, P = conn::server::Standard, const DOMAIN: u8 = 0, B = Vec<u8>> =
+    Router<'tls, H, P, DOMAIN, B>;
 
 impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    MuxInner<'tls, H, P, DOMAIN, B>
+    Router<'tls, H, P, DOMAIN, B>
 {
     pub fn configuration(&mut self) -> configuration::Control<'_, 'tls, H, P, DOMAIN, B> {
         configuration::Control::new(self)
@@ -489,7 +489,7 @@ pub struct ConnectionMut<
     const DOMAIN: u8 = 0,
     B: ReceiveBuffer = Vec<u8>,
 > {
-    mux: &'mux mut MuxInner<'tls, H, P, DOMAIN, B>,
+    mux: &'mux mut Router<'tls, H, P, DOMAIN, B>,
     handle: Handle,
 }
 
@@ -539,11 +539,11 @@ enum RetryGate {
     Drop,
 }
 
-impl<'d, 'tls, const ID: u8, H, P, B> datagram::Handler<'d, ID> for MuxInner<'tls, H, P, ID, B>
+impl<'d, 'tls, const ID: u8, H, P, B> datagram::Handler<'d, ID> for Router<'tls, H, P, ID, B>
 where
     H: Handler<ID, B>,
     P: conn::server::Policy,
-    B: crate::endpoint::EndpointBuffer<'d>,
+    B: crate::endpoint::Storage<'d>,
 {
     fn packet<'turn>(
         &mut self,

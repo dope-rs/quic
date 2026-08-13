@@ -42,7 +42,7 @@ pub(in crate::conn) trait Incoming<B: ReceiveBuffer> {
     fn len(&self) -> usize;
     fn insert(
         self,
-        stream: &mut crate::stream::RecvStream<B>,
+        stream: &mut crate::stream::Receiver<B>,
         ranges: &mut crate::range_buffer::Arena<B>,
         parts: &mut Vec<(u64, std::ops::Range<usize>)>,
         offset: u64,
@@ -306,7 +306,7 @@ impl<B: ReceiveBuffer> Incoming<B> for Copied<'_> {
 
     fn insert(
         self,
-        stream: &mut crate::stream::RecvStream<B>,
+        stream: &mut crate::stream::Receiver<B>,
         ranges: &mut crate::range_buffer::Arena<B>,
         parts: &mut Vec<(u64, std::ops::Range<usize>)>,
         offset: u64,
@@ -326,7 +326,7 @@ impl<'d> Incoming<crate::stream::RecvBuffer<'d>> for RetainedIncoming<'d> {
 
     fn insert(
         self,
-        stream: &mut crate::stream::RecvStream<crate::stream::RecvBuffer<'d>>,
+        stream: &mut crate::stream::Receiver<crate::stream::RecvBuffer<'d>>,
         ranges: &mut crate::range_buffer::Arena<crate::stream::RecvBuffer<'d>>,
         parts: &mut Vec<(u64, std::ops::Range<usize>)>,
         offset: u64,
@@ -349,7 +349,7 @@ impl<B: ReceiveBuffer> Incoming<B> for B {
 
     fn insert(
         self,
-        stream: &mut crate::stream::RecvStream<B>,
+        stream: &mut crate::stream::Receiver<B>,
         ranges: &mut crate::range_buffer::Arena<B>,
         parts: &mut Vec<(u64, std::ops::Range<usize>)>,
         offset: u64,

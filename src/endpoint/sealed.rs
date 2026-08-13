@@ -16,7 +16,7 @@ where
     'd: 'step,
     H: endpoint::raw::ControlHandler<'d, ID, B>,
     P: server::Policy,
-    B: endpoint::EndpointBuffer<'d>,
+    B: endpoint::Storage<'d>,
 {
     pub fn handler_control(
         &mut self,
@@ -31,11 +31,11 @@ where
 // SAFETY: `Control` exposes only handler/connection commands borrowed inside
 // one step. It cannot move, replace, or drop the endpoint or retained UDP mux.
 unsafe impl<'d, 'tls, const ID: u8, H, P, B> dispatch::raw::Controlled<'d>
-    for endpoint::EndpointInner<'d, 'tls, ID, H, P, B>
+    for endpoint::Socket<'d, 'tls, ID, H, P, B>
 where
     H: mux::Handler<ID, B>,
     P: server::Policy,
-    B: endpoint::EndpointBuffer<'d>,
+    B: endpoint::Storage<'d>,
 {
     type Control<'step>
         = endpoint::PooledControl<'step, 'd, 'tls, ID, H, P, B>
@@ -53,11 +53,11 @@ where
 
 // SAFETY: `Endpoint` owns the UDP and mux lifecycle through finish.
 unsafe impl<'d, 'tls, const ID: u8, H, P, B> dispatch::raw::Manifold<'d>
-    for endpoint::EndpointInner<'d, 'tls, ID, H, P, B>
+    for endpoint::Socket<'d, 'tls, ID, H, P, B>
 where
     H: mux::Handler<ID, B>,
     P: server::Policy,
-    B: endpoint::EndpointBuffer<'d>,
+    B: endpoint::Storage<'d>,
 {
     const ID: u8 = ID;
     type Dispatch = dispatch::raw::Plain;

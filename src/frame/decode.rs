@@ -7,13 +7,13 @@ fn data_end(input: &[u8], pos: usize, length: VarInt) -> Result<usize, error::De
         .ok_or(error::Decode::Underflow)
 }
 
-pub(crate) struct FrameDecoder<'a, DataMap, RangeMap> {
+pub(crate) struct Decoder<'a, DataMap, RangeMap> {
     input: &'a [u8],
     data: DataMap,
     ranges: RangeMap,
 }
 
-impl<'a, DataMap, RangeMap> FrameDecoder<'a, DataMap, RangeMap> {
+impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
     pub(crate) fn new(input: &'a [u8], data: DataMap, ranges: RangeMap) -> Self {
         Self {
             input,

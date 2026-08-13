@@ -31,7 +31,7 @@ where
 // SAFETY: `Control` exposes only protocol borrows and slot commands inside one
 // step. It cannot move, replace, or drop the client or its retained endpoint.
 unsafe impl<'d, 'tls, const ID: u8, P, B, A, C> dispatch::raw::Controlled<'d>
-    for client::ClientInner<'d, 'tls, ID, P, B, A, C>
+    for client::Dialer<'d, 'tls, ID, P, B, A, C>
 where
     P: client::Protocol,
     B: client::BackoffPolicy,
@@ -54,7 +54,7 @@ where
 
 // SAFETY: `Client` delegates every retained address to its pinned endpoint.
 unsafe impl<'d, 'tls, const ID: u8, P, B, A, C> dispatch::raw::Manifold<'d>
-    for client::ClientInner<'d, 'tls, ID, P, B, A, C>
+    for client::Dialer<'d, 'tls, ID, P, B, A, C>
 where
     P: client::Protocol,
     B: client::BackoffPolicy,

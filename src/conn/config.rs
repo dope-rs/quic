@@ -107,7 +107,7 @@ impl Default for Options {
 }
 
 impl Options {
-    pub fn validate(&self) -> Result<(), errors::ConnectError> {
+    pub fn validate(&self) -> Result<(), errors::ConnectFailure> {
         let indexed = [
             self.packet_journal_capacity,
             self.crypto_journal_capacity,
@@ -148,12 +148,12 @@ impl Options {
                 .as_ref()
                 .is_some_and(|params| params.validate().is_err())
         {
-            return Err(errors::ConnectError::InvalidConfig);
+            return Err(errors::ConnectFailure::InvalidConfig);
         }
         Ok(())
     }
 
-    pub(crate) fn validate_pooled_client(&self) -> Result<(), errors::ConnectError> {
+    pub(crate) fn validate_pooled_client(&self) -> Result<(), errors::ConnectFailure> {
         self.validate()?;
         if !self.alpn_protocols.is_empty()
             || self.server_cert_chain.is_some()
@@ -161,12 +161,12 @@ impl Options {
             || self.identity.is_some()
             || self.enable_early_data
         {
-            return Err(errors::ConnectError::InvalidConfig);
+            return Err(errors::ConnectFailure::InvalidConfig);
         }
         Ok(())
     }
 
-    fn validate_pooled_server(&self) -> Result<(), errors::ConnectError> {
+    fn validate_pooled_server(&self) -> Result<(), errors::ConnectFailure> {
         self.validate()?;
         if !self.alpn_protocols.is_empty()
             || self.server_cert_chain.is_some()
@@ -175,14 +175,14 @@ impl Options {
             || self.identity.is_some()
             || self.enable_early_data
         {
-            return Err(errors::ConnectError::InvalidConfig);
+            return Err(errors::ConnectFailure::InvalidConfig);
         }
         Ok(())
     }
 
-    pub(crate) fn duplicate_connection(&self) -> Result<Self, errors::ConnectError> {
+    pub(crate) fn duplicate_connection(&self) -> Result<Self, errors::ConnectFailure> {
         if self.resumption.is_some() || self.identity.is_some() {
-            return Err(errors::ConnectError::InvalidConfig);
+            return Err(errors::ConnectFailure::InvalidConfig);
         }
         Ok(Self {
             transport_params: self.transport_params.clone(),
@@ -226,39 +226,39 @@ impl From<transport_params::Params> for Options {
 pub(crate) struct Validated(Options);
 
 impl Validated {
-    pub(crate) fn new(config: Options) -> Result<Self, errors::ConnectError> {
+    pub(crate) fn new(config: Options) -> Result<Self, errors::ConnectFailure> {
         config.validate()?;
         Ok(Self(config))
     }
 
-    pub(crate) fn new_pooled_server(config: Options) -> Result<Self, errors::ConnectError> {
+    pub(crate) fn new_pooled_server(config: Options) -> Result<Self, errors::ConnectFailure> {
         config.validate_pooled_server()?;
         Ok(Self(config))
     }
 
-    pub(crate) fn cap_max_pmtu(&mut self, ceiling: u64) -> Result<(), errors::ConnectError> {
+    pub(crate) fn cap_max_pmtu(&mut self, ceiling: u64) -> Result<(), errors::ConnectFailure> {
         if ceiling < conn::MIN_INITIAL_LEN as u64 {
-            return Err(errors::ConnectError::InvalidConfig);
+            return Err(errors::ConnectFailure::InvalidConfig);
         }
         self.0.max_pmtu = self.0.max_pmtu.min(ceiling);
         Ok(())
     }
 
-    pub(crate) fn duplicate_connection(&self) -> Result<Self, errors::ConnectError> {
+    pub(crate) fn duplicate_connection(&self) -> Result<Self, errors::ConnectFailure> {
         self.0.duplicate_connection().map(Self)
     }
 
     pub(crate) fn take_server_config(
         &mut self,
         signing_key: crypto::sig::SigningKey,
-    ) -> Result<server::config::Config, errors::ConnectError> {
+    ) -> Result<server::config::Config, errors::ConnectFailure> {
         let ticket_keys = self
             .0
             .ticket_secret
             .take()
             .map(crypto::ticket::Keys::single)
             .transpose()
-            .map_err(|_| errors::ConnectError::InvalidConfig)?;
+            .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
         Ok(shin::server::config::Config {
             source: match self.0.server_cert_chain.take() {
                 Some(chain_der) => server::config::CertSource::X509 {

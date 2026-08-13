@@ -95,7 +95,7 @@ impl Permit<'_> {
     pub(super) fn push_stopped(
         &mut self,
         handle: send::Handle,
-        stream: &mut crate::stream::SendStream,
+        stream: &mut crate::stream::Sender,
         stream_id: u64,
         error_code: u64,
     ) {

@@ -7,7 +7,7 @@ pub(in crate::conn) mod crypto;
 
 use crate::frame::{Frame, TYPE_PING};
 use crate::packet::{LONG_HANDSHAKE, LONG_INITIAL, LongHeader, QUIC_V1};
-use crate::stream::{ReceiveBuffer, SendStream};
+use crate::stream::{ReceiveBuffer, Sender};
 use crate::varint::VarInt;
 
 use crate::conn::{
@@ -113,7 +113,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
         stream_id: u64,
         offset: u64,
         fin: bool,
-        stream: &SendStream,
+        stream: &Sender,
         len: usize,
     ) -> bool {
         let start = out.len();

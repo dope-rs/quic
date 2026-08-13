@@ -41,12 +41,12 @@ struct State {
 /// connections. Clones share both the replay store and its authenticated
 /// ticket domain; the type remains `!Send` for thread-per-core runtimes.
 #[derive(Clone, Debug)]
-pub struct EarlyDataReplayCache {
+pub struct ReplayCache {
     state: Rc<RefCell<State>>,
     domain: ReplayDomain,
 }
 
-impl EarlyDataReplayCache {
+impl ReplayCache {
     pub fn new() -> Result<Self, ReplayCacheError> {
         Self::from_capacity(DEFAULT_REPLAY_CAPACITY)
     }
@@ -100,13 +100,13 @@ impl State {
     }
 }
 
-impl ReplayGuard for EarlyDataReplayCache {
+impl ReplayGuard for ReplayCache {
     fn replay_domain(&self) -> Option<ReplayDomain> {
         Some(self.domain.clone())
     }
 }
 
-impl EarlyDataGuard for EarlyDataReplayCache {
+impl EarlyDataGuard for ReplayCache {
     fn register(&self, token: &[u8]) -> bool {
         self.state
             .borrow_mut()

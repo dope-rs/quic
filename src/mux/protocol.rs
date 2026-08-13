@@ -4,13 +4,13 @@ use std::time::Instant;
 use crate::conn::{self, Error, Handle};
 use crate::pmtud::BASE_PMTU;
 use crate::stream::{ReceiveBuffer, RecvBuffer};
-use crate::{ConnectError, TrySendError};
+use crate::{ConnectFailure, SendFailure};
 use dope::manifold::datagram;
 
 use super::drive::{DriveOps as _, QueueOps as _};
 use super::routing::reset::ResetOps as _;
 use super::routing::{AcceptOps as _, CidOps as _, DeadlineOps as _, SlotOps as _};
-use super::{ConnectionMut, Entry, Handler, MuxInner, QueueKind, RetryGate, TlsSession};
+use super::{ConnectionMut, Entry, Handler, QueueKind, RetryGate, Router, TlsSession};
 use crate::packet::ConnectionId;
 
 pub struct Io<'a, 'tls, H, P, const DOMAIN: u8, B: ReceiveBuffer = Vec<u8>>
@@ -18,13 +18,13 @@ where
     H: Handler<DOMAIN, B>,
     P: conn::server::Policy,
 {
-    mux: &'a mut MuxInner<'tls, H, P, DOMAIN, B>,
+    mux: &'a mut Router<'tls, H, P, DOMAIN, B>,
 }
 
 impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
     Io<'a, 'tls, H, P, DOMAIN, B>
 {
-    pub(super) fn new(mux: &'a mut MuxInner<'tls, H, P, DOMAIN, B>) -> Self {
+    pub(super) fn new(mux: &'a mut Router<'tls, H, P, DOMAIN, B>) -> Self {
         Self { mux }
     }
 
@@ -35,9 +35,9 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
         client_config: conn::config::Options,
         initial_dcid: Vec<u8>,
         now: Instant,
-    ) -> Result<Handle, ConnectError> {
+    ) -> Result<Handle, ConnectFailure> {
         let initial_dcid =
-            ConnectionId::try_from(initial_dcid).map_err(|_| ConnectError::InvalidConfig)?;
+            ConnectionId::try_from(initial_dcid).map_err(|_| ConnectFailure::InvalidConfig)?;
         self.connect_id(peer_addr, server_pubkey, client_config, initial_dcid, now)
     }
 
@@ -48,24 +48,24 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
         client_config: conn::config::Options,
         initial_dcid: ConnectionId,
         now: Instant,
-    ) -> Result<Handle, ConnectError> {
+    ) -> Result<Handle, ConnectFailure> {
         self.mux.sync_dirty_connection();
         if self.mux.lifecycle.shutting_down {
-            return Err(ConnectError::Closed);
+            return Err(ConnectFailure::Closed);
         }
         if self.mux.registry.active_conns >= self.mux.registry.max_conns {
-            return Err(ConnectError::Capacity);
+            return Err(ConnectFailure::Capacity);
         }
         client_config.validate()?;
         let max_packet_bytes =
             super::setup::connection_ceiling(&client_config, self.mux.outgoing.bytes_capacity);
         if max_packet_bytes < BASE_PMTU as usize {
-            return Err(ConnectError::InvalidConfig);
+            return Err(ConnectFailure::InvalidConfig);
         }
         let local_cid = self
             .mux
             .gen_cid(client_config.cid_prefix)
-            .ok_or(ConnectError::Capacity)?;
+            .ok_or(ConnectFailure::Capacity)?;
         let conn = conn::setup::Client::<DOMAIN>::connect_buffer::<B>(
             initial_dcid,
             local_cid,
@@ -75,19 +75,19 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
         let handle = self
             .mux
             .insert_connection(conn, None, peer_addr, max_packet_bytes)
-            .ok_or(ConnectError::Capacity)?;
+            .ok_or(ConnectFailure::Capacity)?;
         let index = self
             .mux
             .handle_index(handle)
-            .ok_or(ConnectError::Capacity)?;
+            .ok_or(ConnectFailure::Capacity)?;
         let (key, local_cid) = self.mux.registry.entries[index]
             .slot_mut()
-            .ok_or(ConnectError::Capacity)?
+            .ok_or(ConnectFailure::Capacity)?
             .conn
             .enable_cid_routing();
         if !self.mux.register_local_cid(handle, key, local_cid) {
             self.mux.remove_slot(handle);
-            return Err(ConnectError::Capacity);
+            return Err(ConnectFailure::Capacity);
         }
         self.mux.schedule_flush(handle);
         self.mux.refresh_deadline(handle, now);
@@ -103,9 +103,9 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
         client_config: conn::config::Options,
         initial_dcid: Vec<u8>,
         now: Instant,
-    ) -> Result<Handle, ConnectError> {
+    ) -> Result<Handle, ConnectFailure> {
         let initial_dcid =
-            ConnectionId::try_from(initial_dcid).map_err(|_| ConnectError::InvalidConfig)?;
+            ConnectionId::try_from(initial_dcid).map_err(|_| ConnectFailure::InvalidConfig)?;
         self.connect_pooled_id(peer_addr, pool, client_config, initial_dcid, now)
     }
 
@@ -116,24 +116,24 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
         client_config: conn::config::Options,
         initial_dcid: ConnectionId,
         now: Instant,
-    ) -> Result<Handle, ConnectError> {
+    ) -> Result<Handle, ConnectFailure> {
         self.mux.sync_dirty_connection();
         if self.mux.lifecycle.shutting_down {
-            return Err(ConnectError::Closed);
+            return Err(ConnectFailure::Closed);
         }
         if self.mux.registry.active_conns >= self.mux.registry.max_conns {
-            return Err(ConnectError::Capacity);
+            return Err(ConnectFailure::Capacity);
         }
         client_config.validate()?;
         let max_packet_bytes =
             super::setup::connection_ceiling(&client_config, self.mux.outgoing.bytes_capacity);
         if max_packet_bytes < BASE_PMTU as usize {
-            return Err(ConnectError::InvalidConfig);
+            return Err(ConnectFailure::InvalidConfig);
         }
         let local_cid = self
             .mux
             .gen_cid(client_config.cid_prefix)
-            .ok_or(ConnectError::Capacity)?;
+            .ok_or(ConnectFailure::Capacity)?;
         let pooled = conn::setup::Client::<DOMAIN>::connect_pooled_buffer::<B>(
             initial_dcid,
             local_cid,
@@ -149,19 +149,19 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
                 peer_addr,
                 max_packet_bytes,
             )
-            .ok_or(ConnectError::Capacity)?;
+            .ok_or(ConnectFailure::Capacity)?;
         let index = self
             .mux
             .handle_index(handle)
-            .ok_or(ConnectError::Capacity)?;
+            .ok_or(ConnectFailure::Capacity)?;
         let (key, local_cid) = self.mux.registry.entries[index]
             .slot_mut()
-            .ok_or(ConnectError::Capacity)?
+            .ok_or(ConnectFailure::Capacity)?
             .conn
             .enable_cid_routing();
         if !self.mux.register_local_cid(handle, key, local_cid) {
             self.mux.remove_slot(handle);
-            return Err(ConnectError::Capacity);
+            return Err(ConnectFailure::Capacity);
         }
         self.mux.schedule_flush(handle);
         self.mux.refresh_deadline(handle, now);
@@ -283,9 +283,9 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
         handle: Handle,
         data: Vec<u8>,
         now: Instant,
-    ) -> Result<(), crate::TrySendError<Vec<u8>>> {
+    ) -> Result<(), crate::SendFailure<Vec<u8>>> {
         if self.mux.lifecycle.shutting_down {
-            return Err(TrySendError::Closed(data));
+            return Err(SendFailure::Closed(data));
         }
         let result = match self
             .mux
@@ -294,7 +294,7 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
             .and_then(Entry::slot_mut)
         {
             Some(slot) => slot.conn.datagrams().try_send(data),
-            None => Err(TrySendError::Closed(data)),
+            None => Err(SendFailure::Closed(data)),
         };
         self.mux.schedule_flush(handle);
         self.mux.refresh_deadline(handle, now);

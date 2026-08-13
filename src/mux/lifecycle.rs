@@ -4,7 +4,7 @@ use crate::conn;
 use crate::stream::ReceiveBuffer;
 
 use super::routing::SlotOps as _;
-use super::{DIRECT_DRIVE_BUDGET, Handler, MuxInner};
+use super::{DIRECT_DRIVE_BUDGET, Handler, Router};
 
 #[derive(Default)]
 pub(super) struct State {
@@ -17,13 +17,13 @@ where
     H: Handler<DOMAIN, B>,
     P: conn::server::Policy,
 {
-    mux: &'a mut MuxInner<'tls, H, P, DOMAIN, B>,
+    mux: &'a mut Router<'tls, H, P, DOMAIN, B>,
 }
 
 impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
     Shutdown<'a, 'tls, H, P, DOMAIN, B>
 {
-    pub(super) fn new(mux: &'a mut MuxInner<'tls, H, P, DOMAIN, B>) -> Self {
+    pub(super) fn new(mux: &'a mut Router<'tls, H, P, DOMAIN, B>) -> Self {
         Self { mux }
     }
 

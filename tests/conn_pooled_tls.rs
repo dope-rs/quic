@@ -3,7 +3,7 @@ use std::time::Instant;
 use dope_quic::conn::{self, setup, tls};
 use dope_quic::packet::ConnectionId;
 use dope_quic::varint::VarInt;
-use dope_quic::{ConnectError, transport_params};
+use dope_quic::{ConnectFailure, transport_params};
 use shin::crypto::sig::SigningKey;
 use shin::server::{
     Shard,
@@ -60,7 +60,7 @@ fn options() -> conn::config::Options {
 
 fn server_connection<'pool>(
     pool: &'pool tls::ServerPool,
-) -> Result<ServerConnection<'pool>, ConnectError> {
+) -> Result<ServerConnection<'pool>, ConnectFailure> {
     setup::Server::accept_pooled(
         conn::server::Ids::initial(cid(), cid(), cid()),
         options(),
@@ -91,7 +91,7 @@ fn pooled_authority_rejects_connection_local_tls_configuration() {
             client_options,
         )
         .err(),
-        Some(ConnectError::InvalidConfig)
+        Some(ConnectFailure::InvalidConfig)
     );
 
     let mut server_options = options();
@@ -103,7 +103,7 @@ fn pooled_authority_rejects_connection_local_tls_configuration() {
             &server_pool,
         )
         .err(),
-        Some(ConnectError::InvalidConfig)
+        Some(ConnectFailure::InvalidConfig)
     );
 }
 
@@ -161,11 +161,11 @@ fn one_slot_tls_pools_recycle_after_handshake_while_connections_stay_live() {
     assert_eq!(
         setup::Client::<0>::connect_pooled(CID.to_vec(), CID.to_vec(), &client_pool, options(),)
             .err(),
-        Some(ConnectError::Capacity)
+        Some(ConnectFailure::Capacity)
     );
     assert_eq!(
         server_connection(&server_pool).err(),
-        Some(ConnectError::Capacity)
+        Some(ConnectFailure::Capacity)
     );
 
     let now = Instant::now();

@@ -18,16 +18,16 @@ pub type ServerPool<
 pub fn server_pool<G, V, const DOMAIN: u8>(
     shard: &shin::server::Shard<G, V, DOMAIN>,
     capacity: usize,
-) -> Result<ServerPool<V, DOMAIN, G>, errors::ConnectError>
+) -> Result<ServerPool<V, DOMAIN, G>, errors::ConnectFailure>
 where
     G: shin::server::config::EarlyDataGuard,
     V: shin::server::config::ClientCertVerifier,
 {
     let capacity =
-        slab::Capacity::try_from(capacity).map_err(|_| errors::ConnectError::InvalidConfig)?;
+        slab::Capacity::try_from(capacity).map_err(|_| errors::ConnectFailure::InvalidConfig)?;
     let profile = shard
         .quic_profile(transport_params::Params::MAX_ENCODED_LEN)
-        .map_err(|_| errors::ConnectError::InvalidConfig)?;
+        .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
     Ok(profile.into_pool::<fn() -> u64>(capacity))
 }
 
@@ -44,9 +44,9 @@ impl ClientPool {
         enable_early_data: bool,
         identity: Option<client::config::Identity>,
         capacity: usize,
-    ) -> Result<Self, errors::ConnectError> {
-        let capacity =
-            slab::Capacity::try_from(capacity).map_err(|_| errors::ConnectError::InvalidConfig)?;
+    ) -> Result<Self, errors::ConnectFailure> {
+        let capacity = slab::Capacity::try_from(capacity)
+            .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
         let prepared = client::config::Config {
             verifier: client::config::Verifier::RawPublicKey {
                 expected_pubkey: server_pubkey,
@@ -56,18 +56,18 @@ impl ClientPool {
             enable_early_data,
         }
         .try_into_prepared_with_transport(shin::transport::Mode::Quic)
-        .map_err(errors::ConnectError::InvalidTlsConfig)?;
+        .map_err(errors::ConnectFailure::InvalidTlsConfig)?;
         let identity = identity
             .map(client::config::Identity::try_into_template)
             .transpose()
-            .map_err(errors::ConnectError::InvalidTlsConfig)?;
+            .map_err(errors::ConnectFailure::InvalidTlsConfig)?;
         let inner = prepared
             .try_into_framed_pool(
                 identity,
                 capacity,
                 transport_params::Params::MAX_ENCODED_LEN,
             )
-            .map_err(errors::ConnectError::InvalidTlsConfig)?;
+            .map_err(errors::ConnectFailure::InvalidTlsConfig)?;
         Ok(Self { inner })
     }
 
@@ -76,7 +76,7 @@ impl ClientPool {
         resumption: Option<conn::session::Ticket>,
     ) -> Result<
         client::workspace::FramedReservation<'_, conn::handshake::Clock>,
-        errors::ConnectError,
+        errors::ConnectFailure,
     > {
         let reservation = match resumption {
             Some(ticket) => self
@@ -84,12 +84,12 @@ impl ClientPool {
                 .reserve_restored(
                     ticket
                         .into_restore()
-                        .map_err(errors::ConnectError::InvalidTlsConfig)?,
+                        .map_err(errors::ConnectFailure::InvalidTlsConfig)?,
                 )
-                .map_err(errors::ConnectError::InvalidTlsConfig)?,
+                .map_err(errors::ConnectFailure::InvalidTlsConfig)?,
             None => self.inner.reserve(),
         };
-        reservation.ok_or(errors::ConnectError::Capacity)
+        reservation.ok_or(errors::ConnectFailure::Capacity)
     }
 
     pub fn capacity_profile(&self) -> (usize, usize, usize) {

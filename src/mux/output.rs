@@ -7,7 +7,7 @@ use crate::conn;
 use crate::stream::ReceiveBuffer;
 
 use super::drive::DriveOps as _;
-use super::{DIRECT_DRIVE_BUDGET, Handler, MuxInner, Outgoing};
+use super::{DIRECT_DRIVE_BUDGET, Handler, Outgoing, Router};
 
 pub(super) struct Storage {
     pub(super) pending: Fifo<Outgoing>,
@@ -59,7 +59,7 @@ pub(crate) trait State {
 }
 
 impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer> State
-    for MuxInner<'tls, H, P, DOMAIN, B>
+    for Router<'tls, H, P, DOMAIN, B>
 {
     fn has_buffered_output(&self) -> bool {
         !self.outgoing.pending.is_empty()
@@ -71,13 +71,13 @@ where
     H: Handler<DOMAIN, B>,
     P: conn::server::Policy,
 {
-    mux: &'a mut MuxInner<'tls, H, P, DOMAIN, B>,
+    mux: &'a mut Router<'tls, H, P, DOMAIN, B>,
 }
 
 impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
     Queue<'a, 'tls, H, P, DOMAIN, B>
 {
-    pub(super) fn new(mux: &'a mut MuxInner<'tls, H, P, DOMAIN, B>) -> Self {
+    pub(super) fn new(mux: &'a mut Router<'tls, H, P, DOMAIN, B>) -> Self {
         Self { mux }
     }
 

@@ -130,7 +130,7 @@ pub struct Arena<B: ReceiveBuffer> {
 }
 
 #[derive(Debug)]
-pub(crate) struct RangeBuffer<B: ReceiveBuffer> {
+pub(crate) struct Store<B: ReceiveBuffer> {
     next: u64,
     buffered: usize,
     head: u32,
@@ -289,7 +289,7 @@ impl ReadySegments {
     }
 }
 
-impl<B: ReceiveBuffer> Default for RangeBuffer<B> {
+impl<B: ReceiveBuffer> Default for Store<B> {
     fn default() -> Self {
         Self {
             next: 0,
@@ -301,7 +301,7 @@ impl<B: ReceiveBuffer> Default for RangeBuffer<B> {
     }
 }
 
-impl<B: ReceiveBuffer> RangeBuffer<B> {
+impl<B: ReceiveBuffer> Store<B> {
     pub(crate) fn plan<'a>(
         &self,
         arena: &Arena<B>,
@@ -691,7 +691,7 @@ impl Plan<'_> {
     }
 }
 
-impl RangeBuffer<Vec<u8>> {
+impl Store<Vec<u8>> {
     fn insert_copy(
         &mut self,
         offset: u64,
@@ -759,7 +759,7 @@ impl RangeBuffer<Vec<u8>> {
     }
 }
 
-impl<'d> RangeBuffer<RecvBuffer<'d>> {
+impl<'d> Store<RecvBuffer<'d>> {
     pub(crate) fn insert_retained_and_drain_into(
         &mut self,
         arena: &mut Arena<RecvBuffer<'d>>,

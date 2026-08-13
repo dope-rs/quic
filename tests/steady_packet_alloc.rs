@@ -398,7 +398,7 @@ fn recurring_stream_event_does_not_allocate() {
         Some(Event::Readable { stream_id: stream })
     );
 
-    // A non-empty destination makes RecvStream retain its warmed allocation.
+    // A non-empty destination makes Receiver retain its warmed allocation.
     let mut received = vec![0];
     assert_eq!(server.streams().recv(stream, &mut received), 512);
     received.clear();

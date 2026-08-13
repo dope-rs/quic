@@ -9,8 +9,8 @@ use crate::stream::ReceiveBuffer;
 
 use super::routing::{DeadlineOps as _, SlotOps as _};
 use super::{
-    DrivePhase, Entry, FLUSH_BYTE_QUANTUM, FLUSH_PACKET_QUANTUM, FlushRound, Handler, MuxInner,
-    NONE, Outgoing, QueueKind, QueueLinks, QueueState,
+    DrivePhase, Entry, FLUSH_BYTE_QUANTUM, FLUSH_PACKET_QUANTUM, FlushRound, Handler, NONE,
+    Outgoing, QueueKind, QueueLinks, QueueState, Router,
 };
 
 pub(super) struct Queues {
@@ -70,7 +70,7 @@ pub(super) trait QueueOps {
 }
 
 impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    OutputOps for MuxInner<'tls, H, P, DOMAIN, B>
+    OutputOps for Router<'tls, H, P, DOMAIN, B>
 {
     fn flush_conn_round(&mut self, handle: Handle, now: Instant) -> FlushRound {
         let packet_room = self
@@ -287,7 +287,7 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
 }
 
 impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    DriveOps for MuxInner<'tls, H, P, DOMAIN, B>
+    DriveOps for Router<'tls, H, P, DOMAIN, B>
 {
     fn schedule_flush(&mut self, handle: Handle) {
         let Some(idx) = self.handle_index(handle) else {
@@ -384,7 +384,7 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
 }
 
 impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    QueueOps for MuxInner<'tls, H, P, DOMAIN, B>
+    QueueOps for Router<'tls, H, P, DOMAIN, B>
 {
     fn queue(&self, kind: QueueKind) -> &QueueState {
         match kind {

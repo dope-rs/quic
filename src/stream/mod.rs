@@ -8,7 +8,7 @@ use o3::buffer::{
     storage::{self, inline},
 };
 
-use crate::range_buffer::{Arena, InsertError, MAX_RANGES, RangeBuffer, ReadySegments};
+use crate::range_buffer::{Arena, InsertError, MAX_RANGES, ReadySegments, Store};
 
 const MAX_RECV_SEGMENTS: usize = MAX_RANGES;
 
@@ -24,7 +24,7 @@ pub trait ReceiveBuffer: buffer::Buffer + AsRef<[u8]> + Sized {
     fn copy_from_slice(bytes: &[u8]) -> Self;
     #[doc(hidden)]
     fn insert_copied(
-        stream: &mut RecvStream<Self>,
+        stream: &mut Receiver<Self>,
         arena: &mut Arena<Self>,
         parts: &mut Vec<(u64, Range<usize>)>,
         offset: u64,
@@ -73,7 +73,7 @@ impl ReceiveBuffer for Vec<u8> {
     }
 
     fn insert_copied(
-        stream: &mut RecvStream<Self>,
+        stream: &mut Receiver<Self>,
         arena: &mut Arena<Self>,
         parts: &mut Vec<(u64, Range<usize>)>,
         offset: u64,
@@ -453,29 +453,29 @@ impl From<InsertError> for RecvError {
 }
 
 #[derive(Debug)]
-pub struct RecvStream<B: ReceiveBuffer = Vec<u8>> {
+pub struct Receiver<B: ReceiveBuffer = Vec<u8>> {
     assembled: B::Ready,
     delivered_to: u64,
     highest_offset: u64,
-    gaps: RangeBuffer<B>,
+    gaps: Store<B>,
     final_size: Option<u64>,
     reset_error: Option<u64>,
 }
 
-impl<B: ReceiveBuffer> Default for RecvStream<B> {
+impl<B: ReceiveBuffer> Default for Receiver<B> {
     fn default() -> Self {
         Self {
             assembled: B::Ready::default(),
             delivered_to: 0,
             highest_offset: 0,
-            gaps: RangeBuffer::default(),
+            gaps: Store::default(),
             final_size: None,
             reset_error: None,
         }
     }
 }
 
-impl<B: ReceiveBuffer> RecvStream<B> {
+impl<B: ReceiveBuffer> Receiver<B> {
     pub(crate) fn receive_plan<'a>(
         &self,
         arena: &Arena<B>,
@@ -597,7 +597,7 @@ impl<B: ReceiveBuffer> RecvStream<B> {
     }
 }
 
-impl RecvStream<Vec<u8>> {
+impl Receiver<Vec<u8>> {
     fn insert_copy(
         &mut self,
         arena: &mut Arena<Vec<u8>>,
@@ -627,7 +627,7 @@ impl RecvStream<Vec<u8>> {
     }
 }
 
-impl<'d> RecvStream<RecvBuffer<'d>> {
+impl<'d> Receiver<RecvBuffer<'d>> {
     pub(crate) fn insert_retained(
         &mut self,
         arena: &mut Arena<RecvBuffer<'d>>,
@@ -733,7 +733,7 @@ impl From<Bytes<Retained>> for SendBuffer {
 }
 
 #[derive(Debug, Default)]
-pub struct SendStream {
+pub struct Sender {
     chunks: Cursor<SendBuffer>,
     spare: Vec<u8>,
     base_offset: u64,
@@ -743,7 +743,7 @@ pub struct SendStream {
     stop_sending_error: Option<u64>,
 }
 
-impl SendStream {
+impl Sender {
     pub fn write(&mut self, data: &[u8]) -> bool {
         if data.is_empty() {
             return true;
@@ -955,4 +955,4 @@ impl SendStream {
 }
 
 const _: () = assert!(size_of::<SendBuffer>() == 32);
-const _: () = assert!(size_of::<SendStream>() == 112);
+const _: () = assert!(size_of::<Sender>() == 112);

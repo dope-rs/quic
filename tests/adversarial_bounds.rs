@@ -4,13 +4,13 @@ use std::time::Instant;
 
 use dope_quic::conn::Error;
 use dope_quic::conn::server;
-use dope_quic::early_data::EarlyDataReplayCache;
+use dope_quic::early_data::ReplayCache;
 use dope_quic::frame::Frame;
 use dope_quic::packet::{InitialHeader, QUIC_V1};
 use dope_quic::packet_protection::PacketProtection;
 use dope_quic::qkdf::{InitialSecrets, PacketKeys};
 use dope_quic::varint::VarInt;
-use dope_quic::{ConnectError, Handler, conn, conn::session::Connection};
+use dope_quic::{ConnectFailure, Handler, conn, conn::session::Connection};
 
 const INITIAL_DCID: [u8; 8] = [0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce];
 const CLIENT_SCID: [u8; 4] = [1, 2, 3, 4];
@@ -33,19 +33,19 @@ fn invalid_allocation_limits_fail_before_construction() {
         max_pmtu: u64::MAX,
         ..Default::default()
     };
-    assert_eq!(config.validate(), Err(ConnectError::InvalidConfig));
+    assert_eq!(config.validate(), Err(ConnectFailure::InvalidConfig));
 
     let config = conn::config::Options {
         local_bidi_stream_capacity: 65_537,
         ..Default::default()
     };
-    assert_eq!(config.validate(), Err(ConnectError::InvalidConfig));
+    assert_eq!(config.validate(), Err(ConnectFailure::InvalidConfig));
 
     let config = conn::config::Options {
         local_uni_stream_capacity: 65_537,
         ..Default::default()
     };
-    assert_eq!(config.validate(), Err(ConnectError::InvalidConfig));
+    assert_eq!(config.validate(), Err(ConnectFailure::InvalidConfig));
 }
 
 struct Noop;
@@ -58,27 +58,27 @@ impl Handler<0> for Noop {
 
 #[test]
 fn allocation_constructors_reject_unsupported_capacities() {
-    assert!(EarlyDataReplayCache::with_capacity(usize::MAX).is_err());
+    assert!(ReplayCache::with_capacity(usize::MAX).is_err());
     assert_eq!(
         dope_quic::mux::setup::Client::new(Noop)
             .limits(0, 1, 1)
             .build()
             .err(),
-        Some(ConnectError::InvalidConfig)
+        Some(ConnectFailure::InvalidConfig)
     );
     assert_eq!(
         dope_quic::mux::setup::Client::new(Noop)
             .limits(1, usize::MAX, 1)
             .build()
             .err(),
-        Some(ConnectError::InvalidConfig)
+        Some(ConnectFailure::InvalidConfig)
     );
     assert_eq!(
         dope_quic::mux::setup::Client::new(Noop)
             .limits(1, 1, usize::MAX)
             .build()
             .err(),
-        Some(ConnectError::InvalidConfig)
+        Some(ConnectFailure::InvalidConfig)
     );
 }
 

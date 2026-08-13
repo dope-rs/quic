@@ -6,10 +6,10 @@ use dope::core::driver::{self, schedule};
 use dope::manifold::datagram::{self, Socket};
 
 use crate::conn;
-use crate::endpoint::EndpointBuffer;
+use crate::endpoint::Storage;
 use crate::mux::drive::{DriveOps as _, OutputOps as _};
 use crate::mux::output::State as _;
-use crate::mux::{self, Outgoing, PooledMux};
+use crate::mux::{self, Outgoing, PooledRouter};
 use crate::stream::ReceiveBuffer;
 
 pub(super) struct Runtime<
@@ -20,7 +20,7 @@ pub(super) struct Runtime<
     const ID: u8,
     B: ReceiveBuffer,
 > {
-    pub(super) mux: PooledMux<'tls, H, P, ID, B>,
+    pub(super) mux: PooledRouter<'tls, H, P, ID, B>,
     flush_blocked: bool,
     prefer_output: bool,
     stopping: bool,
@@ -30,7 +30,7 @@ pub(super) struct Runtime<
 impl<'d, 'tls, H: mux::Handler<ID, B>, P: conn::server::Policy, const ID: u8, B: ReceiveBuffer>
     Runtime<'d, 'tls, H, P, ID, B>
 {
-    pub(super) fn new(mux: PooledMux<'tls, H, P, ID, B>) -> Self {
+    pub(super) fn new(mux: PooledRouter<'tls, H, P, ID, B>) -> Self {
         Self {
             mux,
             flush_blocked: false,
@@ -45,7 +45,7 @@ impl<'d, 'tls, const ID: u8, H, P, B> datagram::Handler<'d, ID> for Runtime<'d, 
 where
     H: mux::Handler<ID, B>,
     P: conn::server::Policy,
-    B: EndpointBuffer<'d>,
+    B: Storage<'d>,
 {
     fn packet<'turn>(
         &mut self,
@@ -131,7 +131,7 @@ where
 
 fn queue_one<'turn, 'd, 'tls, const ID: u8, H, P, B>(
     mut socket: Pin<&mut Socket<'d, ID>>,
-    mux: &mut PooledMux<'tls, H, P, ID, B>,
+    mux: &mut PooledRouter<'tls, H, P, ID, B>,
     _permit: driver::schedule::ApplicationPermit<'turn, 'd>,
 ) -> bool
 where

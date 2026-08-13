@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use dope_quic::conn::Handle;
-use dope_quic::{Handler, Mux, TrySendError, conn, conn::session::Connection, transport_params};
+use dope_quic::{Handler, Mux, SendFailure, conn, conn::session::Connection, transport_params};
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
@@ -465,7 +465,7 @@ fn recycled_slot_rejects_stale_generation_handle() {
         client
             .protocol()
             .try_send_datagram(h0, b"stale".to_vec(), t_past),
-        Err(TrySendError::Closed(b"stale".to_vec()))
+        Err(SendFailure::Closed(b"stale".to_vec()))
     );
     client.protocol().flush(h0, t_past);
     client.protocol().close(h0);
@@ -543,7 +543,7 @@ fn shutdown_retires_connections_deadlines_and_outgoing() {
         client
             .protocol()
             .try_send_datagram(client_handle, b"late".to_vec(), now),
-        Err(TrySendError::Closed(b"late".to_vec()))
+        Err(SendFailure::Closed(b"late".to_vec()))
     );
     assert_eq!(
         client.protocol().connect(
@@ -553,7 +553,7 @@ fn shutdown_retires_connections_deadlines_and_outgoing() {
             CID.to_vec(),
             now,
         ),
-        Err(dope_quic::ConnectError::Closed)
+        Err(dope_quic::ConnectFailure::Closed)
     );
     assert!(client.output().drain().next().is_none());
 }

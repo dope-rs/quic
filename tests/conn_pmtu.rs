@@ -3,7 +3,7 @@ pub mod support;
 use std::time::Instant;
 
 use dope_quic::conn::server;
-use dope_quic::{TrySendError, conn, conn::session::Connection, transport_params};
+use dope_quic::{SendFailure, conn, conn::session::Connection, transport_params};
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
@@ -58,7 +58,7 @@ fn datagram_payload_pre_handshake_is_unknown() {
     assert!(client.datagrams().max_payload().is_none());
     let payload = b"x".to_vec();
     let err = client.datagrams().try_send(payload.clone()).unwrap_err();
-    assert_eq!(err, TrySendError::Unsupported(payload));
+    assert_eq!(err, SendFailure::Unsupported(payload));
 }
 
 #[test]
@@ -85,7 +85,7 @@ fn datagram_payload_respects_peer_limit() {
     assert!(client.datagrams().try_send(vec![0; 99]).is_ok());
     let payload = vec![0; 100];
     let err = client.datagrams().try_send(payload.clone()).unwrap_err();
-    assert_eq!(err, TrySendError::TooLarge(payload));
+    assert_eq!(err, SendFailure::TooLarge(payload));
 }
 
 #[test]
@@ -94,7 +94,7 @@ fn server_with_unconfigured_datagram_limit_rejects() {
     complete_handshake(&mut workspace, &mut server, &mut client, Instant::now());
     let payload = vec![0; 10];
     let err = client.datagrams().try_send(payload.clone()).unwrap_err();
-    assert_eq!(err, TrySendError::Unsupported(payload));
+    assert_eq!(err, SendFailure::Unsupported(payload));
 }
 
 #[test]

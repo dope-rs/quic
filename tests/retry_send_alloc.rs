@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use dope_quic::conn;
 use dope_quic::conn::session::Connection;
-use dope_quic::packet::{InitialHeader, QUIC_V1, RetryPacketRef};
+use dope_quic::packet::{InitialHeader, QUIC_V1, RetryRef};
 use dope_quic::{Handler, mux::Outgoing};
 use shin::crypto::sig::SigningKey;
 
@@ -68,7 +68,7 @@ fn control_transmit_allocates_once_cold_and_zero_times_after_recycling() {
     assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 1, "cold Retry");
     let outgoing = mux.output().drain().next().expect("one Retry");
     assert!(matches!(&outgoing, Outgoing::Suffix(..)));
-    let retry = RetryPacketRef::decode(outgoing.payload()).expect("decode Retry");
+    let retry = RetryRef::decode(outgoing.payload()).expect("decode Retry");
     assert_eq!(retry.destination_connection_id(), client_scid);
     let allocation = outgoing.payload().as_ptr();
     mux.output().recycle(outgoing);

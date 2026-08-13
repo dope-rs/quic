@@ -4,8 +4,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dope_quic::packet::{
-    ConnectionId, ConnectionIdError, ConnectionIdRef, InitialHeader, QUIC_V1, RetryPacket,
-    RetryPacketRef,
+    ConnectionId, ConnectionIdError, ConnectionIdRef, InitialHeader, QUIC_V1, Retry, RetryRef,
 };
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -67,7 +66,7 @@ fn retry_verification_borrows_wire_and_reuses_the_one_required_token_allocation(
     let expected_dcid = [0x22; 8];
     let peer_cid = [0x33; 8];
     let token = [0x44; 48];
-    let mut packet = RetryPacket {
+    let mut packet = Retry {
         version: QUIC_V1,
         dcid: expected_dcid.to_vec(),
         scid: peer_cid.to_vec(),
@@ -80,7 +79,7 @@ fn retry_verification_borrows_wire_and_reuses_the_one_required_token_allocation(
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
     COUNTING.set(true);
-    let verified = RetryPacketRef::decode(&wire)
+    let verified = RetryRef::decode(&wire)
         .unwrap()
         .verify_into(
             ConnectionIdRef::new(&original_dcid).unwrap(),

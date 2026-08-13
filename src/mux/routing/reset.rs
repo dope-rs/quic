@@ -5,15 +5,14 @@ use crate::clock::WallClock;
 use crate::conn::path::StatelessResetToken;
 use crate::conn::{self, Error};
 use crate::packet::{
-    ConnectionId, InitialHeader, MAX_CONNECTION_ID_LEN, QUIC_V1, RETRY_INTEGRITY_TAG_LEN,
-    RetryPacket,
+    ConnectionId, InitialHeader, MAX_CONNECTION_ID_LEN, QUIC_V1, RETRY_INTEGRITY_TAG_LEN, Retry,
 };
 use crate::secrets::{RetryTokenSecret, StatelessResetSecret};
 use crate::stream::ReceiveBuffer;
 
 use super::{CidOps as _, DeadlineOps as _, SlotOps as _};
 use crate::mux::drive::OutputOps as _;
-use crate::mux::{Handler, MAX_CIDS_PER_CONN, MuxInner, ROUTED_CID_LEN, RetryGate};
+use crate::mux::{Handler, MAX_CIDS_PER_CONN, ROUTED_CID_LEN, RetryGate, Router};
 
 pub(in crate::mux) trait ResetOps {
     fn maybe_handle_retry_gating(
@@ -27,7 +26,7 @@ pub(in crate::mux) trait ResetOps {
 }
 
 impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    ResetOps for MuxInner<'tls, H, P, DOMAIN, B>
+    ResetOps for Router<'tls, H, P, DOMAIN, B>
 {
     fn maybe_handle_retry_gating(
         &mut self,
@@ -60,7 +59,7 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
             let packet_ceiling = configured_ceiling
                 .min(self.outgoing.bytes_capacity)
                 .min(data.len().saturating_mul(3));
-            let encoded_len = RetryPacket::prefix_len(prefix.scid, new_scid.as_ref_id())
+            let encoded_len = Retry::prefix_len(prefix.scid, new_scid.as_ref_id())
                 + RetryTokenSecret::encoded_len(prefix.dcid)
                 + RETRY_INTEGRITY_TAG_LEN;
             if !self.packet_fits(encoded_len, packet_ceiling) {
@@ -72,14 +71,9 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
             };
             storage.push(prefix.dcid.len() as u8);
             storage.extend_from_slice(prefix.dcid.as_slice());
-            RetryPacket::encode_prefix_into(
-                &mut storage,
-                QUIC_V1,
-                prefix.scid,
-                new_scid.as_ref_id(),
-            );
+            Retry::encode_prefix_into(&mut storage, QUIC_V1, prefix.scid, new_scid.as_ref_id());
             secret.issue_into(&mut storage, &from, prefix.dcid, expiry);
-            let Ok(integrity_tag) = RetryPacket::tag_from_aad(&storage) else {
+            let Ok(integrity_tag) = Retry::tag_from_aad(&storage) else {
                 self.recycle_packet(storage);
                 return Ok(RetryGate::Drop);
             };

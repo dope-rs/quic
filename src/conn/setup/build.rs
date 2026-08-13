@@ -14,7 +14,7 @@ fn local_tp_bytes(
     original_dcid: &ConnectionId,
     retry_scid: Option<&ConnectionId>,
     user_parameters: transport_params::Params,
-) -> Result<Vec<u8>, errors::ConnectError> {
+) -> Result<Vec<u8>, errors::ConnectFailure> {
     let mut parameters = user_parameters;
     parameters.initial_source_connection_id = Some(*local_cid);
     if !is_client {
@@ -26,7 +26,7 @@ fn local_tp_bytes(
     let mut encoded = Vec::new();
     parameters
         .encode(&mut encoded)
-        .map_err(|_| errors::ConnectError::InvalidConfig)?;
+        .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
     Ok(encoded)
 }
 
@@ -191,7 +191,7 @@ where
 
     pub(crate) fn finish<B: crate::stream::ReceiveBuffer>(
         self,
-    ) -> Result<Built<'a, G, V, DOMAIN, B>, errors::ConnectError> {
+    ) -> Result<Built<'a, G, V, DOMAIN, B>, errors::ConnectFailure> {
         let Self {
             initial_dcid,
             local_cid,
@@ -227,7 +227,7 @@ where
             max_pmtu,
         } = options;
         let secrets = qkdf::InitialSecrets::from_dcid(&initial_dcid)
-            .map_err(|_| errors::ConnectError::InvalidConfig)?;
+            .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
         let local_idle = time::Duration::from_millis(user_tp.max_idle_timeout_ms);
         let local_max_data = user_tp.initial_max_data;
         let local_initial_max_stream_data_bidi_local = user_tp.initial_max_stream_data_bidi_local;
@@ -271,38 +271,38 @@ where
                     };
                     let template = cfg
                         .try_into_template_with_transport(shin::transport::Mode::Quic)
-                        .map_err(errors::ConnectError::InvalidTlsConfig)?;
+                        .map_err(errors::ConnectFailure::InvalidTlsConfig)?;
                     let prepared = match resumption {
                         Some(ticket) => template
                             .restore(
                                 ticket
                                     .into_restore()
-                                    .map_err(errors::ConnectError::InvalidTlsConfig)?,
+                                    .map_err(errors::ConnectFailure::InvalidTlsConfig)?,
                             )
-                            .map_err(errors::ConnectError::InvalidTlsConfig)?,
+                            .map_err(errors::ConnectFailure::InvalidTlsConfig)?,
                         None => template.without_resumption(),
                     };
                     let identity = identity
                         .map(shin::client::config::Identity::try_into_template)
                         .transpose()
-                        .map_err(errors::ConnectError::InvalidTlsConfig)?;
+                        .map_err(errors::ConnectFailure::InvalidTlsConfig)?;
                     let client = prepared.into_framed_client(
                         identity,
                         clock::WallClock::now_millis as conn::handshake::Clock,
                     );
                     let outbound_layout = client
                         .outbound_layout()
-                        .map_err(|_| errors::ConnectError::Tls)?;
+                        .map_err(|_| errors::ConnectFailure::Tls)?;
                     let initial_write = packet_protection::PacketProtection::aes_128(
                         &qkdf::PacketKeys::aes_128(&secrets.client)
-                            .map_err(|_| errors::ConnectError::InvalidConfig)?,
+                            .map_err(|_| errors::ConnectFailure::InvalidConfig)?,
                     )
-                    .map_err(|_| errors::ConnectError::InvalidConfig)?;
+                    .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
                     let initial_read = packet_protection::PacketProtection::aes_128(
                         &qkdf::PacketKeys::aes_128(&secrets.server)
-                            .map_err(|_| errors::ConnectError::InvalidConfig)?,
+                            .map_err(|_| errors::ConnectFailure::InvalidConfig)?,
                     )
-                    .map_err(|_| errors::ConnectError::InvalidConfig)?;
+                    .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
                     (
                         conn::handshake::Handshake::client(
                             client,
@@ -329,22 +329,22 @@ where
                             retry_scid.as_deref(),
                             &mut reservation.transport_params(),
                         )
-                        .map_err(|_| errors::ConnectError::InvalidConfig)?;
+                        .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
                     let client =
                         reservation.connect(clock::WallClock::now_millis as conn::handshake::Clock);
                     let outbound_layout = client
                         .outbound_layout()
-                        .map_err(|_| errors::ConnectError::Tls)?;
+                        .map_err(|_| errors::ConnectFailure::Tls)?;
                     let initial_write = packet_protection::PacketProtection::aes_128(
                         &qkdf::PacketKeys::aes_128(&secrets.client)
-                            .map_err(|_| errors::ConnectError::InvalidConfig)?,
+                            .map_err(|_| errors::ConnectFailure::InvalidConfig)?,
                     )
-                    .map_err(|_| errors::ConnectError::InvalidConfig)?;
+                    .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
                     let initial_read = packet_protection::PacketProtection::aes_128(
                         &qkdf::PacketKeys::aes_128(&secrets.server)
-                            .map_err(|_| errors::ConnectError::InvalidConfig)?,
+                            .map_err(|_| errors::ConnectFailure::InvalidConfig)?,
                     )
-                    .map_err(|_| errors::ConnectError::InvalidConfig)?;
+                    .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
                     (
                         conn::handshake::Handshake::server(
                             initial_read,
@@ -375,20 +375,20 @@ where
                     let clock = clock::WallClock::now_millis as conn::handshake::Clock;
                     let server = shard
                         .new_quic(cfg, clock)
-                        .map_err(|_| errors::ConnectError::Tls)?;
+                        .map_err(|_| errors::ConnectFailure::Tls)?;
                     let outbound_layout = server
                         .outbound_layout()
-                        .map_err(|_| errors::ConnectError::Tls)?;
+                        .map_err(|_| errors::ConnectFailure::Tls)?;
                     let initial_write = packet_protection::PacketProtection::aes_128(
                         &qkdf::PacketKeys::aes_128(&secrets.server)
-                            .map_err(|_| errors::ConnectError::InvalidConfig)?,
+                            .map_err(|_| errors::ConnectFailure::InvalidConfig)?,
                     )
-                    .map_err(|_| errors::ConnectError::InvalidConfig)?;
+                    .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
                     let initial_read = packet_protection::PacketProtection::aes_128(
                         &qkdf::PacketKeys::aes_128(&secrets.client)
-                            .map_err(|_| errors::ConnectError::InvalidConfig)?,
+                            .map_err(|_| errors::ConnectFailure::InvalidConfig)?,
                     )
-                    .map_err(|_| errors::ConnectError::InvalidConfig)?;
+                    .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
                     (
                         conn::handshake::Handshake::server(
                             initial_read,
@@ -406,7 +406,7 @@ where
                 Side::ServerPooled { peer_cid, pool } => {
                     user_tp.stateless_reset_token = stateless_reset_secret
                         .map(|secret| secrets::StatelessResetSecret(secret).token_for(&local_cid));
-                    let mut reservation = pool.reserve().ok_or(errors::ConnectError::Capacity)?;
+                    let mut reservation = pool.reserve().ok_or(errors::ConnectFailure::Capacity)?;
                     user_tp
                         .encode_connection_retained(
                             false,
@@ -415,22 +415,22 @@ where
                             retry_scid.as_deref(),
                             &mut reservation.transport_params(),
                         )
-                        .map_err(|_| errors::ConnectError::InvalidConfig)?;
+                        .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
                     let server =
                         reservation.connect(clock::WallClock::now_millis as conn::handshake::Clock);
                     let outbound_layout = server
                         .outbound_layout()
-                        .map_err(|_| errors::ConnectError::Tls)?;
+                        .map_err(|_| errors::ConnectFailure::Tls)?;
                     let initial_write = packet_protection::PacketProtection::aes_128(
                         &qkdf::PacketKeys::aes_128(&secrets.server)
-                            .map_err(|_| errors::ConnectError::InvalidConfig)?,
+                            .map_err(|_| errors::ConnectFailure::InvalidConfig)?,
                     )
-                    .map_err(|_| errors::ConnectError::InvalidConfig)?;
+                    .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
                     let initial_read = packet_protection::PacketProtection::aes_128(
                         &qkdf::PacketKeys::aes_128(&secrets.client)
-                            .map_err(|_| errors::ConnectError::InvalidConfig)?,
+                            .map_err(|_| errors::ConnectFailure::InvalidConfig)?,
                     )
-                    .map_err(|_| errors::ConnectError::InvalidConfig)?;
+                    .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
                     (
                         conn::handshake::Handshake::server(
                             initial_read,
@@ -516,7 +516,7 @@ where
             Tls::Client(mut tls) => {
                 let outcome = tls
                     .start(&mut conn.handshake)
-                    .map_err(|_| errors::ConnectError::Tls)?;
+                    .map_err(|_| errors::ConnectFailure::Tls)?;
                 conn::handshake::apply_outcome(outcome, &mut conn);
                 Built::ClientPooled {
                     connection: conn,

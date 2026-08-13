@@ -4,7 +4,7 @@ pub mod ack_ranges;
 pub(crate) mod decode;
 pub mod error;
 
-use decode::FrameDecoder;
+use decode::Decoder;
 
 pub const TYPE_PADDING: u8 = 0x00;
 pub const TYPE_PING: u8 = 0x01;
@@ -459,7 +459,7 @@ impl Frame {
 
 impl Frame {
     pub fn decode(input: &[u8]) -> Result<(Self, usize), error::Decode> {
-        FrameDecoder::new(input, <[u8]>::to_vec, |input, count| {
+        Decoder::new(input, <[u8]>::to_vec, |input, count| {
             ack_ranges::Ranges::new(input, count).collect()
         })
         .decode()
@@ -480,6 +480,6 @@ impl Frame {
 
 impl<'a> Frame<&'a [u8], ack_ranges::Ranges<'a>> {
     pub fn decode_ref(input: &'a [u8]) -> Result<(Self, usize), error::Decode> {
-        FrameDecoder::new(input, |input| input, ack_ranges::Ranges::new).decode()
+        Decoder::new(input, |input| input, ack_ranges::Ranges::new).decode()
     }
 }

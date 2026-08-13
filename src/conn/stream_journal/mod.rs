@@ -2,7 +2,7 @@ use std::marker;
 use std::num::NonZeroU64;
 use std::ops::{Index, IndexMut};
 
-use crate::stream::SendStream;
+use crate::stream::Sender;
 
 use super::{delivery, send};
 
@@ -235,7 +235,7 @@ impl Acknowledged<'_> {
     }
 
     /// Advances the byte owner before returning any journal node to the pool.
-    pub(super) fn commit(self, stream: &mut SendStream) -> Result<bool, InvalidPrefix> {
+    pub(super) fn commit(self, stream: &mut Sender) -> Result<bool, InvalidPrefix> {
         let Some((offset, bytes, fin, nodes)) = self.span() else {
             self.journal.cancel(self.group);
             return Err(InvalidPrefix);

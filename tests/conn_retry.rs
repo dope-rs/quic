@@ -4,9 +4,7 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use dope_quic::conn::Error;
-use dope_quic::packet::{
-    ConnectionIdRef, InitialHeader, QUIC_V1, RetryPacket, RetryPacketRef, VerifiedRetry,
-};
+use dope_quic::packet::{ConnectionIdRef, InitialHeader, QUIC_V1, Retry, RetryRef, VerifiedRetry};
 use dope_quic::{Handler, Mux, conn, conn::session::Connection};
 
 #[test]
@@ -21,7 +19,7 @@ fn rfc9001_a4_vector_round_trips() {
     let mut tag = [0u8; 16];
     tag.copy_from_slice(&expected_tag);
 
-    let derived = RetryPacket::compute_tag(&odcid, &header).unwrap();
+    let derived = Retry::compute_tag(&odcid, &header).unwrap();
     assert_eq!(derived, tag, "RFC 9001 A.4 integrity tag mismatch");
 }
 
@@ -63,7 +61,7 @@ fn verify_retry<'wire, 'storage>(
     expected_dcid: &[u8],
     storage: &'storage mut Vec<u8>,
 ) -> VerifiedRetry<'wire, 'storage> {
-    RetryPacketRef::decode(wire)
+    RetryRef::decode(wire)
         .unwrap()
         .verify_into(
             ConnectionIdRef::new(original_dcid).unwrap(),
@@ -92,7 +90,7 @@ fn first_initial_without_token_triggers_retry() {
     assert_eq!(outgoing.len(), 1, "exactly one Retry should be emitted");
     let (dst, retry_wire) = (outgoing[0].addr(), outgoing[0].payload());
     assert_eq!(dst, from);
-    let retry = RetryPacketRef::decode(retry_wire).expect("decode Retry");
+    let retry = RetryRef::decode(retry_wire).expect("decode Retry");
     assert_eq!(
         retry.destination_connection_id(),
         client_scid,
@@ -215,7 +213,7 @@ fn client_with_initial_dcid(initial_dcid: &[u8]) -> Connection {
 }
 
 fn craft_retry_for(odcid: &[u8], echo_dcid: &[u8], new_scid: &[u8], token: &[u8]) -> Vec<u8> {
-    let mut retry = RetryPacket {
+    let mut retry = Retry {
         version: QUIC_V1,
         dcid: echo_dcid.to_vec(),
         scid: new_scid.to_vec(),

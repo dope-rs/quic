@@ -3,7 +3,7 @@ pub mod support;
 use std::time::Instant;
 
 use dope_quic::conn::{packet::Batch, session::Ticket};
-use dope_quic::early_data::EarlyDataReplayCache;
+use dope_quic::early_data::ReplayCache;
 use dope_quic::{conn, transport_params};
 use shin::crypto::sig::SigningKey;
 
@@ -28,7 +28,7 @@ fn signing() -> SigningKey {
     SigningKey::from_seed(&[0x77u8; 32]).unwrap()
 }
 
-fn first_session_ticket(replay: EarlyDataReplayCache) -> Ticket {
+fn first_session_ticket(replay: ReplayCache) -> Ticket {
     let server_cfg = conn::config::Options {
         transport_params: user_tp(),
         ticket_secret: Some(TICKET_SECRET),
@@ -76,7 +76,7 @@ fn first_session_ticket(replay: EarlyDataReplayCache) -> Ticket {
 
 #[test]
 fn zero_rtt_followed_by_one_rtt_full_round_trip() {
-    let replay = EarlyDataReplayCache::new().unwrap();
+    let replay = ReplayCache::new().unwrap();
     let ticket = first_session_ticket(replay.clone());
 
     let server_cfg = conn::config::Options {
@@ -134,7 +134,7 @@ fn zero_rtt_followed_by_one_rtt_full_round_trip() {
 
 #[test]
 fn server_rejects_early_data_drops_zero_rtt_but_handshake_completes() {
-    let ticket = first_session_ticket(EarlyDataReplayCache::new().unwrap());
+    let ticket = first_session_ticket(ReplayCache::new().unwrap());
 
     let server_cfg = conn::config::Options {
         transport_params: user_tp(),
@@ -191,7 +191,7 @@ fn server_rejects_early_data_drops_zero_rtt_but_handshake_completes() {
 
 #[test]
 fn cached_peer_tp_caps_zero_rtt_stream_emission() {
-    let replay = EarlyDataReplayCache::new().unwrap();
+    let replay = ReplayCache::new().unwrap();
     let ticket = first_session_ticket(replay.clone());
     let mut tight_tp = user_tp();
     tight_tp.initial_max_stream_data_bidi_remote = 4;
@@ -249,7 +249,7 @@ fn cached_peer_tp_caps_zero_rtt_stream_emission() {
 
 #[test]
 fn zero_rtt_stream_data_arrives_before_handshake_completes() {
-    let replay = EarlyDataReplayCache::new().unwrap();
+    let replay = ReplayCache::new().unwrap();
     let ticket = first_session_ticket(replay.clone());
 
     let server_cfg = conn::config::Options {
@@ -313,7 +313,7 @@ fn zero_rtt_stream_data_arrives_before_handshake_completes() {
 
 #[test]
 fn oversized_zero_rtt_stream_is_split_below_the_byte_ceiling() {
-    let ticket = first_session_ticket(EarlyDataReplayCache::new().unwrap());
+    let ticket = first_session_ticket(ReplayCache::new().unwrap());
     let client_cfg = conn::config::Options {
         transport_params: user_tp(),
         resumption: Some(ticket),

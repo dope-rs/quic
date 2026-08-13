@@ -1,7 +1,7 @@
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 
-use crate::stream::SendStream;
+use crate::stream::Sender;
 use crate::varint::VarInt;
 
 use super::streams::table;
@@ -69,7 +69,7 @@ impl<Kind> Credit<Kind> {
 }
 
 pub(super) struct Entry {
-    pub(super) stream: SendStream,
+    pub(super) stream: Sender,
     pub(super) credit: Credit<control::kind::StreamDataBlocked>,
     pub(super) delivery_group: Option<stream_journal::GroupId>,
     pub(super) reset_stream: control::Signal<control::kind::ResetStream>,
@@ -78,7 +78,7 @@ pub(super) struct Entry {
 impl Entry {
     fn new(credit: u64) -> Self {
         Self {
-            stream: SendStream::default(),
+            stream: Sender::default(),
             credit: Credit::new(credit),
             delivery_group: None,
             reset_stream: control::Signal::new(),
@@ -126,7 +126,7 @@ impl table::Reusable for Entry {
 }
 
 impl Deref for Entry {
-    type Target = SendStream;
+    type Target = Sender;
 
     fn deref(&self) -> &Self::Target {
         &self.stream
@@ -343,6 +343,6 @@ impl Iterator for Iter<'_> {
 
 const _: () =
     assert!(size_of::<Credit<control::kind::StreamDataBlocked>>() == 2 * size_of::<u64>());
-const _: () = assert!(size_of::<Entry>() == size_of::<SendStream>() + 4 * size_of::<u64>());
+const _: () = assert!(size_of::<Entry>() == size_of::<Sender>() + 4 * size_of::<u64>());
 const _: () = assert!(size_of::<Handle>() == size_of::<u64>());
 const _: () = assert!(size_of::<Option<Handle>>() == size_of::<u64>());

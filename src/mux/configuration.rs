@@ -6,20 +6,20 @@ use shin::crypto::ticket::Keys;
 use crate::conn;
 use crate::stream::ReceiveBuffer;
 
-use super::{Handler, MAX_CONNECTIONS, MuxInner};
+use super::{Handler, MAX_CONNECTIONS, Router};
 
 pub struct Control<'a, 'tls, H, P, const DOMAIN: u8, B: ReceiveBuffer = Vec<u8>>
 where
     H: Handler<DOMAIN, B>,
     P: conn::server::Policy,
 {
-    mux: &'a mut MuxInner<'tls, H, P, DOMAIN, B>,
+    mux: &'a mut Router<'tls, H, P, DOMAIN, B>,
 }
 
 impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
     Control<'a, 'tls, H, P, DOMAIN, B>
 {
-    pub(super) fn new(mux: &'a mut MuxInner<'tls, H, P, DOMAIN, B>) -> Self {
+    pub(super) fn new(mux: &'a mut Router<'tls, H, P, DOMAIN, B>) -> Self {
         Self { mux }
     }
 

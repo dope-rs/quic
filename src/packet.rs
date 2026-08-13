@@ -2,7 +2,7 @@ use std::ops::{Deref, Range};
 
 use subtle::ConstantTimeEq;
 
-use crate::packet_protection::{PacketProtection, PacketProtectionError};
+use crate::packet_protection::{CryptoFailure, PacketProtection};
 use crate::varint::VarInt;
 
 pub const FORM_LONG: u8 = 0x80;
@@ -338,17 +338,17 @@ fn decode_long_layout(input: &[u8], kind: LongType) -> Result<LongLayout, Decode
 
 /// Mutable packet storage that can preserve its owner while a coalesced QUIC
 /// datagram is split into individually protected long-header packets.
-pub(crate) trait LongPacketBuffer: AsRef<[u8]> + AsMut<[u8]> + Sized {
+pub(crate) trait LongBuffer: AsRef<[u8]> + AsMut<[u8]> + Sized {
     fn split_at(self, mid: usize) -> Option<(Self, Self)>;
 }
 
-impl LongPacketBuffer for &mut [u8] {
+impl LongBuffer for &mut [u8] {
     fn split_at(self, mid: usize) -> Option<(Self, Self)> {
         (mid <= self.len()).then(|| self.split_at_mut(mid))
     }
 }
 
-impl<'turn, 'd> LongPacketBuffer for dope::manifold::datagram::packet::Split<'turn, 'd> {
+impl<'turn, 'd> LongBuffer for dope::manifold::datagram::packet::Split<'turn, 'd> {
     fn split_at(self, mid: usize) -> Option<(Self, Self)> {
         dope::manifold::datagram::packet::Split::split_at(self, mid).ok()
     }
@@ -358,12 +358,12 @@ impl<'turn, 'd> LongPacketBuffer for dope::manifold::datagram::packet::Split<'tu
 ///
 /// Parsing owns `packet` for the lifetime of this value. Decryption consumes the
 /// value, so no header borrow can overlap the in-place packet mutation.
-pub(crate) struct ParsedLongPacket<P> {
+pub(crate) struct ParsedLong<P> {
     packet: P,
     layout: ProtectedLongLayout,
 }
 
-impl<P: AsRef<[u8]>> ParsedLongPacket<P> {
+impl<P: AsRef<[u8]>> ParsedLong<P> {
     pub(crate) fn parse(packet: P) -> Result<Self, DecodeError> {
         let input = packet.as_ref();
         let first = *input.first().ok_or(DecodeError::Underflow)?;
@@ -394,7 +394,7 @@ impl<P: AsRef<[u8]>> ParsedLongPacket<P> {
     }
 }
 
-impl<P: LongPacketBuffer> ParsedLongPacket<P> {
+impl<P: LongBuffer> ParsedLong<P> {
     pub(crate) fn split_first(self) -> Result<(Self, P), DecodeError> {
         let packet_len = self.layout.packet_len;
         let (packet, tail) = self
@@ -412,18 +412,18 @@ impl<P: LongPacketBuffer> ParsedLongPacket<P> {
     }
 }
 
-impl<P: AsRef<[u8]> + AsMut<[u8]>> ParsedLongPacket<P> {
+impl<P: AsRef<[u8]> + AsMut<[u8]>> ParsedLong<P> {
     pub(crate) fn decrypt(
         mut self,
         protection: &PacketProtection,
         expected_packet_number: u64,
-    ) -> Result<DecryptedLongPacket<P>, PacketProtectionError> {
+    ) -> Result<DecryptedLong<P>, CryptoFailure> {
         let (packet_number, body) = protection.decrypt_long_in_place(
             self.packet.as_mut(),
             self.layout.pn_offset,
             expected_packet_number,
         )?;
-        Ok(DecryptedLongPacket {
+        Ok(DecryptedLong {
             packet: self.packet,
             packet_number,
             body,
@@ -431,13 +431,13 @@ impl<P: AsRef<[u8]> + AsMut<[u8]>> ParsedLongPacket<P> {
     }
 }
 
-pub(crate) struct DecryptedLongPacket<P> {
+pub(crate) struct DecryptedLong<P> {
     packet: P,
     packet_number: u64,
     body: Range<usize>,
 }
 
-impl<P: AsRef<[u8]>> DecryptedLongPacket<P> {
+impl<P: AsRef<[u8]>> DecryptedLong<P> {
     pub(crate) fn packet_number(&self) -> u64 {
         self.packet_number
     }
@@ -706,7 +706,7 @@ impl ShortHeader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetryPacket {
+pub struct Retry {
     pub version: u32,
     pub dcid: Vec<u8>,
     pub scid: Vec<u8>,
@@ -724,9 +724,9 @@ pub const RETRY_INTEGRITY_TAG_LEN: usize = 16;
 
 /// A structurally valid Retry packet borrowing the exact received wire bytes.
 ///
-/// Its fields remain untrusted until [`RetryPacketRef::verify_into`] succeeds.
+/// Its fields remain untrusted until [`RetryRef::verify_into`] succeeds.
 #[derive(Debug, Clone, Copy)]
-pub struct RetryPacketRef<'wire> {
+pub struct RetryRef<'wire> {
     version: u32,
     dcid: ConnectionIdRef<'wire>,
     scid: ConnectionIdRef<'wire>,
@@ -741,7 +741,7 @@ pub struct VerifiedRetry<'wire, 'storage> {
     token: &'storage [u8],
 }
 
-impl<'wire> RetryPacketRef<'wire> {
+impl<'wire> RetryRef<'wire> {
     pub fn decode(input: &'wire [u8]) -> Result<Self, DecodeError> {
         let prefix = decode_long_prefix(input, LONG_RETRY)?;
         let token_start = prefix.pos;
@@ -811,7 +811,7 @@ impl<'wire> RetryPacketRef<'wire> {
         storage.extend_from_slice(original_dcid.as_slice());
         storage.extend_from_slice(self.header);
 
-        let expected = RetryPacket::tag_from_aad(storage)?;
+        let expected = Retry::tag_from_aad(storage)?;
         if !bool::from(self.integrity_tag[..].ct_eq(&expected[..])) {
             storage.clear();
             return Ok(None);
@@ -838,7 +838,7 @@ impl<'wire, 'storage> VerifiedRetry<'wire, 'storage> {
     }
 }
 
-impl RetryPacket {
+impl Retry {
     pub(crate) const fn prefix_len(dcid: ConnectionIdRef<'_>, scid: ConnectionIdRef<'_>) -> usize {
         7 + dcid.len() + scid.len()
     }
