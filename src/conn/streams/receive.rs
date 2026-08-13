@@ -4,7 +4,7 @@ use crate::varint::VarInt;
 use crate::conn::receive_workspace::{
     ParsedFrame, ReceiveAdmission, ReceiveAdmissions, ReceivePayloadPlans, StreamFrameIndex,
 };
-use crate::conn::{Error, MAX_STREAM_COUNT, control, event_queue, recv, send, stream as api};
+use crate::conn::{Error, MAX_STREAM_COUNT, control, event_queue, recv, send, stream};
 use crate::frame::Frame;
 use crate::range_buffer::{MAX_RANGES, Plan};
 
@@ -907,7 +907,7 @@ pub(in crate::conn) trait Receive<B: ReceiveBuffer> {
         access: Access,
         is_client: bool,
         available: bool,
-    ) -> Result<(), api::Error>;
+    ) -> Result<(), stream::Error>;
     fn local_initial_credit(&self, stream_id: u64, is_client: bool) -> u64;
     fn recv_eof(&self, stream_id: u64, is_client: bool) -> bool;
     fn recv_fin_received(&self, stream_id: u64, is_client: bool) -> bool;
@@ -1261,15 +1261,15 @@ impl<B: ReceiveBuffer> Receive<B> for Streams<B> {
         access: Access,
         is_client: bool,
         available: bool,
-    ) -> Result<(), api::Error> {
+    ) -> Result<(), stream::Error> {
         if stream_id > VarInt::MAX {
-            return Err(api::Error::IdOverflow);
+            return Err(stream::Error::IdOverflow);
         }
         if !available {
-            return Err(api::Error::NotEstablished);
+            return Err(stream::Error::NotEstablished);
         }
         self.validate_access(stream_id, access, is_client)
-            .map_err(|_| api::Error::InvalidStream)
+            .map_err(|_| stream::Error::InvalidStream)
     }
 
     fn local_initial_credit(&self, stream_id: u64, is_client: bool) -> u64 {

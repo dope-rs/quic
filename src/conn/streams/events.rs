@@ -1,15 +1,15 @@
-use crate::conn::stream as api;
+use crate::conn::stream;
 
 use super::Streams;
 use crate::stream::ReceiveBuffer;
 
 pub(in crate::conn) trait Events {
-    fn poll_event(&mut self) -> Option<api::Event>;
+    fn poll_event(&mut self) -> Option<stream::Event>;
     fn has_events(&self) -> bool;
 }
 
 impl<B: ReceiveBuffer> Events for Streams<B> {
-    fn poll_event(&mut self) -> Option<api::Event> {
+    fn poll_event(&mut self) -> Option<stream::Event> {
         let popped = self.events.pop()?;
         if let Some(handle) = popped.receive_owner()
             && let Some(position) = self.receive.map.position_mut(handle)
