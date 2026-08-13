@@ -3,8 +3,8 @@ use dope::core::driver::schedule;
 use crate::conn;
 use crate::stream;
 
-use super::routing::SlotOps as _;
 use crate::mux;
+use crate::mux::routing::SlotOps as _;
 
 #[derive(Default)]
 pub(super) struct State {

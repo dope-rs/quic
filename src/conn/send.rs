@@ -4,10 +4,10 @@ use std::ops;
 use crate::stream;
 use crate::varint;
 
-use super::streams::table;
 use crate::conn::control;
 use crate::conn::control::Write as _;
 use crate::conn::stream_journal;
+use crate::conn::streams::table;
 
 pub(super) struct Side;
 

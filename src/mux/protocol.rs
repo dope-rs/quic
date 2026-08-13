@@ -7,10 +7,10 @@ use crate::stream;
 
 use dope::manifold::datagram;
 
-use super::drive::{DriveOps as _, QueueOps as _};
-use super::routing::reset::ResetOps as _;
-use super::routing::{AcceptOps as _, CidOps as _, DeadlineOps as _, SlotOps as _};
 use crate::mux;
+use crate::mux::drive::{DriveOps as _, QueueOps as _};
+use crate::mux::routing::reset::ResetOps as _;
+use crate::mux::routing::{AcceptOps as _, CidOps as _, DeadlineOps as _, SlotOps as _};
 use crate::packet;
 
 pub struct Io<'a, 'tls, H, P, const DOMAIN: u8, B: stream::ReceiveBuffer = Vec<u8>>

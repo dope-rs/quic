@@ -1,4 +1,4 @@
-use super::*;
+use crate::frame::*;
 use crate::varint;
 
 fn data_end(input: &[u8], pos: usize, length: varint::VarInt) -> Result<usize, error::Decode> {

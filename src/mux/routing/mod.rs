@@ -13,8 +13,8 @@ use crate::packet;
 use crate::stream;
 
 use self::reset::ResetOps as _;
-use super::drive::{DriveOps as _, QueueOps as _};
 use crate::mux;
+use crate::mux::drive::{DriveOps as _, QueueOps as _};
 
 pub(super) trait AcceptOps {
     fn try_accept(

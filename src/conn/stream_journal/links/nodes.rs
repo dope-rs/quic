@@ -1,7 +1,7 @@
 use crate::conn::stream_journal;
 use crate::conn::stream_journal::journal;
 
-use super::groups::GroupOps as _;
+use crate::conn::stream_journal::links::groups::GroupOps as _;
 
 pub(in crate::conn::stream_journal) trait NodeOps {
     fn link_all(&mut self, id: stream_journal::GroupId, index: u32);

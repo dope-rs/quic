@@ -7,8 +7,8 @@ use crate::conn::handshake;
 use crate::packet;
 use crate::stream;
 
-use super::frames::{self, ProcessFrames as _};
 use crate::conn::ingress;
+use crate::conn::ingress::frames::{self, ProcessFrames as _};
 
 pub(crate) struct Retained<'a, 'd, const DOMAIN: u8> {
     ingress: ingress::Ingress<'a, DOMAIN, stream::RecvBuffer<'d>>,

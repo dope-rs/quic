@@ -1,4 +1,4 @@
-use super::{Capture, CaptureControl};
+use crate::{Capture, CaptureControl};
 
 // SAFETY: the control exposes only test-owned command state and cannot move
 // or replace retained endpoint storage.

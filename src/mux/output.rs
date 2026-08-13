@@ -6,8 +6,8 @@ use o3::collections::queue::fixed;
 use crate::conn;
 use crate::stream;
 
-use super::drive::DriveOps as _;
 use crate::mux;
+use crate::mux::drive::DriveOps as _;
 
 pub(super) struct Storage {
     pub(super) pending: fixed::Fifo<mux::Outgoing>,

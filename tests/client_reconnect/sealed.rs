@@ -1,4 +1,4 @@
-use super::{Events, EventsControl};
+use crate::{Events, EventsControl};
 
 // SAFETY: the control moves only test-owned timer state and cannot replace the
 // protocol installed beneath the client.

@@ -4,7 +4,7 @@ use std::ops;
 
 use crate::stream;
 
-use super::{delivery, send};
+use crate::conn::{delivery, send};
 
 pub(super) mod journal;
 mod links;

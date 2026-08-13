@@ -1,4 +1,4 @@
-use super::remove::Remove as _;
+use crate::conn::retired::remove::Remove as _;
 
 use crate::conn::retired;
 

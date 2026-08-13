@@ -7,8 +7,8 @@ use crate::conn;
 
 use crate::stream;
 
-use super::routing::{DeadlineOps as _, SlotOps as _};
 use crate::mux;
+use crate::mux::routing::{DeadlineOps as _, SlotOps as _};
 
 pub(super) struct Queues {
     pub(super) notify: mux::QueueState,

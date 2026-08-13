@@ -1,4 +1,4 @@
-use super::{CapturingControl, CapturingHandler};
+use crate::{CapturingControl, CapturingHandler};
 
 // SAFETY: the control moves only test-owned command/timer state and cannot
 // replace the handler installed beneath the endpoint.

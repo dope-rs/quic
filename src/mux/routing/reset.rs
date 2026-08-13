@@ -6,9 +6,9 @@ use crate::packet;
 
 use crate::stream;
 
-use super::{CidOps as _, DeadlineOps as _, SlotOps as _};
 use crate::mux;
 use crate::mux::drive::OutputOps as _;
+use crate::mux::routing::{CidOps as _, DeadlineOps as _, SlotOps as _};
 
 pub(in crate::mux) trait ResetOps {
     fn maybe_handle_retry_gating(

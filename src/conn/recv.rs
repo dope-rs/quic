@@ -3,8 +3,8 @@ use std::ops;
 
 use crate::stream;
 
-use super::control;
-use super::streams::table;
+use crate::conn::control;
+use crate::conn::streams::table;
 
 pub(super) struct Side;
 
