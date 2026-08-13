@@ -46,11 +46,8 @@ struct Node {
 }
 
 /// Bounded FIFO whose natural stream owner retains pending state.
-///
-/// Enqueue, duplicate suppression, cancellation and polling use no hash or
-/// search. The node carries the existing typed stream handle so polling can
-/// clear its owner's inline pending bit by one generation-checked slot access.
-/// If the stream retired first, the stale handle simply fails to resolve.
+/// Typed stream handles make enqueue, suppression, cancellation, and polling
+/// direct slot operations; retired handles simply fail to resolve.
 pub(super) struct Events {
     nodes: Vec<Node>,
     free: u32,

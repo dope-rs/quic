@@ -42,9 +42,8 @@ pub trait ReceiveBuffer: buffer::Buffer + AsRef<[u8]> + Sized {
 }
 
 /// Type-selected contiguous receive storage.
-///
-/// This is public only because it is the associated implementation detail of
-/// [`ReceiveBuffer`]. Applications should consume data through stream APIs.
+/// Public only as an associated implementation detail of [`ReceiveBuffer`];
+/// applications consume data through stream APIs.
 #[doc(hidden)]
 pub trait ReadyBuffer<B: ReceiveBuffer>: Default {
     fn clear(&mut self, arena: &mut range_buffer::Arena<B>);
@@ -555,10 +554,9 @@ impl<B: ReceiveBuffer> Receiver<B> {
         Ok(())
     }
 
-    /// Applies the metadata effect of a STREAM frame whose payload is proven
-    /// to be erased by a later RESET_STREAM in the same packet. Applications
-    /// cannot run during packet commit, so the payload itself never needs to
-    /// escape the dispatch turn.
+    /// Applies metadata for a STREAM superseded by a later same-packet reset.
+    /// Applications cannot run during commit, so its payload cannot escape the
+    /// dispatch turn.
     pub(crate) fn observe_transient(
         &mut self,
         offset: u64,
@@ -882,10 +880,8 @@ impl Sender {
     }
 
     /// Applies one contiguous prefix proven by the delivery journal.
-    ///
-    /// The journal retains every out-of-order acknowledgement. Consequently
-    /// this method never needs its own interval index and cannot release bytes
-    /// still referenced by an in-flight or retryable delivery node.
+    /// Out-of-order ACKs remain journaled, so no local interval index is needed
+    /// and referenced in-flight or retryable bytes cannot be released.
     pub(crate) fn acknowledge_prefix(&mut self, offset: u64, len: usize, fin: bool) -> bool {
         if offset != self.base_offset || len > self.sent_rel || len > self.len() {
             return false;

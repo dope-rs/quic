@@ -51,10 +51,9 @@ pub const DEFAULT_ACK_DELAY_EXPONENT: u64 = 3;
 pub const DEFAULT_MAX_ACK_DELAY_MS: u64 = 25;
 pub const DEFAULT_ACTIVE_CONNECTION_ID_LIMIT: u64 = 2;
 
-/// Maximum number of distinct, non-reserved parameters accepted from one
-/// peer. The current profile defines 17 parameters; the remaining slots are
-/// an explicit forward-compatibility budget that keeps decoding allocation
-/// free and adversarial work bounded.
+/// Maximum distinct non-reserved parameters accepted from one peer.
+/// Beyond the 17 defined parameters, remaining slots bound allocation-free
+/// forward compatibility and adversarial work.
 pub const MAX_PARAMETERS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

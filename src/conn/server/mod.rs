@@ -9,10 +9,8 @@ use crate::conn;
 use crate::packet;
 
 /// Replay protection owned by one server lane.
-///
-/// A guard that returns a domain must share one atomic replay store with every
-/// clone that returns the same domain. This binds ticket authority to the
-/// actual replay store instead of to an individual QUIC connection.
+/// Guards returning the same domain must share one atomic replay store, binding
+/// ticket authority to that store instead of an individual connection.
 pub trait ReplayGuard: config::EarlyDataGuard {
     fn replay_domain(&self) -> Option<server::ReplayDomain>;
 }

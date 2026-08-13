@@ -166,11 +166,8 @@ impl Config {
 }
 
 /// Compile-time receive policy used by [`Endpoint`].
-///
-/// `Vec<u8>` selects independently owned copied ranges. [`RecvBuffer`] selects
-/// driver-branded retention when resident amplification is bounded and falls
-/// back to one exact shared owner for all packet payload bytes that escape.
-/// Dispatch is statically resolved for each endpoint type.
+/// `Vec<u8>` copies ranges; [`RecvBuffer`] retains bounded driver storage or one
+/// exact shared owner. Dispatch is statically resolved per endpoint type.
 #[doc(hidden)]
 pub trait Storage<'d>: stream::ReceiveBuffer {
     fn datagram_config(config: Config) -> io::Result<datagram::Config>;

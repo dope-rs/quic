@@ -18,11 +18,9 @@ pub(super) type Map = table::Map<Side, Entry>;
 const READY_NONE: u32 = u32::MAX;
 const READY_END: u32 = u32::MAX - 1;
 
-/// Peer-owned flow-control credit and the advisory derived from its limit.
-///
-/// `blocked == None` means the current limit has not been reported, a live key
-/// means queued or in flight, and a stale key is the zero-allocation ACK
-/// tombstone. Raising the limit clears all three states through the queue owner.
+/// Peer flow-control credit and its derived advisory state.
+/// No key is unreported, a live key is queued or in flight, and a stale key is
+/// an ACK tombstone; raising the limit clears every state through its owner.
 pub(super) struct Credit<Kind> {
     limit: u64,
     blocked: Option<control::OwnerKey<Kind>>,

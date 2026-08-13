@@ -15,10 +15,8 @@ fn stop_frame_id(frame: &receive_workspace::ParsedFrame) -> Option<u64> {
     }
 }
 
-/// Scratch-backed plan for one packet.
-///
-/// The single workspace borrow prevents receive-lane reentrancy. Dropping the
-/// plan returns every bounded scratch structure to its empty reusable state.
+/// Scratch-backed packet plan whose workspace borrow prevents reentrancy.
+/// Dropping it empties every bounded scratch structure for reuse.
 pub(super) struct Plan<'workspace> {
     workspace: &'workspace mut receive_workspace::ReceiveWorkspace,
     admitted_bytes: usize,

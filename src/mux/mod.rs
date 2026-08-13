@@ -480,10 +480,8 @@ impl<
 }
 
 /// Exclusive connection access that restores Mux routing indexes on drop.
-///
-/// The guard's borrow prevents the connection from outliving or overlapping
-/// its Mux slot. Any peer reset-token changes made through `Connection` APIs
-/// are committed before the Mux can receive another datagram.
+/// The borrow confines access to its slot, and peer reset-token changes commit
+/// before the Mux can receive another datagram.
 #[must_use = "connection index synchronization runs when the guard is dropped"]
 pub struct ConnectionMut<
     'mux,

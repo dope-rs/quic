@@ -18,11 +18,9 @@ struct Bucket {
     records: [Option<Record>; BUCKET_WIDTH],
 }
 
-/// Fixed-storage, fixed-probe reverse index for peer stateless-reset tokens.
-///
-/// A lookup examines two independently keyed buckets and therefore performs
-/// at most `2 * BUCKET_WIDTH` token comparisons. Insertion reports saturation
-/// instead of probing farther or growing storage on the packet path.
+/// Fixed-storage, fixed-probe reverse index for peer reset tokens.
+/// Lookup checks two keyed buckets; insertion reports saturation instead of
+/// probing farther or growing storage on the packet path.
 pub(super) struct ResetIndex {
     buckets: Box<[Bucket]>,
     first: hash::RandomState,

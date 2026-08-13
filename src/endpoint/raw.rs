@@ -1,10 +1,7 @@
 use crate::mux;
 
-/// Restricted coordinate view supplied by an endpoint handler.
-///
 /// # Safety
-/// `Control` must not expose an operation that moves, replaces, or drops
-/// driver-branded retained storage owned by the handler.
+/// `Control` cannot move, replace, or drop driver-branded handler storage.
 pub unsafe trait ControlHandler<'d, const ID: u8, B: crate::stream::ReceiveBuffer = Vec<u8>>:
     mux::Handler<ID, B>
 {

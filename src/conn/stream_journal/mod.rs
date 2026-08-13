@@ -77,10 +77,9 @@ impl GroupId {
     }
 }
 
-/// A retry traversal capability tied to one packet-building turn.
-///
-/// Every candidate, including one rejected for size or duplication, consumes
-/// one unit. Code cannot retain this capability beyond the counter it borrows.
+/// Retry traversal capability tied to one packet-building turn.
+/// Every candidate consumes one unit, including size or duplicate rejections,
+/// and the capability cannot outlive its borrowed counter.
 pub(super) struct RetryWork<'turn> {
     remaining: &'turn mut usize,
     _exclusive: marker::PhantomData<&'turn mut ()>,
@@ -128,14 +127,9 @@ struct Slot<T> {
     value: Option<T>,
 }
 
-/// A fixed-address, fixed-capacity slot arena with a lazily materialized
-/// virgin tail.
-///
-/// `Vec::with_capacity` reserves the complete address range at construction,
-/// so the first use of a virgin slot cannot allocate or move existing slots.
-/// Unlike a boxed `[Slot; capacity]`, however, no slot page is initialized
-/// until a record actually reaches it. Released slots are recycled through an
-/// intrusive free list and retain their generation counter.
+/// Fixed-address, fixed-capacity arena with a lazy virgin tail.
+/// Reserved slots materialize without allocation or movement; released slots
+/// retain their generation and recycle through an intrusive free list.
 struct Arena<T> {
     slots: Vec<Slot<T>>,
     free: u32,
@@ -215,11 +209,9 @@ struct Group {
 #[derive(Debug)]
 pub(super) struct InvalidPrefix;
 
-/// A contiguous acknowledged prefix tied to an exclusive journal borrow.
-///
-/// The borrow prevents node reuse until the corresponding stream buffer has
-/// advanced. Out-of-order ACKs never produce this capability and therefore
-/// remain charged to the journal's fixed capacity.
+/// Contiguous acknowledged prefix tied to an exclusive journal borrow.
+/// The borrow prevents reuse until its stream advances; out-of-order ACKs do
+/// not produce this capability and remain charged to journal capacity.
 #[must_use]
 pub(super) struct Acknowledged<'journal> {
     journal: &'journal mut journal::Journal,

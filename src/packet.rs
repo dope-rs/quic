@@ -376,10 +376,9 @@ impl<'turn, 'd> LongBuffer for dope::manifold::datagram::packet::Split<'turn, 'd
     }
 }
 
-/// A validated long-header layout inseparably bound to the packet it describes.
-///
-/// Parsing owns `packet` for the lifetime of this value. Decryption consumes the
-/// value, so no header borrow can overlap the in-place packet mutation.
+/// Validated long-header layout inseparably bound to its packet.
+/// Parsing owns the packet and decryption consumes this value, preventing a
+/// header borrow from overlapping in-place mutation.
 pub(crate) struct ParsedLong<P> {
     packet: P,
     layout: ProtectedLongLayout,
@@ -806,12 +805,9 @@ impl<'wire> RetryRef<'wire> {
         self.integrity_tag
     }
 
-    /// Verifies the Retry and promotes its token into `storage`.
-    ///
-    /// `storage` is used first as the contiguous AES-GCM AAD buffer and then
-    /// compacted in place to the token bytes. Starting from an empty `Vec`, the
-    /// complete receive path therefore performs at most the one allocation
-    /// required to retain an arbitrary-length token beyond `'wire`.
+    /// Verifies Retry and promotes its token into `storage`.
+    /// The storage first holds contiguous AES-GCM AAD, then compacts in place,
+    /// requiring at most one allocation to retain a token beyond `'wire`.
     pub fn verify_into<'storage>(
         self,
         original_dcid: ConnectionIdRef<'_>,

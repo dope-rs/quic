@@ -27,12 +27,9 @@ pub(super) struct Capacity {
     pub(super) limit: usize,
 }
 
-/// One fixed-capacity owner for in-flight, retryable, and acknowledged stream
-/// records whose byte prefix cannot yet be released.
-///
-/// A stream cancellation invalidates its group in O(1). Nodes stay reachable
-/// through packet journal handles until ACK/loss, but are immediately eligible
-/// for generation-safe reuse through the reclaim-group queue.
+/// Fixed-capacity owner for stream records whose bytes remain retained.
+/// Cancellation invalidates a group in O(1); nodes remain reachable until
+/// ACK/loss while becoming immediately eligible for generation-safe reuse.
 pub(in crate::conn) struct Journal {
     pub(super) storage: Storage,
     pub(super) queues: Queues,

@@ -41,11 +41,9 @@ const SIGNAL_VALUE_MAX: u64 = (1 << 62) - 1;
 
 pub(super) mod kind;
 
-/// Stable typed identity held by the control's natural owner.
-///
-/// Its generation changes only when a slot is removed and reused. Packet
-/// delivery handles use a separate generation, so loss and replacement can
-/// invalidate stale packets without invalidating the owner's identity.
+/// Stable typed identity whose generation changes only on slot reuse.
+/// Packet delivery uses an independent generation, allowing stale packets to
+/// be invalidated without invalidating the natural owner.
 #[repr(transparent)]
 pub(super) struct OwnerKey<Kind>(num::NonZeroU64, marker::PhantomData<fn() -> Kind>);
 
@@ -85,12 +83,9 @@ impl<Kind> PartialEq for OwnerKey<Kind> {
 
 impl<Kind> Eq for OwnerKey<Kind> {}
 
-/// One word owned by the state that requires a reliable control record.
-///
-/// Zero is idle, a low nonzero value retains a deferred QUIC varint, and the
-/// high-bit form retains a live or acknowledged generation-checked owner. The
-/// queue therefore owns delivery only; desired state never depends on space in
-/// the bounded journal.
+/// One word retaining required state independently of the bounded journal.
+/// Zero is idle, low values are deferred QUIC varints, and the high-bit form
+/// retains a live or acknowledged generation-checked owner.
 #[repr(transparent)]
 pub(super) struct Signal<Kind>(u64, marker::PhantomData<fn() -> Kind>);
 
@@ -195,12 +190,9 @@ struct Slot {
     entry: Option<Entry>,
 }
 
-/// One bounded owner for a control's value, delivery generation and queue links.
-///
-/// Queueing resolves a typed key supplied by the record's natural owner in one
-/// slot access. Selection, commit, ACK, loss and probe scheduling then need no
-/// allocation, hashing or delivery-table lookup. A cursor borrows this owner,
-/// so selected records cannot outlive or race mutation of their generation.
+/// Bounded owner for control values, delivery generations, and queue links.
+/// Typed owner keys resolve in one slot access; a borrowing cursor prevents
+/// selected records from outliving or racing generation mutation.
 pub(super) struct Pending {
     slots: Vec<Slot>,
     free_head: u32,
@@ -285,10 +277,9 @@ impl Drop for Permit<'_> {
     }
 }
 
-/// Typed mutations available to natural owners and derived-control drains.
-/// `Pending` retains defer-capable required values in their typed signal, while
-/// `Permit` materializes them under a linear journal reservation. Neither
-/// exposes queue storage or lets a borrowed record escape the mutation.
+/// Typed mutations for natural owners and derived-control drains.
+/// `Pending` retains deferred values while `Permit` materializes them under a
+/// linear reservation; neither exposes storage or lets records escape.
 pub(in crate::conn) trait Write {
     fn owner_is_live<Kind>(&self, owner: Option<OwnerKey<Kind>>) -> bool;
     fn remove_control<Kind>(&mut self, owner: &mut Option<OwnerKey<Kind>>);

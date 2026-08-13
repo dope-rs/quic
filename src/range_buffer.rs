@@ -119,11 +119,9 @@ struct Node<B> {
     next: u32,
 }
 
-/// One fixed node allocation shared by every receive stream on a connection.
-///
-/// A stream owns only an intrusive head index. Retained packet owners remain
-/// in their natural `B` values, while metadata slots move between streams
-/// without allocation.
+/// Fixed node allocation shared by all receive streams on a connection.
+/// Streams own intrusive head indexes; retained packets stay in `B` while
+/// metadata slots move between streams without allocation.
 pub struct Arena<B: stream::ReceiveBuffer> {
     nodes: Vec<Node<B>>,
     free: u32,
@@ -597,10 +595,9 @@ impl Plan<'_> {
         self.segments.len()
     }
 
-    /// Applies the bounded range transition while
-    /// exposing each newly accepted source subrange before the scratch parts
-    /// are consumed. This lets a compact owner be materialized without
-    /// retaining an unbounded fragment journal.
+    /// Applies a bounded range transition and exposes each accepted subrange.
+    /// Observation precedes scratch consumption, allowing compact ownership
+    /// without retaining an unbounded fragment journal.
     pub(crate) fn insert_observed<E>(
         &mut self,
         offset: u64,

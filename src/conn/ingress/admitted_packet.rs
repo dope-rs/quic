@@ -5,11 +5,9 @@ use crate::conn::recovery;
 use crate::pn_space;
 use crate::stream;
 
-/// An authenticated packet whose number is fresh for its epoch.
-///
-/// The exclusive connection borrow keeps the admission check stable until
-/// commit. Dropping the value aborts admission without touching receive
-/// history; consuming it through `commit` records the packet exactly once.
+/// Authenticated packet whose number is fresh for its epoch.
+/// Its exclusive borrow stabilizes admission until commit; dropping aborts,
+/// while consuming through `commit` records the packet exactly once.
 #[must_use = "an admitted packet must be committed or deliberately dropped"]
 pub(super) struct AdmittedPacket<'connection, const DOMAIN: u8, B: stream::ReceiveBuffer> {
     connection: &'connection mut crate::conn::session::Connection<DOMAIN, B>,

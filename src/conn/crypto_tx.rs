@@ -123,12 +123,9 @@ pub(super) struct Selection<'a> {
     pub(super) data: &'a [u8],
 }
 
-/// Single owner for QUIC CRYPTO bytes, range state and delivery generations.
-///
-/// TLS appends each byte once. Packets, retransmissions and PTO probes borrow
-/// ranges from that storage; ACK and loss resolve generation handles directly.
-/// The validated TLS flight bound reserves Initial and Handshake concurrently;
-/// discarded backing storage is recycled for Application post-handshake bytes.
+/// Single owner for QUIC CRYPTO bytes, ranges, and delivery generations.
+/// Packets borrow the append-only TLS storage; ACK and loss resolve handles.
+/// Discarded Initial storage is recycled for post-handshake Application bytes.
 pub(super) struct Tx {
     spaces: [Space; 3],
     spare: Vec<u8>,

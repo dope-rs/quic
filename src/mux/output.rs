@@ -137,11 +137,9 @@ impl<
         self.mux.outgoing.bytes_capacity
     }
 
-    /// Returns a completed outgoing allocation to this Mux's packet pool.
-    ///
-    /// Custom transports should call this after they no longer access the
-    /// packet. The integrated endpoint does so automatically after the kernel
-    /// releases the send buffer.
+    /// Returns a completed outgoing allocation to the Mux packet pool.
+    /// Custom transports call this after releasing the packet; the integrated
+    /// endpoint calls it after the kernel releases the send buffer.
     pub fn recycle(&mut self, outgoing: mux::Outgoing) {
         self.mux.outgoing.recycle_packet(outgoing.into_storage());
     }

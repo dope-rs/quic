@@ -136,10 +136,8 @@ enum Probe {
 }
 
 /// Fixed-capacity stream-side storage.
-///
-/// A wire ID pays one bounded hash probe and yields an entry whose references
-/// are tied to this map borrow. Work crossing that borrow uses a typed,
-/// generation-checked handle and resolves by direct slot access.
+/// A wire ID pays one bounded hash probe; work crossing the map borrow uses a
+/// typed generation-checked handle resolved by direct slot access.
 pub(in crate::conn) struct Map<Side, Value> {
     nodes: Vec<Node<Side, Value>>,
     buckets: Box<[u32]>,

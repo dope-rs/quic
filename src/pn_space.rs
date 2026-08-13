@@ -7,10 +7,8 @@ const RECEIVED_WINDOW_BITS: usize = MAX_ACK_INTERVALS * 2 - 1;
 const RECEIVED_WINDOW_WORDS: usize = RECEIVED_WINDOW_BITS.div_ceil(u64::BITS as usize);
 
 /// Fixed packet-number history shared by replay rejection and ACK generation.
-///
-/// A number below `base()` is retired, even if it was never observed. QUIC
-/// retransmits its frames in a new packet number, so bounding reordering this
-/// way cannot make an old authenticated packet fresh again.
+/// Numbers below `base()` are retired; QUIC retransmits frames under new packet
+/// numbers, so bounded reordering cannot make old packets fresh again.
 #[derive(Debug)]
 struct ReceivedPackets {
     words: [u64; RECEIVED_WINDOW_WORDS],

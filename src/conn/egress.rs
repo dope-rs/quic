@@ -17,11 +17,9 @@ use control::Write as _;
 const HANDSHAKE_DONE: u8 = 1 << 0;
 const NEW_CONNECTION_IDS: u8 = 1 << 1;
 
-/// Durable, owner-local work derived from a completed handshake.
-///
-/// The bits survive bounded-control backpressure. Reconciliation only visits
-/// the owner maps while their bit is armed, so steady-state transmission pays
-/// one zero test and keeps values in their natural owners.
+/// Durable owner-local work that survives bounded-control backpressure.
+/// Armed bits select owner maps for reconciliation; the steady state pays one
+/// zero test while values remain with their natural owners.
 #[derive(Default)]
 #[repr(transparent)]
 pub(super) struct DerivedControls(u8);

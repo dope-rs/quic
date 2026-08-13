@@ -1,10 +1,7 @@
 use crate::client;
 
-/// Restricted coordinate view supplied by a client protocol.
-///
 /// # Safety
-/// `Control` must not expose an operation that moves, replaces, or drops
-/// driver-branded retained storage owned by the protocol.
+/// `Control` cannot move, replace, or drop driver-branded protocol storage.
 pub unsafe trait ControlProtocol: client::Protocol {
     type Control<'step>
     where
