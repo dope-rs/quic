@@ -190,7 +190,7 @@ impl<Side, Value: Reusable> Map<Side, Value> {
         Some(&self.nodes[node as usize].value)
     }
 
-    pub(in crate::conn) fn get_with_position(
+    pub(in crate::conn) fn with_position(
         &self,
         stream_id: Id<Side>,
     ) -> Option<(&Value, &Position<Side>)> {
@@ -399,7 +399,7 @@ impl<'a, Side, Value: Reusable> Occupied<'a, Side, Value> {
         &mut self.map.nodes[self.node as usize].value
     }
 
-    pub(in crate::conn) fn get_with_position_mut(&mut self) -> (&mut Value, &mut Position<Side>) {
+    pub(in crate::conn) fn with_position_mut(&mut self) -> (&mut Value, &mut Position<Side>) {
         let node = &mut self.map.nodes[self.node as usize];
         (&mut node.value, &mut node.link_or_next_free)
     }

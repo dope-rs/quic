@@ -52,7 +52,7 @@ impl RetryTokenSecret {
         expiry_unix_secs: u64,
     ) {
         let (addr_bytes, addr_len) = Self::addr_bytes(addr);
-        let odcid = odcid.as_slice();
+        let odcid = odcid.into_slice();
         let tag = self.tag(&addr_bytes[..addr_len], odcid, expiry_unix_secs);
         out.extend_from_slice(&expiry_unix_secs.to_be_bytes());
         out.push(odcid.len() as u8);

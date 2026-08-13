@@ -81,7 +81,7 @@ impl<
                 return Ok(mux::RetryGate::Drop);
             };
             storage.push(prefix.dcid.len() as u8);
-            storage.extend_from_slice(prefix.dcid.as_slice());
+            storage.extend_from_slice(prefix.dcid.into_slice());
             crate::packet::Retry::encode_prefix_into(
                 &mut storage,
                 crate::packet::QUIC_V1,

@@ -693,7 +693,7 @@ impl<B: crate::stream::ReceiveBuffer> streams::State<B> {
         );
         match map.entry(recv::Id::new(stream_id)) {
             table::Entry::Occupied(mut occupied) => {
-                let (stream, event_position) = occupied.get_with_position_mut();
+                let (stream, event_position) = occupied.with_position_mut();
                 stream.reset(error_code, final_size);
                 events.push_reset(event_position, stream_id, error_code);
                 control.remove_control(&mut stream.max_stream_data);
@@ -728,7 +728,7 @@ impl<B: crate::stream::ReceiveBuffer> streams::State<B> {
             &mut receive.ranges,
         );
         if let table::Entry::Occupied(mut occupied) = map.entry(recv::Id::new(stream_id)) {
-            let (stream, event_position) = occupied.get_with_position_mut();
+            let (stream, event_position) = occupied.with_position_mut();
             control.remove_control(&mut stream.max_stream_data);
             control.remove_signal(&mut stream.stop_sending);
             events.cancel(event_position);
@@ -811,7 +811,7 @@ impl<B: crate::stream::ReceiveBuffer> streams::Streams<B> {
             };
             let handle = occupied.handle();
             let (value, released, retire, schedule_credit) = {
-                let (stream, event_position) = occupied.get_with_position_mut();
+                let (stream, event_position) = occupied.with_position_mut();
                 let (value, released) = consume(stream, ranges);
                 let retire = stream.is_eof() && stream.reset_error().is_none();
                 let schedule_credit = if released == 0 || retire {
@@ -982,7 +982,7 @@ impl<B: crate::stream::ReceiveBuffer> streams::State<B> {
             mut stream_present,
             mut range_plan,
             original_ranges,
-        ) = match receive.map.get_with_position(recv::Id::new(stream_id)) {
+        ) = match receive.map.with_position(recv::Id::new(stream_id)) {
             Some((stream, event_position)) => (
                 stream.limit(),
                 stream.highest_offset(),

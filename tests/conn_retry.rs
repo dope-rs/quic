@@ -128,7 +128,7 @@ fn second_initial_with_valid_token_does_not_re_retry() {
     let token = retry.token().to_vec();
     let new_dcid = retry.source_connection_id();
 
-    let mut second_initial = craft_initial(new_dcid.as_slice(), &client_scid, &token);
+    let mut second_initial = craft_initial(new_dcid.into_slice(), &client_scid, &token);
     let _ = mux
         .protocol()
         .recv(from, &mut second_initial, Instant::now());
@@ -168,7 +168,7 @@ fn second_initial_with_wrong_addr_is_rejected() {
     let token = retry.token().to_vec();
     let new_dcid = retry.source_connection_id();
 
-    let mut second_initial = craft_initial(new_dcid.as_slice(), &client_scid, &token);
+    let mut second_initial = craft_initial(new_dcid.into_slice(), &client_scid, &token);
     let _ = mux
         .protocol()
         .recv(from_b, &mut second_initial, Instant::now());

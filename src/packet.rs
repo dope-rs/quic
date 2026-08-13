@@ -132,7 +132,7 @@ impl<'a> ConnectionIdRef<'a> {
         Self(bytes)
     }
 
-    pub const fn as_slice(self) -> &'a [u8] {
+    pub const fn into_slice(self) -> &'a [u8] {
         self.0
     }
 
@@ -802,7 +802,7 @@ impl<'wire> RetryRef<'wire> {
         storage: &'storage mut Vec<u8>,
     ) -> Result<Option<VerifiedRetry<'wire, 'storage>>, EncodeError> {
         storage.clear();
-        if self.dcid.as_slice() != expected_dcid.as_slice() {
+        if self.dcid.into_slice() != expected_dcid.into_slice() {
             return Ok(None);
         }
 
@@ -814,7 +814,7 @@ impl<'wire> RetryRef<'wire> {
             .ok_or(EncodeError::ValueOutOfRange)?;
         storage.reserve_exact(aad_len);
         storage.push(original_dcid.len() as u8);
-        storage.extend_from_slice(original_dcid.as_slice());
+        storage.extend_from_slice(original_dcid.into_slice());
         storage.extend_from_slice(self.header);
 
         let expected = Retry::tag_from_aad(storage)?;
@@ -858,9 +858,9 @@ impl Retry {
         out.push(FORM_LONG | FIXED_BIT | LONG_RETRY);
         out.extend_from_slice(&version.to_be_bytes());
         out.push(dcid.len() as u8);
-        out.extend_from_slice(dcid.as_slice());
+        out.extend_from_slice(dcid.into_slice());
         out.push(scid.len() as u8);
-        out.extend_from_slice(scid.as_slice());
+        out.extend_from_slice(scid.into_slice());
     }
 
     pub fn encode_header(&self) -> Result<Vec<u8>, EncodeError> {

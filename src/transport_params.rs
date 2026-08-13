@@ -271,13 +271,13 @@ impl Params {
             self.active_connection_id_limit,
         )?;
         if let Some(cid) = ids.initial {
-            Self::put_bytes(out, ID_INITIAL_SOURCE_CONNECTION_ID, cid.as_slice())?;
+            Self::put_bytes(out, ID_INITIAL_SOURCE_CONNECTION_ID, cid.into_slice())?;
         }
         if let Some(cid) = ids.original {
-            Self::put_bytes(out, ID_ORIGINAL_DESTINATION_CONNECTION_ID, cid.as_slice())?;
+            Self::put_bytes(out, ID_ORIGINAL_DESTINATION_CONNECTION_ID, cid.into_slice())?;
         }
         if let Some(cid) = ids.retry {
-            Self::put_bytes(out, ID_RETRY_SOURCE_CONNECTION_ID, cid.as_slice())?;
+            Self::put_bytes(out, ID_RETRY_SOURCE_CONNECTION_ID, cid.into_slice())?;
         }
         if let Some(size) = self.max_datagram_frame_size {
             Self::put_varint(out, ID_MAX_DATAGRAM_FRAME_SIZE, size)?;
