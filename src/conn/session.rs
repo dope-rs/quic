@@ -94,7 +94,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Connection<DOMAIN, B> {
     }
 
     pub fn take_session_tickets(&mut self) -> Vec<Ticket> {
-        self.handshake.take_session_tickets()
+        self.handshake.peer.take_tickets()
     }
 
     pub(crate) fn enable_cid_routing(

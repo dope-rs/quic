@@ -34,12 +34,37 @@ struct TicketStore {
     bytes: usize,
 }
 
+pub(super) struct PeerHandshake {
+    transport_params: Option<transport_params::Params>,
+    tickets: TicketStore,
+}
+
+impl PeerHandshake {
+    fn new() -> Self {
+        Self {
+            transport_params: None,
+            tickets: TicketStore {
+                received: collections::VecDeque::new(),
+                bytes: 0,
+            },
+        }
+    }
+
+    fn take_transport_params(&mut self) -> Option<transport_params::Params> {
+        self.transport_params.take()
+    }
+
+    pub(super) fn take_tickets(&mut self) -> Vec<session::Ticket> {
+        self.tickets.bytes = 0;
+        self.tickets.received.drain(..).collect()
+    }
+}
+
 pub(super) struct Handshake<const DOMAIN: u8> {
     client: Option<Box<client::FramedClient<Clock>>>,
     protections: Protections,
     crypto: crypto_tx::Tx,
-    peer_transport_params: Option<transport_params::Params>,
-    tickets: TicketStore,
+    pub(super) peer: PeerHandshake,
 }
 
 #[derive(Default)]
@@ -81,7 +106,8 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Establishment<'_, DOMAIN, B> {
     pub(super) fn complete(self) -> Result<(), conn::Error> {
         let peer_tp = self
             .handshake
-            .take_peer_transport_params()
+            .peer
+            .take_transport_params()
             .ok_or(conn::Error::TransportParameterMismatch)?;
 
         let expected_iscid = self
@@ -374,11 +400,7 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
                 zero_rtt_write: None,
             },
             crypto: crypto_tx::Tx::new(crypto_capacity, outbound_layout),
-            peer_transport_params: None,
-            tickets: TicketStore {
-                received: collections::VecDeque::new(),
-                bytes: 0,
-            },
+            peer: PeerHandshake::new(),
         }
     }
 
@@ -430,14 +452,13 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
             client,
             protections,
             crypto,
-            peer_transport_params,
-            tickets,
+            peer,
         } = self;
         let mut events = Events {
             protections,
             crypto,
-            peer_transport_params,
-            tickets,
+            peer_transport_params: &mut peer.transport_params,
+            tickets: &mut peer.tickets,
             is_client,
             outcome: Outcome::default(),
         };
@@ -495,15 +516,6 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
 
     pub(super) fn retry_initial_crypto(&mut self) {
         self.crypto.retry_initial();
-    }
-
-    fn take_peer_transport_params(&mut self) -> Option<transport_params::Params> {
-        self.peer_transport_params.take()
-    }
-
-    pub(super) fn take_session_tickets(&mut self) -> Vec<session::Ticket> {
-        self.tickets.bytes = 0;
-        self.tickets.received.drain(..).collect()
     }
 }
 
