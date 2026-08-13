@@ -141,12 +141,10 @@ pub(super) struct Tx {
 impl Tx {
     pub(super) fn new(limit: usize, layout: connection::OutboundLayout) -> Self {
         let limit = limit.min((u32::MAX - 1) as usize);
-        // Application flights begin only after Initial is discarded, so one
-        // allocation covers the larger lifetime-disjoint epoch.
-        let initial_capacity = layout.plaintext().max(layout.application());
+        let recycled_initial_capacity = layout.plaintext().max(layout.application());
         Self {
             spaces: [
-                Space::new(initial_capacity, layout.plaintext()),
+                Space::new(recycled_initial_capacity, layout.plaintext()),
                 Space::new(layout.handshake(), layout.handshake()),
                 Space::new(0, layout.application()),
             ],

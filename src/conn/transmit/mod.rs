@@ -69,11 +69,8 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
         let packet_bytes = max_packet_bytes.min(self.connection.egress.pmtud.current() as usize);
         let packet_slots = max_packets.min(conn::MAX_BATCH_PACKETS);
         batch.reset(packet_slots, packet_bytes);
-        // fill_batch takes the caller's raw ceiling: regular packets clamp to
-        // the path MTU internally, but PMTU probes must be allowed to exceed
-        // it — pre-clamping made every probe re-arm at the current MTU and
-        // emit forever.
-        self.fill_batch(batch, now, packet_slots, max_packet_bytes);
+        let probe_aware_packet_ceiling = max_packet_bytes;
+        self.fill_batch(batch, now, packet_slots, probe_aware_packet_ceiling);
     }
 
     pub(crate) fn send_one(

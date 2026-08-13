@@ -20,6 +20,7 @@ pub(crate) enum ReceiveAdmission {
     Datagram,
     Stream,
     StreamTransient,
+    /// Preserves earlier frame metadata while superseding payload and gap topology.
     Reset,
     Stop,
 }

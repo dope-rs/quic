@@ -840,13 +840,12 @@ impl Pending {
         self.queue_blocked(credit.blocked_mut(), record)
     }
 
+    /// Distinguishes an absent owner from a live retry and a stale ACK tombstone.
     fn blocked_sendable<Kind>(
         &self,
         owner: Option<OwnerKey<Kind>>,
         record: crate::conn::delivery::Control,
     ) -> bool {
-        // A stale typed key is the natural owner's ACK tombstone. Only an
-        // absent key may allocate for this limit; a queued live key may retry.
         match owner {
             None => self.remaining_capacity() != 0,
             Some(owner) => self.resolve_owner(Some(owner)).is_some_and(|entry| {
@@ -856,13 +855,12 @@ impl Pending {
         }
     }
 
+    /// Defers a first advisory frame under pressure and suppresses ACKed limits.
     fn queue_blocked<Kind>(
         &mut self,
         owner: &mut Option<OwnerKey<Kind>>,
         record: crate::conn::delivery::Control,
     ) -> Option<crate::conn::delivery::Handle<crate::conn::delivery::Control>> {
-        // BLOCKED frames are advisory. Capacity pressure defers a first
-        // emission, while a stale ACK tombstone suppresses the same limit.
         match *owner {
             None if self.remaining_capacity() == 0 => return None,
             Some(owner) if self.resolve_owner(Some(owner)).is_none() => return None,

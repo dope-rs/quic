@@ -1011,9 +1011,6 @@ impl<B: crate::stream::ReceiveBuffer> streams::State<B> {
                     if !event_pending {
                         event_slots = 1;
                     }
-                    // Earlier STREAM frames still apply their observable metadata
-                    // in wire order, but their payload and gap topology can never
-                    // escape the later RESET_STREAM.
                     admissions.mark(
                         frame_index.get(),
                         receive_workspace::ReceiveAdmission::Reset,

@@ -49,7 +49,7 @@ const STREAM_SCHEDULE_WORK_LIMIT: usize = 256;
 const MAX_PATH_TOKENS: usize = 64;
 pub(crate) const MAX_FRAMES_PER_PACKET: usize = 256;
 const _: () = assert!(MAX_FRAMES_PER_PACKET == u8::MAX as usize + 1);
-// Generated gaps and range lengths are at most 512, hence two wire bytes each.
+/// Bound for generated ACK gaps and ranges that each occupy at most two bytes.
 const MAX_GENERATED_ACK_FRAME_BYTES: usize =
     1 + 8 + 1 + 2 + 2 + frame::MAX_ADDITIONAL_ACK_RANGES * 4;
 const MAX_BATCH_PACKETS: usize = 64;

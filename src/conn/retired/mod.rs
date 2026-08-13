@@ -4,9 +4,7 @@ pub(super) mod streams;
 
 use remove::Remove as _;
 
-// With at most 65,536 intervals, a degree-8 B-tree has at most six levels.
-// Each level searches at most 15 packed keys and every mutation touches only
-// that path plus the two adjacent intervals; connection age is irrelevant.
+/// Degree eight bounds 65,536 intervals to six levels and fifteen keys per level.
 const MIN_DEGREE: usize = 8;
 const MAX_KEYS: usize = MIN_DEGREE * 2 - 1;
 const MAX_CHILDREN: usize = MIN_DEGREE * 2;

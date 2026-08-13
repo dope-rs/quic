@@ -53,6 +53,7 @@ impl<Tag> Retire<'_, Tag> {
 /// every structural index inside the exclusive mutation that produced it.
 pub(super) struct Sequence<Tag> {
     pub(super) contiguous: u64,
+    /// Each retained interval requires a distinct live hole before it.
     pub(super) ranges: retired::Tree<Tag>,
 }
 
@@ -60,9 +61,6 @@ impl<Tag> Sequence<Tag> {
     pub(super) fn new(live_capacity: usize) -> Self {
         Self {
             contiguous: 0,
-            // The contiguous frontier consumes the leading retired run. Every
-            // remaining interval therefore needs a distinct live hole before
-            // it, so interval count cannot exceed simultaneous live streams.
             ranges: retired::Tree::new(live_capacity),
         }
     }
