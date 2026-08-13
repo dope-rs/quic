@@ -1,4 +1,4 @@
-use crate::{conn, pn_space, stream};
+use crate::{PnSpace, conn, pn_space, stream};
 
 #[derive(Clone, Copy, Default)]
 pub(in crate::conn) struct Discarded(u8);
@@ -33,19 +33,19 @@ impl<'a, const DOMAIN: u8> Transition<'a, DOMAIN> {
     pub(in crate::conn) fn discard_initial(&mut self) {
         self.discard_packets(conn::Epoch::Initial);
         self.handshake.discard(conn::Epoch::Initial);
-        self.egress.recovery.spaces[conn::Epoch::Initial as usize] = pn_space::PnSpace::default();
+        self.egress.recovery.spaces[conn::Epoch::Initial as usize] = PnSpace::default();
     }
 
     pub(in crate::conn) fn retry_initial(&mut self) {
         self.discard_packets(conn::Epoch::Initial);
         self.handshake.retry_initial_crypto();
-        self.egress.recovery.spaces[conn::Epoch::Initial as usize] = pn_space::PnSpace::default();
+        self.egress.recovery.spaces[conn::Epoch::Initial as usize] = PnSpace::default();
     }
 
     pub(in crate::conn) fn discard_handshake(&mut self) {
         self.discard_packets(conn::Epoch::Handshake);
         self.handshake.discard(conn::Epoch::Handshake);
-        self.egress.recovery.spaces[conn::Epoch::Handshake as usize] = pn_space::PnSpace::default();
+        self.egress.recovery.spaces[conn::Epoch::Handshake as usize] = PnSpace::default();
     }
 
     fn discard_packets(&mut self, epoch: conn::Epoch) {

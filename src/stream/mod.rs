@@ -10,10 +10,11 @@ use crate::range_buffer;
 const MAX_RECV_SEGMENTS: usize = range_buffer::MAX_RANGES;
 
 mod buffer;
+pub(crate) use buffer::Buffer;
 
 /// Receive storage that can preserve a packet owner's lifetime while exposing
 /// only the accepted byte range.
-pub trait ReceiveBuffer: buffer::Buffer + AsRef<[u8]> + Sized {
+pub trait ReceiveBuffer: Buffer + AsRef<[u8]> + Sized {
     #[doc(hidden)]
     type Ready: ReadyBuffer<Self>;
     #[doc(hidden)]
@@ -59,7 +60,7 @@ pub trait ReadyBuffer<B: ReceiveBuffer>: Default {
     fn pop_front(&mut self, arena: &mut range_buffer::Arena<B>) -> Option<B>;
 }
 
-impl buffer::Buffer for Vec<u8> {}
+impl Buffer for Vec<u8> {}
 
 impl ReceiveBuffer for Vec<u8> {
     type Ready = Vec<u8>;
@@ -208,7 +209,7 @@ impl<'d> RecvBuffer<'d> {
     }
 }
 
-impl buffer::Buffer for RecvBuffer<'_> {}
+impl Buffer for RecvBuffer<'_> {}
 
 impl std::fmt::Debug for RecvBuffer<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -23,4 +23,8 @@ pub mod stream;
 pub mod transport_params;
 pub mod varint;
 
+pub(crate) use new_reno::NewReno;
 pub use o3::buffer::CapacityError;
+pub(crate) use pacer::Pacer;
+pub(crate) use pmtud::Pmtud;
+pub(crate) use pn_space::PnSpace;

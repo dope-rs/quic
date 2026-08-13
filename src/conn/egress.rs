@@ -1,11 +1,8 @@
 use std::collections;
 use std::time;
 
-use crate::new_reno;
-use crate::pacer;
-use crate::pmtud;
-use crate::pn_space;
 use crate::rtt;
+use crate::{NewReno, Pacer, Pmtud, PnSpace};
 
 use crate::conn;
 use crate::conn::control;
@@ -101,7 +98,7 @@ pub(super) struct Egress {
 }
 
 pub(super) struct RecoveryState {
-    pub(super) spaces: [pn_space::PnSpace; 3],
+    pub(super) spaces: [PnSpace; 3],
     pub(super) rtt: rtt::RttTracker,
     pub(super) pto_count: u32,
     pub(super) loss_timer: Option<time::Instant>,
@@ -111,9 +108,9 @@ pub(super) struct RecoveryState {
 }
 
 pub(super) struct CongestionState {
-    pub(super) cc: new_reno::NewReno,
-    pub(super) pacer: pacer::Pacer,
-    pub(super) pmtud: pmtud::Pmtud,
+    pub(super) cc: NewReno,
+    pub(super) pacer: Pacer,
+    pub(super) pmtud: Pmtud,
     pub(super) packet_ceiling: usize,
     pub(super) pmtud_probe_pn: Option<u64>,
 }
@@ -160,9 +157,9 @@ impl Egress {
                 ),
             },
             congestion: CongestionState {
-                cc: new_reno::NewReno::default(),
-                pacer: pacer::Pacer::new(time::Instant::now()),
-                pmtud: pmtud::Pmtud::new(setup.max_pmtu),
+                cc: NewReno::default(),
+                pacer: Pacer::new(time::Instant::now()),
+                pmtud: Pmtud::new(setup.max_pmtu),
                 packet_ceiling,
                 pmtud_probe_pn: None,
             },

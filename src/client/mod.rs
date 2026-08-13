@@ -67,9 +67,10 @@ pub struct PooledEndpointSpec<'tls> {
 }
 
 mod authority;
+pub(crate) use authority::Authority;
 
 #[doc(hidden)]
-pub trait EndpointAuthority<'tls>: Copy + authority::Authority {
+pub trait EndpointAuthority<'tls>: Copy + Authority {
     fn connect<'d, const ID: u8, H: mux::Handler<ID>>(
         self,
         endpoint: pin::Pin<&mut endpoint::PooledSocket<'d, 'tls, ID, H>>,
@@ -79,7 +80,7 @@ pub trait EndpointAuthority<'tls>: Copy + authority::Authority {
     ) -> Result<conn::Handle, crate::errors::ConnectFailure>;
 }
 
-impl authority::Authority for [u8; 32] {}
+impl Authority for [u8; 32] {}
 
 impl<'tls> EndpointAuthority<'tls> for [u8; 32] {
     fn connect<'d, const ID: u8, H: mux::Handler<ID>>(
@@ -93,7 +94,7 @@ impl<'tls> EndpointAuthority<'tls> for [u8; 32] {
     }
 }
 
-impl authority::Authority for &conn::tls::ClientPool {}
+impl Authority for &conn::tls::ClientPool {}
 
 impl<'tls> EndpointAuthority<'tls> for &'tls conn::tls::ClientPool {
     fn connect<'d, const ID: u8, H: mux::Handler<ID>>(

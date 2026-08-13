@@ -18,7 +18,7 @@ fn stop_frame_id(frame: &receive_workspace::ParsedFrame) -> Option<u64> {
 /// Scratch-backed packet plan whose workspace borrow prevents reentrancy.
 /// Dropping it empties every bounded scratch structure for reuse.
 pub(super) struct Plan<'workspace> {
-    workspace: &'workspace mut receive_workspace::ReceiveWorkspace,
+    workspace: &'workspace mut conn::ReceiveWorkspace,
     admitted_bytes: usize,
     datagram_slots: usize,
 }
@@ -33,7 +33,7 @@ impl<'workspace> Plan<'workspace> {
     }
 
     pub(super) fn begin(
-        workspace: &'workspace mut receive_workspace::ReceiveWorkspace,
+        workspace: &'workspace mut conn::ReceiveWorkspace,
         datagram_slots: usize,
     ) -> Self {
         workspace.parsed_frames.clear();
@@ -102,7 +102,7 @@ impl<'workspace> Plan<'workspace> {
         streams: &mut crate::conn::streams::State<B>,
         is_client: bool,
     ) -> Result<Reservation, conn::Error> {
-        let receive_workspace::ReceiveWorkspace {
+        let conn::ReceiveWorkspace {
             parsed_frames,
             admissions,
             payloads,
@@ -222,7 +222,7 @@ impl<'workspace> Plan<'workspace> {
         self.workspace.parsed_frames.push(frame);
     }
 
-    pub(super) fn workspace(&mut self) -> &mut receive_workspace::ReceiveWorkspace {
+    pub(super) fn workspace(&mut self) -> &mut conn::ReceiveWorkspace {
         self.workspace
     }
 }
