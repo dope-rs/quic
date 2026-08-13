@@ -1,34 +1,39 @@
-use std::ops::DerefMut;
+use std::ops;
 
-use crate::conn::delivery::{Control, Handle};
-use crate::frame::Frame;
-use crate::varint::VarInt;
+use crate::conn::delivery;
+use crate::frame;
+use crate::varint;
 
-use super::{PREFIX, Pending, SUFFIX};
+use crate::conn::control;
 
 pub(in crate::conn) struct Encoder<'a> {
-    pending: &'a Pending,
+    pending: &'a control::Pending,
     path: &'a crate::conn::path::Path,
 }
 
 impl<'a> Encoder<'a> {
-    pub(in crate::conn) fn new(pending: &'a Pending, path: &'a crate::conn::path::Path) -> Self {
+    pub(in crate::conn) fn new(
+        pending: &'a control::Pending,
+        path: &'a crate::conn::path::Path,
+    ) -> Self {
         Self { pending, path }
     }
     pub(in crate::conn) fn encode_pending<const MASK: u16, Out>(
         &self,
         out: &mut Out,
         limit: usize,
-        handle: Handle<Control>,
-        record: Control,
+        handle: delivery::Handle<delivery::Control>,
+        record: delivery::Control,
     ) -> bool
     where
-        Out: DerefMut<Target = Vec<u8>>,
+        Out: ops::DerefMut<Target = Vec<u8>>,
     {
-        if MASK == PREFIX {
+        if MASK == control::PREFIX {
             match record {
-                Control::HandshakeDone => Self::append(out, limit, &Frame::HandshakeDone),
-                Control::NewConnectionId(sequence_number) => {
+                delivery::Control::HandshakeDone => {
+                    Self::append(out, limit, &frame::Frame::HandshakeDone)
+                }
+                delivery::Control::NewConnectionId(sequence_number) => {
                     let Some(key) = self.pending.local_cid_key(handle) else {
                         return false;
                     };
@@ -40,12 +45,12 @@ impl<'a> Encoder<'a> {
                     debug_assert_eq!(sequence_number, resolved_sequence);
                     let start = out.len();
                     out.push(0x18);
-                    let Some(sequence_number) = VarInt::new(sequence_number) else {
+                    let Some(sequence_number) = varint::VarInt::new(sequence_number) else {
                         out.truncate(start);
                         return false;
                     };
                     sequence_number.encode(&mut **out);
-                    VarInt::ZERO.encode(&mut **out);
+                    varint::VarInt::ZERO.encode(&mut **out);
                     out.push(connection_id.len() as u8);
                     out.extend_from_slice(connection_id);
                     out.extend_from_slice(&reset_token);
@@ -56,89 +61,95 @@ impl<'a> Encoder<'a> {
                         false
                     }
                 }
-                Control::RetireConnectionId(sequence_number) => {
-                    let Some(sequence_number) = VarInt::new(sequence_number) else {
-                        return false;
-                    };
-                    Self::append(out, limit, &Frame::RetireConnectionId { sequence_number })
-                }
-                _ => unreachable!("prefix cursor emitted a suffix control"),
-            }
-        } else {
-            debug_assert_eq!(MASK, SUFFIX);
-            match record {
-                Control::StopSending(stream_id, error_code) => {
-                    let (Some(stream_id), Some(error_code)) =
-                        (VarInt::new(stream_id), VarInt::new(error_code))
-                    else {
+                delivery::Control::RetireConnectionId(sequence_number) => {
+                    let Some(sequence_number) = varint::VarInt::new(sequence_number) else {
                         return false;
                     };
                     Self::append(
                         out,
                         limit,
-                        &Frame::StopSending {
-                            stream_id,
-                            error_code,
-                        },
+                        &frame::Frame::RetireConnectionId { sequence_number },
                     )
                 }
-                Control::ResetStream(stream_id, error_code, final_size) => {
-                    let (Some(stream_id), Some(error_code), Some(final_size)) = (
-                        VarInt::new(stream_id),
-                        VarInt::new(error_code),
-                        VarInt::new(final_size),
+                _ => unreachable!("prefix cursor emitted a suffix control"),
+            }
+        } else {
+            debug_assert_eq!(MASK, control::SUFFIX);
+            match record {
+                delivery::Control::StopSending(stream_id, error_code) => {
+                    let (Some(stream_id), Some(error_code)) = (
+                        varint::VarInt::new(stream_id),
+                        varint::VarInt::new(error_code),
                     ) else {
                         return false;
                     };
                     Self::append(
                         out,
                         limit,
-                        &Frame::ResetStream {
+                        &frame::Frame::StopSending {
+                            stream_id,
+                            error_code,
+                        },
+                    )
+                }
+                delivery::Control::ResetStream(stream_id, error_code, final_size) => {
+                    let (Some(stream_id), Some(error_code), Some(final_size)) = (
+                        varint::VarInt::new(stream_id),
+                        varint::VarInt::new(error_code),
+                        varint::VarInt::new(final_size),
+                    ) else {
+                        return false;
+                    };
+                    Self::append(
+                        out,
+                        limit,
+                        &frame::Frame::ResetStream {
                             stream_id,
                             error_code,
                             final_size,
                         },
                     )
                 }
-                Control::MaxData(maximum_data) => {
-                    let Some(maximum_data) = VarInt::new(maximum_data) else {
+                delivery::Control::MaxData(maximum_data) => {
+                    let Some(maximum_data) = varint::VarInt::new(maximum_data) else {
                         return false;
                     };
-                    Self::append(out, limit, &Frame::MaxData { maximum_data })
+                    Self::append(out, limit, &frame::Frame::MaxData { maximum_data })
                 }
-                Control::MaxStreamData(stream_id, maximum_stream_data) => {
-                    let (Some(stream_id), Some(maximum_stream_data)) =
-                        (VarInt::new(stream_id), VarInt::new(maximum_stream_data))
-                    else {
+                delivery::Control::MaxStreamData(stream_id, maximum_stream_data) => {
+                    let (Some(stream_id), Some(maximum_stream_data)) = (
+                        varint::VarInt::new(stream_id),
+                        varint::VarInt::new(maximum_stream_data),
+                    ) else {
                         return false;
                     };
                     Self::append(
                         out,
                         limit,
-                        &Frame::MaxStreamData {
+                        &frame::Frame::MaxStreamData {
                             stream_id,
                             maximum_stream_data,
                         },
                     )
                 }
-                Control::MaxStreams(is_uni, max_streams) => {
-                    let Some(max_streams) = VarInt::new(max_streams) else {
+                delivery::Control::MaxStreams(is_uni, max_streams) => {
+                    let Some(max_streams) = varint::VarInt::new(max_streams) else {
                         return false;
                     };
                     Self::append(
                         out,
                         limit,
-                        &Frame::MaxStreams {
+                        &frame::Frame::MaxStreams {
                             is_uni,
                             max_streams,
                         },
                     )
                 }
-                Control::PathResponse(data) => {
-                    Self::append(out, limit, &Frame::PathResponse { data })
+                delivery::Control::PathResponse(data) => {
+                    Self::append(out, limit, &frame::Frame::PathResponse { data })
                 }
-                Control::PathChallenge(data) => {
-                    Self::append(out, limit, &Frame::PathChallenge { data })
+                delivery::Control::PathChallenge(data) => {
+                    Self::append(out, limit, &frame::Frame::PathChallenge { data })
                 }
                 _ => unreachable!("suffix cursor emitted a non-suffix control"),
             }
@@ -149,28 +160,28 @@ impl<'a> Encoder<'a> {
         &self,
         out: &mut Out,
         limit: usize,
-        handle: Handle<Control>,
-        record: Control,
+        handle: delivery::Handle<delivery::Control>,
+        record: delivery::Control,
     ) -> bool
     where
-        Out: DerefMut<Target = Vec<u8>>,
+        Out: ops::DerefMut<Target = Vec<u8>>,
     {
         match record {
-            Control::HandshakeDone
-            | Control::NewConnectionId(_)
-            | Control::RetireConnectionId(_) => {
-                self.encode_pending::<PREFIX, _>(out, limit, handle, record)
+            delivery::Control::HandshakeDone
+            | delivery::Control::NewConnectionId(_)
+            | delivery::Control::RetireConnectionId(_) => {
+                self.encode_pending::<{ control::PREFIX }, _>(out, limit, handle, record)
             }
-            Control::StopSending(_, _)
-            | Control::ResetStream(_, _, _)
-            | Control::MaxData(_)
-            | Control::MaxStreamData(_, _)
-            | Control::MaxStreams(_, _)
-            | Control::PathResponse(_)
-            | Control::PathChallenge(_) => {
-                self.encode_pending::<SUFFIX, _>(out, limit, handle, record)
+            delivery::Control::StopSending(_, _)
+            | delivery::Control::ResetStream(_, _, _)
+            | delivery::Control::MaxData(_)
+            | delivery::Control::MaxStreamData(_, _)
+            | delivery::Control::MaxStreams(_, _)
+            | delivery::Control::PathResponse(_)
+            | delivery::Control::PathChallenge(_) => {
+                self.encode_pending::<{ control::SUFFIX }, _>(out, limit, handle, record)
             }
-            Control::DataBlocked(_) | Control::StreamDataBlocked(_, _) => {
+            delivery::Control::DataBlocked(_) | delivery::Control::StreamDataBlocked(_, _) => {
                 self.encode_blocked(out, limit, record)
             }
         }
@@ -180,28 +191,29 @@ impl<'a> Encoder<'a> {
         &self,
         out: &mut Out,
         limit: usize,
-        record: Control,
+        record: delivery::Control,
     ) -> bool
     where
-        Out: DerefMut<Target = Vec<u8>>,
+        Out: ops::DerefMut<Target = Vec<u8>>,
     {
         match record {
-            Control::DataBlocked(maximum_data) => {
-                let Some(maximum_data) = VarInt::new(maximum_data) else {
+            delivery::Control::DataBlocked(maximum_data) => {
+                let Some(maximum_data) = varint::VarInt::new(maximum_data) else {
                     return false;
                 };
-                Self::append(out, limit, &Frame::DataBlocked { maximum_data })
+                Self::append(out, limit, &frame::Frame::DataBlocked { maximum_data })
             }
-            Control::StreamDataBlocked(stream_id, maximum_stream_data) => {
-                let (Some(stream_id), Some(maximum_stream_data)) =
-                    (VarInt::new(stream_id), VarInt::new(maximum_stream_data))
-                else {
+            delivery::Control::StreamDataBlocked(stream_id, maximum_stream_data) => {
+                let (Some(stream_id), Some(maximum_stream_data)) = (
+                    varint::VarInt::new(stream_id),
+                    varint::VarInt::new(maximum_stream_data),
+                ) else {
                     return false;
                 };
                 Self::append(
                     out,
                     limit,
-                    &Frame::StreamDataBlocked {
+                    &frame::Frame::StreamDataBlocked {
                         stream_id,
                         maximum_stream_data,
                     },
@@ -211,9 +223,9 @@ impl<'a> Encoder<'a> {
         }
     }
 
-    fn append<Out>(out: &mut Out, limit: usize, frame: &Frame) -> bool
+    fn append<Out>(out: &mut Out, limit: usize, frame: &frame::Frame) -> bool
     where
-        Out: DerefMut<Target = Vec<u8>>,
+        Out: ops::DerefMut<Target = Vec<u8>>,
     {
         let start = out.len();
         if frame.encode(out).is_ok() && out.len() <= limit {

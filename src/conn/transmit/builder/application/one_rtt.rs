@@ -1,14 +1,13 @@
-use crate::conn::{
-    Epoch, PACKET_STREAM_CAPACITY, PN_LEN, STREAM_FRAME_OVERHEAD, commit, delivery, packet,
-    stream_journal,
-};
-use crate::frame::Frame;
-use crate::packet::ShortHeaderRef;
-use crate::stream::ReceiveBuffer;
+use crate::conn::commit;
+use crate::conn::delivery;
+use crate::conn::packet;
+use crate::conn::stream_journal;
 
-use super::{Application, Builder};
-use crate::conn::transmit::builder::ack::Ack;
-use crate::conn::transmit::builder::crypto::Crypto;
+use crate::stream;
+
+use crate::conn::transmit::builder::ack::Ack as _;
+use crate::conn::transmit::builder::application;
+use crate::conn::transmit::builder::crypto::Crypto as _;
 
 pub(in crate::conn::transmit) trait BuildOneRtt {
     fn build_one_rtt<const PTO_PROBE: bool>(
@@ -18,18 +17,21 @@ pub(in crate::conn::transmit) trait BuildOneRtt {
     ) -> Option<(usize, commit::Packet)>;
 }
 
-impl<const DOMAIN: u8, B: ReceiveBuffer> BuildOneRtt for Application<'_, DOMAIN, B> {
+impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
+    for application::Application<'_, DOMAIN, B>
+{
     fn build_one_rtt<const PTO_PROBE: bool>(
         &mut self,
         dst: &mut Vec<u8>,
         max_packet_bytes: usize,
     ) -> Option<(usize, commit::Packet)> {
-        let pn = self.packet.connection.egress.spaces[Epoch::Application as usize].next_pn;
+        let pn =
+            self.packet.connection.egress.spaces[crate::conn::Epoch::Application as usize].next_pn;
         let packet_start = dst.len();
-        let pn_off = ShortHeaderRef {
+        let pn_off = crate::packet::ShortHeaderRef {
             dcid: self.packet.connection.path.peer_cid(),
             packet_number: pn,
-            pn_len: PN_LEN,
+            pn_len: crate::conn::PN_LEN,
         }
         .encode_into(dst)
         .ok()?;
@@ -37,31 +39,38 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildOneRtt for Application<'_, DOMAIN,
         let payload_limit =
             payload_start.checked_add(self.packet.short_payload_limit(max_packet_bytes))?;
         let mut frames = packet::Payload::new(dst, payload_start);
-        let mut commit = commit::Packet::new(Epoch::Application, pn);
+        let mut commit = commit::Packet::new(crate::conn::Epoch::Application, pn);
         let track_delivery = self.packet.can_track_packet();
         if PTO_PROBE {
-            commit.ack_included =
-                self.packet
-                    .append_ack_frame(Epoch::Application, &mut frames, payload_limit);
+            commit.ack_included = self.packet.append_ack_frame(
+                crate::conn::Epoch::Application,
+                &mut frames,
+                payload_limit,
+            );
             let frame_room = payload_limit.saturating_sub(frames.len());
-            if let Some((delivery, data)) = self.packet.crypto_probe(Epoch::Application, frame_room)
-                && Builder::<DOMAIN, B>::encode_crypto(&mut frames, delivery.record.offset, data)
+            if let Some((delivery, data)) = self
+                .packet
+                .crypto_probe(crate::conn::Epoch::Application, frame_room)
+                && crate::conn::transmit::builder::Builder::<DOMAIN, B>::encode_crypto(
+                    &mut frames,
+                    delivery.record.offset,
+                    data,
+                )
             {
                 commit.crypto = Some(delivery);
                 commit.ack_eliciting = true;
             }
             while !commit.controls.is_full() {
-                let next =
-                    self.packet
-                        .connection
-                        .control
-                        .next_probe(Epoch::Application, |handle| {
-                            commit
-                                .controls
-                                .as_slice()
-                                .iter()
-                                .any(|delivery| delivery.handle == handle)
-                        });
+                let next = self.packet.connection.control.next_probe(
+                    crate::conn::Epoch::Application,
+                    |handle| {
+                        commit
+                            .controls
+                            .as_slice()
+                            .iter()
+                            .any(|delivery| delivery.handle == handle)
+                    },
+                );
                 let Some((handle, record)) = next else {
                     break;
                 };
@@ -93,8 +102,11 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildOneRtt for Application<'_, DOMAIN,
                 let Some((handle, send_handle, record)) = next else {
                     break;
                 };
-                let room = payload_limit
-                    .saturating_sub(frames.len().saturating_add(STREAM_FRAME_OVERHEAD));
+                let room = payload_limit.saturating_sub(
+                    frames
+                        .len()
+                        .saturating_add(crate::conn::STREAM_FRAME_OVERHEAD),
+                );
                 if record.len as usize > room {
                     break;
                 }
@@ -126,7 +138,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildOneRtt for Application<'_, DOMAIN,
                 let Ok(len) = usize::try_from(record.len) else {
                     continue;
                 };
-                if !Builder::<DOMAIN, B>::append_stream_frame(
+                if !crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_stream_frame(
                     &mut frames,
                     payload_limit,
                     record.stream_id,
@@ -144,19 +156,25 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildOneRtt for Application<'_, DOMAIN,
                 commit.ack_eliciting = true;
             }
             if !commit.ack_eliciting {
-                if !Builder::<DOMAIN, B>::append_frame(&mut frames, payload_limit, &Frame::Ping) {
+                if !crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_frame(
+                    &mut frames,
+                    payload_limit,
+                    &crate::frame::Frame::Ping,
+                ) {
                     return None;
                 }
                 commit.ack_eliciting = true;
             }
             commit.pto_probe = true;
         } else {
-            commit.ack_included =
-                self.packet
-                    .append_ack_frame(Epoch::Application, &mut frames, payload_limit);
+            commit.ack_included = self.packet.append_ack_frame(
+                crate::conn::Epoch::Application,
+                &mut frames,
+                payload_limit,
+            );
             let has_control = track_delivery && !self.packet.connection.control.is_empty();
             if has_control && let Some(cursor) = self.packet.connection.control.prefix() {
-                Builder::<DOMAIN, B>::append_pending_controls(
+                crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_pending_controls(
                     &self.packet.connection.control,
                     &self.packet.connection.path,
                     &mut frames,
@@ -168,15 +186,19 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildOneRtt for Application<'_, DOMAIN,
             let frame_room = payload_limit.saturating_sub(frames.len());
             let crypto = track_delivery
                 .then(|| {
-                    Builder::<DOMAIN, B>::peek_crypto_chunk(
+                    crate::conn::transmit::builder::Builder::<DOMAIN, B>::peek_crypto_chunk(
                         self.packet.connection.handshake.crypto(),
-                        Epoch::Application,
+                        crate::conn::Epoch::Application,
                         frame_room,
                     )
                 })
                 .flatten();
             if let Some((crypto, data)) = crypto
-                && Builder::<DOMAIN, B>::encode_crypto(&mut frames, crypto.record.offset, data)
+                && crate::conn::transmit::builder::Builder::<DOMAIN, B>::encode_crypto(
+                    &mut frames,
+                    crypto.record.offset,
+                    data,
+                )
             {
                 commit.crypto = Some(crypto);
                 commit.ack_eliciting = true;
@@ -184,7 +206,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildOneRtt for Application<'_, DOMAIN,
             if has_control
                 && let Some(records) = self.packet.connection.control.only_path_responses()
             {
-                Builder::<DOMAIN, B>::append_path_controls(
+                crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_path_controls(
                     &self.packet.connection.control,
                     &self.packet.connection.path,
                     records,
@@ -195,7 +217,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildOneRtt for Application<'_, DOMAIN,
             } else if has_control
                 && let Some(records) = self.packet.connection.control.only_path_challenges()
             {
-                Builder::<DOMAIN, B>::append_path_controls(
+                crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_path_controls(
                     &self.packet.connection.control,
                     &self.packet.connection.path,
                     records,
@@ -204,7 +226,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildOneRtt for Application<'_, DOMAIN,
                     &mut commit,
                 );
             } else if has_control && let Some(cursor) = self.packet.connection.control.suffix() {
-                Builder::<DOMAIN, B>::append_pending_controls(
+                crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_pending_controls(
                     &self.packet.connection.control,
                     &self.packet.connection.path,
                     &mut frames,
@@ -213,11 +235,14 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildOneRtt for Application<'_, DOMAIN,
                     cursor,
                 );
             }
-            let mut retry_remaining = PACKET_STREAM_CAPACITY;
+            let mut retry_remaining = crate::conn::PACKET_STREAM_CAPACITY;
             let mut retry_work = stream_journal::RetryWork::new(&mut retry_remaining);
             while track_delivery && !commit.streams.is_full() {
-                let room = payload_limit
-                    .saturating_sub(frames.len().saturating_add(STREAM_FRAME_OVERHEAD));
+                let room = payload_limit.saturating_sub(
+                    frames
+                        .len()
+                        .saturating_add(crate::conn::STREAM_FRAME_OVERHEAD),
+                );
                 let next = self
                     .packet
                     .connection
@@ -262,7 +287,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildOneRtt for Application<'_, DOMAIN,
                 let Ok(len_usize) = usize::try_from(record.len) else {
                     continue;
                 };
-                if !Builder::<DOMAIN, B>::append_stream_frame(
+                if !crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_stream_frame(
                     &mut frames,
                     payload_limit,
                     record.stream_id,
@@ -383,8 +408,11 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildOneRtt for Application<'_, DOMAIN,
                     idx += 1;
                     continue;
                 }
-                let packet_room = payload_limit
-                    .saturating_sub(frames.len().saturating_add(STREAM_FRAME_OVERHEAD));
+                let packet_room = payload_limit.saturating_sub(
+                    frames
+                        .len()
+                        .saturating_add(crate::conn::STREAM_FRAME_OVERHEAD),
+                );
                 let take = flow_take.min(packet_room as u64) as usize;
                 if take == 0 && !fin_only {
                     break;
@@ -400,7 +428,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildOneRtt for Application<'_, DOMAIN,
                     continue;
                 }
                 let fin_now = stream.would_fin(n);
-                if !Builder::<DOMAIN, B>::append_stream_frame(
+                if !crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_stream_frame(
                     &mut frames,
                     payload_limit,
                     id,
@@ -430,14 +458,14 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildOneRtt for Application<'_, DOMAIN,
             .packet
             .connection
             .handshake
-            .write_key(Epoch::Application)?
+            .write_key(crate::conn::Epoch::Application)?
             .protect_short_in_place(
                 frames.out_mut(),
                 packet_start,
                 payload_start,
                 pn,
                 pn_off,
-                PN_LEN as usize,
+                crate::conn::PN_LEN as usize,
             )
             .ok()?;
 

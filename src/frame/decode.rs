@@ -1,6 +1,7 @@
 use super::*;
+use crate::varint;
 
-fn data_end(input: &[u8], pos: usize, length: VarInt) -> Result<usize, error::Decode> {
+fn data_end(input: &[u8], pos: usize, length: varint::VarInt) -> Result<usize, error::Decode> {
     let length = usize::try_from(length.get()).map_err(|_| error::Decode::Underflow)?;
     pos.checked_add(length)
         .filter(|&end| end <= input.len())
@@ -38,11 +39,11 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
             TYPE_PADDING => Ok((Frame::Padding, pos)),
             TYPE_PING => Ok((Frame::Ping, pos)),
             TYPE_RESET_STREAM => {
-                let (stream_id, n) = VarInt::decode(&input[pos..])?;
+                let (stream_id, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
-                let (error_code, n) = VarInt::decode(&input[pos..])?;
+                let (error_code, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
-                let (final_size, n) = VarInt::decode(&input[pos..])?;
+                let (final_size, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 Ok((
                     Frame::ResetStream {
@@ -54,9 +55,9 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                 ))
             }
             TYPE_STOP_SENDING => {
-                let (stream_id, n) = VarInt::decode(&input[pos..])?;
+                let (stream_id, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
-                let (error_code, n) = VarInt::decode(&input[pos..])?;
+                let (error_code, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 Ok((
                     Frame::StopSending {
@@ -67,14 +68,14 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                 ))
             }
             TYPE_MAX_DATA => {
-                let (maximum_data, n) = VarInt::decode(&input[pos..])?;
+                let (maximum_data, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 Ok((Frame::MaxData { maximum_data }, pos))
             }
             TYPE_MAX_STREAM_DATA => {
-                let (stream_id, n) = VarInt::decode(&input[pos..])?;
+                let (stream_id, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
-                let (maximum_stream_data, n) = VarInt::decode(&input[pos..])?;
+                let (maximum_stream_data, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 Ok((
                     Frame::MaxStreamData {
@@ -85,14 +86,14 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                 ))
             }
             TYPE_DATA_BLOCKED => {
-                let (maximum_data, n) = VarInt::decode(&input[pos..])?;
+                let (maximum_data, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 Ok((Frame::DataBlocked { maximum_data }, pos))
             }
             TYPE_STREAM_DATA_BLOCKED => {
-                let (stream_id, n) = VarInt::decode(&input[pos..])?;
+                let (stream_id, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
-                let (maximum_stream_data, n) = VarInt::decode(&input[pos..])?;
+                let (maximum_stream_data, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 Ok((
                     Frame::StreamDataBlocked {
@@ -103,7 +104,7 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                 ))
             }
             TYPE_MAX_STREAMS_BIDI | TYPE_MAX_STREAMS_UNI => {
-                let (max_streams, n) = VarInt::decode(&input[pos..])?;
+                let (max_streams, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 Ok((
                     Frame::MaxStreams {
@@ -114,7 +115,7 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                 ))
             }
             TYPE_STREAMS_BLOCKED_BIDI | TYPE_STREAMS_BLOCKED_UNI => {
-                let (max_streams, n) = VarInt::decode(&input[pos..])?;
+                let (max_streams, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 Ok((
                     Frame::StreamsBlocked {
@@ -128,17 +129,17 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                 let has_off = t & STREAM_FLAG_OFF != 0;
                 let has_len = t & STREAM_FLAG_LEN != 0;
                 let fin = t & STREAM_FLAG_FIN != 0;
-                let (stream_id, n) = VarInt::decode(&input[pos..])?;
+                let (stream_id, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 let offset = if has_off {
-                    let (o, n) = VarInt::decode(&input[pos..])?;
+                    let (o, n) = varint::VarInt::decode(&input[pos..])?;
                     pos += n;
                     o
                 } else {
-                    VarInt::ZERO
+                    varint::VarInt::ZERO
                 };
                 let data = if has_len {
-                    let (length, n) = VarInt::decode(&input[pos..])?;
+                    let (length, n) = varint::VarInt::decode(&input[pos..])?;
                     pos += n;
                     let end = data_end(input, pos, length)?;
                     let d = data(&input[pos..end]);
@@ -161,18 +162,18 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                 ))
             }
             TYPE_ACK | TYPE_ACK_ECN => {
-                let (largest, n) = VarInt::decode(&input[pos..])?;
+                let (largest, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
-                let (delay, n) = VarInt::decode(&input[pos..])?;
+                let (delay, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
-                let (range_count, n) = VarInt::decode(&input[pos..])?;
+                let (range_count, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 let range_count = usize::try_from(range_count.get())
                     .map_err(|_| error::Decode::InvalidAckRange)?;
                 if range_count > MAX_ADDITIONAL_ACK_RANGES {
                     return Err(error::Decode::InvalidAckRange);
                 }
-                let (first_range, n) = VarInt::decode(&input[pos..])?;
+                let (first_range, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 let mut previous_smallest = largest
                     .get()
@@ -184,9 +185,9 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                 }
                 let ranges_start = pos;
                 for _ in 0..range_count {
-                    let (gap, n) = VarInt::decode(&input[pos..])?;
+                    let (gap, n) = varint::VarInt::decode(&input[pos..])?;
                     pos += n;
-                    let (range_len, n) = VarInt::decode(&input[pos..])?;
+                    let (range_len, n) = varint::VarInt::decode(&input[pos..])?;
                     pos += n;
                     let skip = gap
                         .get()
@@ -202,7 +203,7 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                 let additional_ranges = ranges(&input[ranges_start..pos], range_count);
                 if ty == TYPE_ACK_ECN {
                     for _ in 0..3 {
-                        let (_, n) = VarInt::decode(&input[pos..])?;
+                        let (_, n) = varint::VarInt::decode(&input[pos..])?;
                         pos += n;
                     }
                 }
@@ -217,9 +218,9 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                 ))
             }
             TYPE_CRYPTO => {
-                let (offset, n) = VarInt::decode(&input[pos..])?;
+                let (offset, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
-                let (length, n) = VarInt::decode(&input[pos..])?;
+                let (length, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 let end = data_end(input, pos, length)?;
                 let data = data(&input[pos..end]);
@@ -237,7 +238,7 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                 ))
             }
             TYPE_DATAGRAM_LEN => {
-                let (length, n) = VarInt::decode(&input[pos..])?;
+                let (length, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 let end = data_end(input, pos, length)?;
                 let data = data(&input[pos..end]);
@@ -252,9 +253,9 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
             }
             TYPE_HANDSHAKE_DONE => Ok((Frame::HandshakeDone, pos)),
             TYPE_NEW_CONNECTION_ID => {
-                let (sequence_number, n) = VarInt::decode(&input[pos..])?;
+                let (sequence_number, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
-                let (retire_prior_to, n) = VarInt::decode(&input[pos..])?;
+                let (retire_prior_to, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 if input.len() <= pos {
                     return Err(error::Decode::Underflow);
@@ -280,7 +281,7 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
                 ))
             }
             TYPE_RETIRE_CONNECTION_ID => {
-                let (sequence_number, n) = VarInt::decode(&input[pos..])?;
+                let (sequence_number, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 Ok((Frame::RetireConnectionId { sequence_number }, pos))
             }
@@ -300,16 +301,16 @@ impl<'a, DataMap, RangeMap> Decoder<'a, DataMap, RangeMap> {
             }
             TYPE_CONNECTION_CLOSE | TYPE_CONNECTION_CLOSE_APP => {
                 let is_application = ty == TYPE_CONNECTION_CLOSE_APP;
-                let (error_code, n) = VarInt::decode(&input[pos..])?;
+                let (error_code, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 let frame_type = if is_application {
-                    VarInt::ZERO
+                    varint::VarInt::ZERO
                 } else {
-                    let (ft, n) = VarInt::decode(&input[pos..])?;
+                    let (ft, n) = varint::VarInt::decode(&input[pos..])?;
                     pos += n;
                     ft
                 };
-                let (reason_len, n) = VarInt::decode(&input[pos..])?;
+                let (reason_len, n) = varint::VarInt::decode(&input[pos..])?;
                 pos += n;
                 let end = data_end(input, pos, reason_len)?;
                 let reason = data(&input[pos..end]);

@@ -1,8 +1,6 @@
-use super::{
-    Epoch, Error,
-    delivery::{Crypto, Handle},
-};
-use shin::connection::{OutboundFlight, OutboundLayout};
+use crate::conn;
+use crate::conn::delivery;
+use shin::connection;
 use std::mem;
 
 const NONE: u32 = u32::MAX;
@@ -41,8 +39,8 @@ enum Status {
 }
 
 struct Entry {
-    epoch: Epoch,
-    record: Crypto,
+    epoch: conn::Epoch,
+    record: delivery::Crypto,
     status: Status,
     ready_next: u32,
     flight: Links,
@@ -120,8 +118,8 @@ impl Space {
 
 /// Borrowed CRYPTO range selected from one immutable epoch byte store.
 pub(super) struct Selection<'a> {
-    pub(super) record: Crypto,
-    pub(super) handle: Option<Handle<Crypto>>,
+    pub(super) record: delivery::Crypto,
+    pub(super) handle: Option<delivery::Handle<delivery::Crypto>>,
     pub(super) data: &'a [u8],
 }
 
@@ -141,7 +139,7 @@ pub(super) struct Tx {
 }
 
 impl Tx {
-    pub(super) fn new(limit: usize, layout: OutboundLayout) -> Self {
+    pub(super) fn new(limit: usize, layout: connection::OutboundLayout) -> Self {
         let limit = limit.min((u32::MAX - 1) as usize);
         // Application flights begin only after Initial is discarded, so one
         // allocation covers the larger lifetime-disjoint epoch.
@@ -160,7 +158,10 @@ impl Tx {
         }
     }
 
-    pub(super) fn begin(&mut self, epoch: Epoch) -> Result<OutboundFlight<'_>, Error> {
+    pub(super) fn begin(
+        &mut self,
+        epoch: conn::Epoch,
+    ) -> Result<connection::OutboundFlight<'_>, conn::Error> {
         let space = &mut self.spaces[epoch as usize];
         if space.bytes.is_empty()
             && space.bytes.capacity() < space.limit
@@ -172,11 +173,12 @@ impl Tx {
         let maximum = space
             .limit
             .checked_sub(space.bytes.len())
-            .ok_or(Error::EventCapacity)?;
-        OutboundFlight::from_reserved(&mut space.bytes, maximum).ok_or(Error::EventCapacity)
+            .ok_or(conn::Error::EventCapacity)?;
+        connection::OutboundFlight::from_reserved(&mut space.bytes, maximum)
+            .ok_or(conn::Error::EventCapacity)
     }
 
-    pub(super) fn append(&mut self, epoch: Epoch, data: &[u8]) -> Result<(), Error> {
+    pub(super) fn append(&mut self, epoch: conn::Epoch, data: &[u8]) -> Result<(), conn::Error> {
         let space = &mut self.spaces[epoch as usize];
         if space.bytes.is_empty()
             && space.bytes.capacity() < space.limit
@@ -190,15 +192,15 @@ impl Tx {
             .len()
             .checked_add(data.len())
             .filter(|end| *end <= space.limit)
-            .ok_or(Error::EventCapacity)?;
+            .ok_or(conn::Error::EventCapacity)?;
         if end > space.bytes.capacity() {
-            return Err(Error::EventCapacity);
+            return Err(conn::Error::EventCapacity);
         }
         space.bytes.extend_from_slice(data);
         Ok(())
     }
 
-    pub(super) fn has_sendable(&self, epoch: Epoch) -> bool {
+    pub(super) fn has_sendable(&self, epoch: conn::Epoch) -> bool {
         let space = &self.spaces[epoch as usize];
         space.ready != NONE
             || space
@@ -210,7 +212,7 @@ impl Tx {
         self.len.saturating_add(needed) <= self.limit
     }
 
-    pub(super) fn peek(&self, epoch: Epoch) -> Option<Crypto> {
+    pub(super) fn peek(&self, epoch: conn::Epoch) -> Option<delivery::Crypto> {
         let space = &self.spaces[epoch as usize];
         if space.ready != NONE {
             return self.slots[space.ready as usize]
@@ -219,13 +221,13 @@ impl Tx {
                 .map(|entry| entry.record);
         }
         let len = usize::try_from(space.end_offset()?.checked_sub(space.next_unsent)?).ok()?;
-        (len != 0).then_some(Crypto {
+        (len != 0).then_some(delivery::Crypto {
             offset: space.next_unsent,
             len,
         })
     }
 
-    pub(super) fn select(&self, epoch: Epoch, max_len: usize) -> Option<Selection<'_>> {
+    pub(super) fn select(&self, epoch: conn::Epoch, max_len: usize) -> Option<Selection<'_>> {
         if max_len == 0 {
             return None;
         }
@@ -245,13 +247,13 @@ impl Tx {
         let start = space.index(offset)?;
         let end = start.checked_add(len)?;
         Some(Selection {
-            record: Crypto { offset, len },
+            record: delivery::Crypto { offset, len },
             handle,
             data: space.bytes.get(start..end)?,
         })
     }
 
-    pub(super) fn select_probe(&self, epoch: Epoch, max_len: usize) -> Option<Selection<'_>> {
+    pub(super) fn select_probe(&self, epoch: conn::Epoch, max_len: usize) -> Option<Selection<'_>> {
         let space = &self.spaces[epoch as usize];
         let current = space.probe_cursor;
         if current == NONE {
@@ -273,10 +275,10 @@ impl Tx {
 
     pub(super) fn commit(
         &mut self,
-        epoch: Epoch,
-        record: Crypto,
-        selected: Option<Handle<Crypto>>,
-    ) -> Option<Handle<Crypto>> {
+        epoch: conn::Epoch,
+        record: delivery::Crypto,
+        selected: Option<delivery::Handle<delivery::Crypto>>,
+    ) -> Option<delivery::Handle<delivery::Crypto>> {
         if record.len == 0 {
             return None;
         }
@@ -297,7 +299,7 @@ impl Tx {
                     }
                     self.unlink_ready(index);
                     if record.len < original_len {
-                        let remainder = Crypto {
+                        let remainder = delivery::Crypto {
                             offset: record.offset.checked_add(u64::try_from(record.len).ok()?)?,
                             len: original_len - record.len,
                         };
@@ -345,7 +347,7 @@ impl Tx {
         self.handle(index)
     }
 
-    pub(super) fn acknowledge(&mut self, handle: Handle<Crypto>) -> bool {
+    pub(super) fn acknowledge(&mut self, handle: delivery::Handle<delivery::Crypto>) -> bool {
         let index = handle.index();
         let Some(entry) = self.resolve(handle) else {
             return false;
@@ -360,7 +362,7 @@ impl Tx {
         true
     }
 
-    pub(super) fn lose(&mut self, handle: Handle<Crypto>) {
+    pub(super) fn lose(&mut self, handle: delivery::Handle<delivery::Crypto>) {
         let index = handle.index();
         let Some(entry) = self.resolve(handle) else {
             return;
@@ -382,24 +384,24 @@ impl Tx {
         self.link_ready(index);
     }
 
-    pub(super) fn arm_probes(&mut self, epoch: Epoch) {
+    pub(super) fn arm_probes(&mut self, epoch: conn::Epoch) {
         let space = &mut self.spaces[epoch as usize];
         space.probe_cursor = space.in_flight.head;
     }
 
-    pub(super) fn discard(&mut self, epoch: Epoch) {
+    pub(super) fn discard(&mut self, epoch: conn::Epoch) {
         self.clear_epoch(epoch, true);
     }
 
     pub(super) fn retry_initial(&mut self) {
-        self.clear_epoch(Epoch::Initial, false);
+        self.clear_epoch(conn::Epoch::Initial, false);
     }
 
-    pub(super) fn bytes(&self, epoch: Epoch) -> &[u8] {
+    pub(super) fn bytes(&self, epoch: conn::Epoch) -> &[u8] {
         &self.spaces[epoch as usize].bytes
     }
 
-    fn clear_epoch(&mut self, epoch: Epoch, clear_bytes: bool) {
+    fn clear_epoch(&mut self, epoch: conn::Epoch, clear_bytes: bool) {
         let space = &mut self.spaces[epoch as usize];
         space.ready = NONE;
         space.in_flight = Chain::EMPTY;
@@ -432,9 +434,9 @@ impl Tx {
     fn insert_queued_after(
         &mut self,
         previous: usize,
-        epoch: Epoch,
-        record: Crypto,
-    ) -> Option<Handle<Crypto>> {
+        epoch: conn::Epoch,
+        record: delivery::Crypto,
+    ) -> Option<delivery::Handle<delivery::Crypto>> {
         let index = self.allocate()?;
         self.slots[index].entry = Some(Entry {
             epoch,
@@ -450,7 +452,7 @@ impl Tx {
         self.handle(index)
     }
 
-    fn reclaim(&mut self, epoch: Epoch) {
+    fn reclaim(&mut self, epoch: conn::Epoch) {
         loop {
             let index = self.spaces[epoch as usize].order.head;
             if index == NONE {
@@ -471,7 +473,7 @@ impl Tx {
             };
             self.unlink_order_head(index);
             self.remove_unlinked(index);
-            if epoch != Epoch::Initial {
+            if epoch != conn::Epoch::Initial {
                 self.spaces[epoch as usize].reclaim_to(offset);
             }
         }
@@ -516,11 +518,11 @@ impl Tx {
         true
     }
 
-    fn handle(&self, index: usize) -> Option<Handle<Crypto>> {
-        Handle::new(index, self.slots.get(index)?.generation)
+    fn handle(&self, index: usize) -> Option<delivery::Handle<delivery::Crypto>> {
+        delivery::Handle::new(index, self.slots.get(index)?.generation)
     }
 
-    fn resolve(&self, handle: Handle<Crypto>) -> Option<&Entry> {
+    fn resolve(&self, handle: delivery::Handle<delivery::Crypto>) -> Option<&Entry> {
         let slot = self.slots.get(handle.index())?;
         (slot.generation == handle.generation())
             .then_some(slot.entry.as_ref())

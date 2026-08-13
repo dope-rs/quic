@@ -1,6 +1,8 @@
-use std::ops::Range;
+use std::ops;
 
-use crate::stream::{ReadyBuffer, ReceiveBuffer, RecvBuffer};
+use crate::stream;
+use crate::stream::ReadyBuffer as _;
+use crate::stream::ReceiveBuffer as _;
 
 pub(crate) const MAX_RANGES: usize = 256;
 const NONE: u32 = u32::MAX;
@@ -62,15 +64,15 @@ impl<T> InsertData<T> {
     }
 }
 
-struct InsertContext<'a, B: ReceiveBuffer> {
+struct InsertContext<'a, B: stream::ReceiveBuffer> {
     arena: &'a mut Arena<B>,
-    parts: &'a mut Vec<(u64, Range<usize>)>,
+    parts: &'a mut Vec<(u64, ops::Range<usize>)>,
     limits: InsertLimits,
 }
 
 fn collect_missing(
-    parts: &mut Vec<(u64, Range<usize>)>,
-    segments: impl IntoIterator<Item = Result<Range<u64>, InsertError>>,
+    parts: &mut Vec<(u64, ops::Range<usize>)>,
+    segments: impl IntoIterator<Item = Result<ops::Range<u64>, InsertError>>,
     offset: u64,
     end: u64,
     data_len: usize,
@@ -122,7 +124,7 @@ struct Node<B> {
 /// A stream owns only an intrusive head index. Retained packet owners remain
 /// in their natural `B` values, while metadata slots move between streams
 /// without allocation.
-pub struct Arena<B: ReceiveBuffer> {
+pub struct Arena<B: stream::ReceiveBuffer> {
     nodes: Vec<Node<B>>,
     free: u32,
     live: usize,
@@ -130,7 +132,7 @@ pub struct Arena<B: ReceiveBuffer> {
 }
 
 #[derive(Debug)]
-pub(crate) struct Store<B: ReceiveBuffer> {
+pub(crate) struct Store<B: stream::ReceiveBuffer> {
     next: u64,
     buffered: usize,
     head: u32,
@@ -142,11 +144,11 @@ pub(crate) struct Store<B: ReceiveBuffer> {
 /// before any driver-owned range escapes its dispatch turn.
 pub(crate) struct Plan<'a> {
     next: u64,
-    segments: &'a mut Vec<Range<u64>>,
-    parts: &'a mut Vec<(u64, Range<usize>)>,
+    segments: &'a mut Vec<ops::Range<u64>>,
+    parts: &'a mut Vec<(u64, ops::Range<usize>)>,
 }
 
-impl<B: ReceiveBuffer> Arena<B> {
+impl<B: stream::ReceiveBuffer> Arena<B> {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             nodes: Vec::with_capacity(capacity),
@@ -272,7 +274,7 @@ impl ReadySegments {
         self.segments
     }
 
-    pub(crate) fn push_back<B: ReceiveBuffer>(
+    pub(crate) fn push_back<B: stream::ReceiveBuffer>(
         &mut self,
         arena: &mut Arena<B>,
         bytes: B,
@@ -280,16 +282,19 @@ impl ReadySegments {
         arena.ready_push_back(self, bytes)
     }
 
-    pub(crate) fn pop_front<B: ReceiveBuffer>(&mut self, arena: &mut Arena<B>) -> Option<B> {
+    pub(crate) fn pop_front<B: stream::ReceiveBuffer>(
+        &mut self,
+        arena: &mut Arena<B>,
+    ) -> Option<B> {
         arena.ready_pop_front(self)
     }
 
-    pub(crate) fn clear<B: ReceiveBuffer>(&mut self, arena: &mut Arena<B>) {
+    pub(crate) fn clear<B: stream::ReceiveBuffer>(&mut self, arena: &mut Arena<B>) {
         arena.ready_clear(self);
     }
 }
 
-impl<B: ReceiveBuffer> Default for Store<B> {
+impl<B: stream::ReceiveBuffer> Default for Store<B> {
     fn default() -> Self {
         Self {
             next: 0,
@@ -301,12 +306,12 @@ impl<B: ReceiveBuffer> Default for Store<B> {
     }
 }
 
-impl<B: ReceiveBuffer> Store<B> {
+impl<B: stream::ReceiveBuffer> Store<B> {
     pub(crate) fn plan<'a>(
         &self,
         arena: &Arena<B>,
-        segments: &'a mut Vec<Range<u64>>,
-        parts: &'a mut Vec<(u64, Range<usize>)>,
+        segments: &'a mut Vec<ops::Range<u64>>,
+        parts: &'a mut Vec<(u64, ops::Range<usize>)>,
     ) -> Plan<'a> {
         segments.clear();
         let mut current = self.head;
@@ -353,7 +358,7 @@ impl<B: ReceiveBuffer> Store<B> {
     pub(crate) fn insert_and_drain_into(
         &mut self,
         arena: &mut Arena<B>,
-        parts: &mut Vec<(u64, Range<usize>)>,
+        parts: &mut Vec<(u64, ops::Range<usize>)>,
         offset: u64,
         data: B,
         limits: InsertLimits,
@@ -385,7 +390,7 @@ impl<B: ReceiveBuffer> Store<B> {
         data: B,
         limits: InsertLimits,
         arena: &mut Arena<B>,
-        parts: &mut Vec<(u64, Range<usize>)>,
+        parts: &mut Vec<(u64, ops::Range<usize>)>,
     ) -> Result<(), InsertError> {
         let len = data.as_ref().len();
         self.insert_with(
@@ -404,8 +409,8 @@ impl<B: ReceiveBuffer> Store<B> {
         &mut self,
         data: InsertData<T>,
         context: InsertContext<'_, B>,
-        mut slice: impl FnMut(&T, Range<usize>) -> B,
-        take: impl FnOnce(T, Range<usize>) -> B,
+        mut slice: impl FnMut(&T, ops::Range<usize>) -> B,
+        take: impl FnOnce(T, ops::Range<usize>) -> B,
     ) -> Result<(), InsertError> {
         let InsertData {
             source,
@@ -576,8 +581,8 @@ impl<B: ReceiveBuffer> Store<B> {
 
 impl Plan<'_> {
     pub(crate) fn empty<'a>(
-        segments: &'a mut Vec<Range<u64>>,
-        parts: &'a mut Vec<(u64, Range<usize>)>,
+        segments: &'a mut Vec<ops::Range<u64>>,
+        parts: &'a mut Vec<(u64, ops::Range<usize>)>,
     ) -> Plan<'a> {
         segments.clear();
         parts.clear();
@@ -601,7 +606,7 @@ impl Plan<'_> {
         offset: u64,
         len: usize,
         max_ranges: usize,
-        mut observe: impl FnMut(Range<usize>) -> Result<(), E>,
+        mut observe: impl FnMut(ops::Range<usize>) -> Result<(), E>,
     ) -> Result<usize, E>
     where
         E: From<InsertError>,
@@ -698,7 +703,7 @@ impl Store<Vec<u8>> {
         data: &[u8],
         limits: InsertLimits,
         arena: &mut Arena<Vec<u8>>,
-        parts: &mut Vec<(u64, Range<usize>)>,
+        parts: &mut Vec<(u64, ops::Range<usize>)>,
     ) -> Result<(), InsertError> {
         let len = data.len();
         self.insert_with(
@@ -716,7 +721,7 @@ impl Store<Vec<u8>> {
     pub(crate) fn insert_copy_and_drain_into(
         &mut self,
         arena: &mut Arena<Vec<u8>>,
-        parts: &mut Vec<(u64, Range<usize>)>,
+        parts: &mut Vec<(u64, ops::Range<usize>)>,
         offset: u64,
         data: &[u8],
         limits: InsertLimits,
@@ -759,13 +764,13 @@ impl Store<Vec<u8>> {
     }
 }
 
-impl<'d> Store<RecvBuffer<'d>> {
+impl<'d> Store<stream::RecvBuffer<'d>> {
     pub(crate) fn insert_retained_and_drain_into(
         &mut self,
-        arena: &mut Arena<RecvBuffer<'d>>,
-        parts: &mut Vec<(u64, Range<usize>)>,
+        arena: &mut Arena<stream::RecvBuffer<'d>>,
+        parts: &mut Vec<(u64, ops::Range<usize>)>,
         offset: u64,
-        data: RecvBuffer<'d>,
+        data: stream::RecvBuffer<'d>,
         limits: InsertLimits,
         output: &mut ReadySegments,
     ) -> Result<(), InsertError> {
@@ -794,8 +799,8 @@ impl<'d> Store<RecvBuffer<'d>> {
     /// `data` is the concatenation of its accepted parts in range order.
     pub(crate) fn insert_compact_and_drain_into(
         &mut self,
-        arena: &mut Arena<RecvBuffer<'d>>,
-        parts: &mut Vec<(u64, Range<usize>)>,
+        arena: &mut Arena<stream::RecvBuffer<'d>>,
+        parts: &mut Vec<(u64, ops::Range<usize>)>,
         data: InsertData<o3::buffer::storage::Shared>,
         limits: InsertLimits,
         output: &mut ReadySegments,
@@ -818,7 +823,7 @@ impl<'d> Store<RecvBuffer<'d>> {
                 return Err(InsertError::BufferFull);
             }
             output
-                .push_back(arena, RecvBuffer::compact(data))
+                .push_back(arena, stream::RecvBuffer::compact(data))
                 .map_err(|_| InsertError::BufferFull)?;
             self.next = end;
         } else {
@@ -836,7 +841,7 @@ impl<'d> Store<RecvBuffer<'d>> {
                     let start = cursor.get();
                     let end = start + range.len();
                     cursor.set(end);
-                    RecvBuffer::compact(
+                    stream::RecvBuffer::compact(
                         data.get(start..end)
                             .expect("the receive plan bounded every compact part"),
                     )
@@ -849,7 +854,7 @@ impl<'d> Store<RecvBuffer<'d>> {
                     if start != 0 {
                         assert!(data.try_advance(start));
                     }
-                    RecvBuffer::compact(data)
+                    stream::RecvBuffer::compact(data)
                 },
             )?;
             debug_assert_eq!(cursor.get(), compact_len);
@@ -863,7 +868,7 @@ impl<'d> Store<RecvBuffer<'d>> {
 
     fn drain_contiguous_into_ready(
         &mut self,
-        arena: &mut Arena<RecvBuffer<'d>>,
+        arena: &mut Arena<stream::RecvBuffer<'d>>,
         output: &mut ReadySegments,
     ) -> Result<(), InsertError> {
         while self.head != NONE {

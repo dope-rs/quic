@@ -1,14 +1,16 @@
-use std::hash::{BuildHasher as _, RandomState};
+use std::hash;
+use std::hash::BuildHasher as _;
 
-use crate::conn::{Handle, path::StatelessResetToken};
+use crate::conn;
+use crate::conn::path;
 
 const BUCKET_WIDTH: usize = 4;
 const BUCKETS_PER_CONNECTION: usize = 4;
 
 #[derive(Clone, Copy)]
 struct Record {
-    token: StatelessResetToken,
-    handle: Handle,
+    token: path::StatelessResetToken,
+    handle: conn::Handle,
 }
 
 #[derive(Default)]
@@ -23,8 +25,8 @@ struct Bucket {
 /// instead of probing farther or growing storage on the packet path.
 pub(super) struct ResetIndex {
     buckets: Box<[Bucket]>,
-    first: RandomState,
-    second: RandomState,
+    first: hash::RandomState,
+    second: hash::RandomState,
     len: usize,
 }
 
@@ -39,13 +41,17 @@ impl ResetIndex {
             buckets: std::iter::repeat_with(Bucket::default)
                 .take(bucket_count)
                 .collect(),
-            first: RandomState::new(),
-            second: RandomState::new(),
+            first: hash::RandomState::new(),
+            second: hash::RandomState::new(),
             len: 0,
         }
     }
 
-    pub(super) fn insert(&mut self, token: StatelessResetToken, handle: Handle) -> bool {
+    pub(super) fn insert(
+        &mut self,
+        token: path::StatelessResetToken,
+        handle: conn::Handle,
+    ) -> bool {
         let [first, second] = self.bucket_indices(token);
         for bucket in [first, second] {
             if let Some(record) = self.buckets[bucket]
@@ -74,7 +80,7 @@ impl ResetIndex {
         true
     }
 
-    pub(super) fn get(&self, token: StatelessResetToken) -> Option<Handle> {
+    pub(super) fn get(&self, token: path::StatelessResetToken) -> Option<conn::Handle> {
         let [first, second] = self.bucket_indices(token);
         [first, second].into_iter().find_map(|bucket| {
             self.buckets[bucket]
@@ -86,7 +92,11 @@ impl ResetIndex {
         })
     }
 
-    pub(super) fn remove(&mut self, token: StatelessResetToken, handle: Handle) -> bool {
+    pub(super) fn remove(
+        &mut self,
+        token: path::StatelessResetToken,
+        handle: conn::Handle,
+    ) -> bool {
         let [first, second] = self.bucket_indices(token);
         for bucket in [first, second] {
             let Some(record) = self.buckets[bucket].records.iter_mut().find(|record| {
@@ -113,7 +123,7 @@ impl ResetIndex {
             .count()
     }
 
-    fn bucket_indices(&self, token: StatelessResetToken) -> [usize; 2] {
+    fn bucket_indices(&self, token: path::StatelessResetToken) -> [usize; 2] {
         let mask = self.buckets.len() - 1;
         let first = self.first.hash_one(token) as usize & mask;
         let mut second = self.second.hash_one(token) as usize & mask;

@@ -1,31 +1,33 @@
-use std::mem::take;
-use std::ops::{Deref, DerefMut};
+use std::mem;
+use std::ops;
 
 pub(in crate::conn) mod ack;
 pub(super) mod application;
 pub(in crate::conn) mod crypto;
 
-use crate::frame::{Frame, TYPE_PING};
-use crate::packet::{LONG_HANDSHAKE, LONG_INITIAL, LongHeader, QUIC_V1};
-use crate::stream::{ReceiveBuffer, Sender};
-use crate::varint::VarInt;
+use crate::frame;
 
-use crate::conn::{
-    Connection, Epoch, MIN_INITIAL_LEN, PACKET_CONTROL_CAPACITY, PACKET_STREAM_CAPACITY, PN_LEN,
-    TAG_LEN, commit, control, delivery, packet,
-};
+use crate::stream;
 
+use crate::conn;
+use crate::conn::commit;
+use crate::conn::control;
+use crate::conn::delivery;
+use crate::conn::packet;
+
+use crate::conn::transmit::builder::application::one_rtt::BuildOneRtt as _;
+use crate::conn::transmit::builder::application::zero_rtt::BuildZeroRtt as _;
+use crate::conn::transmit::builder::crypto::Crypto as _;
 use ack::Ack as _;
-use application::one_rtt::BuildOneRtt;
-use application::zero_rtt::BuildZeroRtt;
-use crypto::Crypto;
 
-pub(in crate::conn) struct Builder<'a, const DOMAIN: u8, B: ReceiveBuffer> {
-    connection: &'a mut Connection<DOMAIN, B>,
+pub(in crate::conn) struct Builder<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> {
+    connection: &'a mut crate::conn::session::Connection<DOMAIN, B>,
 }
 
-impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
-    pub(in crate::conn) fn new(connection: &'a mut Connection<DOMAIN, B>) -> Self {
+impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
+    pub(in crate::conn) fn new(
+        connection: &'a mut crate::conn::session::Connection<DOMAIN, B>,
+    ) -> Self {
         Self { connection }
     }
 
@@ -42,11 +44,11 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
     }
 
     fn long_payload_limit(fixed_header: usize, max_packet_bytes: usize) -> usize {
-        let mut payload = max_packet_bytes.saturating_sub(fixed_header + TAG_LEN + 1);
+        let mut payload = max_packet_bytes.saturating_sub(fixed_header + conn::TAG_LEN + 1);
         loop {
-            let length = PN_LEN as usize + payload + TAG_LEN;
-            let next =
-                max_packet_bytes.saturating_sub(fixed_header + TAG_LEN + Self::varint_len(length));
+            let length = conn::PN_LEN as usize + payload + conn::TAG_LEN;
+            let next = max_packet_bytes
+                .saturating_sub(fixed_header + conn::TAG_LEN + Self::varint_len(length));
             if next >= payload {
                 return payload;
             }
@@ -77,7 +79,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
             + local_cid_len
             + Self::varint_len(token_len)
             + token_len
-            + PN_LEN as usize;
+            + conn::PN_LEN as usize;
         Self::long_payload_limit(fixed_header, max_packet_bytes)
     }
 
@@ -88,16 +90,17 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
             + self.connection.path.peer_cid().len()
             + 1
             + self.connection.path.local_cid().len()
-            + PN_LEN as usize;
+            + conn::PN_LEN as usize;
         Self::long_payload_limit(fixed_header, max_packet_bytes)
     }
 
     fn short_payload_limit(&self, max_packet_bytes: usize) -> usize {
-        max_packet_bytes
-            .saturating_sub(1 + self.connection.path.peer_cid().len() + PN_LEN as usize + TAG_LEN)
+        max_packet_bytes.saturating_sub(
+            1 + self.connection.path.peer_cid().len() + conn::PN_LEN as usize + conn::TAG_LEN,
+        )
     }
 
-    fn append_frame(out: &mut Vec<u8>, limit: usize, frame: &Frame) -> bool {
+    fn append_frame(out: &mut Vec<u8>, limit: usize, frame: &frame::Frame) -> bool {
         let start = out.len();
         if frame.encode(out).is_ok() && out.len() <= limit {
             true
@@ -113,21 +116,22 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
         stream_id: u64,
         offset: u64,
         fin: bool,
-        stream: &Sender,
+        stream: &stream::Sender,
         len: usize,
     ) -> bool {
         let start = out.len();
         let Ok(len_u64) = u64::try_from(len) else {
             return false;
         };
-        let Some(stream_id) = VarInt::new(stream_id) else {
+        let Some(stream_id) = crate::varint::VarInt::new(stream_id) else {
             return false;
         };
-        let Some(wire_offset) = VarInt::new(offset) else {
+        let Some(wire_offset) = crate::varint::VarInt::new(offset) else {
             return false;
         };
         if stream.range_available(offset, len_u64)
-            && Frame::encode_stream_header(out, stream_id, wire_offset, fin, Some(len)).is_ok()
+            && frame::Frame::encode_stream_header(out, stream_id, wire_offset, fin, Some(len))
+                .is_ok()
             && out.len().saturating_add(len) <= limit
             && (len == 0 || stream.append_range(out, offset, len))
         {
@@ -139,16 +143,15 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
     }
 
     fn can_track_packet(&self) -> bool {
-        let pn = self.connection.egress.spaces[Epoch::Application as usize].next_pn;
+        let pn = self.connection.egress.spaces[conn::Epoch::Application as usize].next_pn;
         self.connection
             .egress
             .packet_journals
-            .has_room_for(Epoch::Application, pn, 2)
-            && self
-                .connection
-                .egress
-                .packet_journals
-                .has_carrier_room(PACKET_CONTROL_CAPACITY * 2, PACKET_STREAM_CAPACITY * 2)
+            .has_room_for(conn::Epoch::Application, pn, 2)
+            && self.connection.egress.packet_journals.has_carrier_room(
+                conn::PACKET_CONTROL_CAPACITY * 2,
+                conn::PACKET_STREAM_CAPACITY * 2,
+            )
             && self.connection.handshake.crypto().has_room(2)
             && (self.connection.streams.transmit.deliveries.has_retransmit()
                 || self
@@ -156,21 +159,21 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
                     .streams
                     .transmit
                     .deliveries
-                    .has_room(PACKET_STREAM_CAPACITY * 2))
+                    .has_room(conn::PACKET_STREAM_CAPACITY * 2))
     }
 
-    fn can_track_probe(&self, epoch: Epoch) -> bool {
+    fn can_track_probe(&self, epoch: conn::Epoch) -> bool {
         let pn = self.connection.egress.spaces[epoch as usize].next_pn;
         self.connection
             .egress
             .packet_journals
             .has_room_for(epoch, pn, 1)
-            && (epoch != Epoch::Application
+            && (epoch != conn::Epoch::Application
                 || self
                     .connection
                     .egress
                     .packet_journals
-                    .has_carrier_room(PACKET_CONTROL_CAPACITY, PACKET_STREAM_CAPACITY))
+                    .has_carrier_room(conn::PACKET_CONTROL_CAPACITY, conn::PACKET_STREAM_CAPACITY))
     }
 
     fn append_pending_controls<const MASK: u16, Out>(
@@ -181,7 +184,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
         commit: &mut commit::Packet,
         mut cursor: control::cursor::Cursor<'_, MASK>,
     ) where
-        Out: Deref<Target = Vec<u8>> + DerefMut,
+        Out: ops::Deref<Target = Vec<u8>> + ops::DerefMut,
     {
         while !commit.controls.is_full() {
             let Some((handle, record)) = cursor.next() else {
@@ -205,7 +208,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
         limit: usize,
         commit: &mut commit::Packet,
     ) where
-        Out: Deref<Target = Vec<u8>> + DerefMut,
+        Out: ops::Deref<Target = Vec<u8>> + ops::DerefMut,
     {
         for (handle, record) in records {
             if commit.controls.is_full() {
@@ -231,64 +234,63 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
             return None;
         }
         match epoch {
-            Epoch::Initial | Epoch::Handshake => self.build_crypto_packet(
+            conn::Epoch::Initial | conn::Epoch::Handshake => self.build_crypto_packet(
                 dst,
                 max_packet_bytes,
                 self.connection.egress.pto_probe_epoch?,
                 packet::CryptoMode::PtoProbe,
             ),
-            Epoch::Application
+            conn::Epoch::Application
                 if self
                     .connection
                     .handshake
-                    .write_key(Epoch::Application)
+                    .write_key(conn::Epoch::Application)
                     .is_some() =>
             {
                 application::Application::new(self.connection)
                     .build_one_rtt::<true>(dst, max_packet_bytes)
             }
-            Epoch::Application => application::Application::new(self.connection).build_zero_rtt(
-                dst,
-                max_packet_bytes,
-                true,
-            ),
+            conn::Epoch::Application => application::Application::new(self.connection)
+                .build_zero_rtt(dst, max_packet_bytes, true),
         }
     }
 
     fn seal_crypto_packet(
         &mut self,
         dst: &mut Vec<u8>,
-        epoch: Epoch,
+        epoch: conn::Epoch,
         pn: u64,
         frames: &[u8],
     ) -> Option<usize> {
         let packet_type = match epoch {
-            Epoch::Initial => LONG_INITIAL,
-            Epoch::Handshake => LONG_HANDSHAKE,
-            Epoch::Application => return None,
+            conn::Epoch::Initial => crate::packet::LONG_INITIAL,
+            conn::Epoch::Handshake => crate::packet::LONG_HANDSHAKE,
+            conn::Epoch::Application => return None,
         };
-        let mut header = take(&mut self.connection.scratch_header);
+        let mut header = mem::take(&mut self.connection.scratch_header);
         header.clear();
         let token =
-            (epoch == Epoch::Initial).then_some(self.connection.path.retry_token.as_slice());
-        let result = LongHeader {
-            version: QUIC_V1,
+            (epoch == conn::Epoch::Initial).then_some(self.connection.path.retry_token.as_slice());
+        let result = crate::packet::LongHeader {
+            version: crate::packet::QUIC_V1,
             packet_type,
             dcid: self.connection.path.peer_cid(),
             scid: self.connection.path.local_cid(),
             token,
             packet_number: pn,
-            packet_number_len: PN_LEN,
+            packet_number_len: conn::PN_LEN,
         }
-        .encode_into(&mut header, frames.len() + TAG_LEN)
+        .encode_into(&mut header, frames.len() + conn::TAG_LEN)
         .ok()
         .and_then(|pn_offset| {
             let protection = match epoch {
-                Epoch::Initial | Epoch::Handshake => self.connection.handshake.write_key(epoch),
-                Epoch::Application => None,
+                conn::Epoch::Initial | conn::Epoch::Handshake => {
+                    self.connection.handshake.write_key(epoch)
+                }
+                conn::Epoch::Application => None,
             }?;
             protection
-                .encrypt_long_into(dst, &header, frames, pn, pn_offset, PN_LEN as usize)
+                .encrypt_long_into(dst, &header, frames, pn, pn_offset, conn::PN_LEN as usize)
                 .ok()
         });
         header.clear();
@@ -300,28 +302,30 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
         &mut self,
         dst: &mut Vec<u8>,
         max_packet_bytes: usize,
-        epoch: Epoch,
+        epoch: conn::Epoch,
         mode: packet::CryptoMode,
     ) -> Option<(usize, commit::Packet)> {
-        if epoch == Epoch::Application
-            || epoch == Epoch::Initial
+        if epoch == conn::Epoch::Application
+            || epoch == conn::Epoch::Initial
                 && self.connection.is_client
-                && max_packet_bytes < MIN_INITIAL_LEN
+                && max_packet_bytes < crate::conn::MIN_INITIAL_LEN
         {
             return None;
         }
         match epoch {
-            Epoch::Initial | Epoch::Handshake => self.connection.handshake.write_key(epoch)?,
-            Epoch::Application => return None,
+            conn::Epoch::Initial | conn::Epoch::Handshake => {
+                self.connection.handshake.write_key(epoch)?
+            }
+            conn::Epoch::Application => return None,
         };
         let payload_limit = match epoch {
-            Epoch::Initial => self.initial_payload_limit(max_packet_bytes),
-            Epoch::Handshake => self.handshake_payload_limit(max_packet_bytes),
-            Epoch::Application => return None,
+            conn::Epoch::Initial => self.initial_payload_limit(max_packet_bytes),
+            conn::Epoch::Handshake => self.handshake_payload_limit(max_packet_bytes),
+            conn::Epoch::Application => return None,
         };
         let pn = self.connection.egress.spaces[epoch as usize].next_pn;
 
-        let mut frames = take(&mut self.connection.scratch_frames);
+        let mut frames = mem::take(&mut self.connection.scratch_frames);
         frames.clear();
         let ack_included = self.append_ack_frame(epoch, &mut frames, payload_limit);
         let frame_room = payload_limit.saturating_sub(frames.len());
@@ -336,17 +340,17 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
                     && self.connection.handshake.crypto().has_room(2)
                 {
                     let chunk = match epoch {
-                        Epoch::Initial => Self::peek_crypto_chunk(
+                        conn::Epoch::Initial => Self::peek_crypto_chunk(
                             self.connection.handshake.crypto(),
-                            Epoch::Initial,
+                            conn::Epoch::Initial,
                             frame_room,
                         ),
-                        Epoch::Handshake => Self::peek_crypto_chunk(
+                        conn::Epoch::Handshake => Self::peek_crypto_chunk(
                             self.connection.handshake.crypto(),
-                            Epoch::Handshake,
+                            conn::Epoch::Handshake,
                             frame_room,
                         ),
-                        Epoch::Application => None,
+                        conn::Epoch::Application => None,
                     };
                     if let Some((record, data)) = chunk
                         && Self::encode_crypto(&mut frames, record.record.offset, data)
@@ -361,7 +365,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
                 {
                     crypto = Some(delivery);
                 } else {
-                    frames.push(TYPE_PING);
+                    frames.push(crate::frame::TYPE_PING);
                 }
             }
         }
@@ -371,7 +375,10 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Builder<'a, DOMAIN, B> {
             return None;
         }
 
-        if epoch == Epoch::Initial && self.connection.is_client && frames.len() < payload_limit {
+        if epoch == conn::Epoch::Initial
+            && self.connection.is_client
+            && frames.len() < payload_limit
+        {
             frames.resize(payload_limit, 0);
         }
         let sealed = self.seal_crypto_packet(dst, epoch, pn, &frames);

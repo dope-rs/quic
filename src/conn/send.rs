@@ -1,12 +1,13 @@
-use std::mem::size_of;
-use std::ops::{Deref, DerefMut};
+use std::mem;
+use std::ops;
 
-use crate::stream::Sender;
-use crate::varint::VarInt;
+use crate::stream;
+use crate::varint;
 
 use super::streams::table;
-use super::{STREAM_SCHEDULE_WORK_LIMIT, control, stream_journal};
+use crate::conn::control;
 use crate::conn::control::Write as _;
+use crate::conn::stream_journal;
 
 pub(super) struct Side;
 
@@ -29,7 +30,7 @@ pub(super) struct Credit<Kind> {
 
 impl<Kind> Credit<Kind> {
     pub(super) fn new(limit: u64) -> Self {
-        debug_assert!(limit <= VarInt::MAX);
+        debug_assert!(limit <= varint::VarInt::MAX);
         Self {
             limit,
             blocked: None,
@@ -42,12 +43,12 @@ impl<Kind> Credit<Kind> {
 
     pub(super) fn initialize(&mut self, limit: u64) {
         debug_assert!(self.blocked.is_none());
-        debug_assert!(limit <= VarInt::MAX);
+        debug_assert!(limit <= varint::VarInt::MAX);
         self.limit = limit;
     }
 
     pub(super) fn raise<C: control::Write>(&mut self, limit: u64, control: &mut C) {
-        debug_assert!(limit <= VarInt::MAX);
+        debug_assert!(limit <= varint::VarInt::MAX);
         if limit <= self.limit() {
             return;
         }
@@ -69,7 +70,7 @@ impl<Kind> Credit<Kind> {
 }
 
 pub(super) struct Entry {
-    pub(super) stream: Sender,
+    pub(super) stream: stream::Sender,
     pub(super) credit: Credit<control::kind::StreamDataBlocked>,
     pub(super) delivery_group: Option<stream_journal::GroupId>,
     pub(super) reset_stream: control::Signal<control::kind::ResetStream>,
@@ -78,7 +79,7 @@ pub(super) struct Entry {
 impl Entry {
     fn new(credit: u64) -> Self {
         Self {
-            stream: Sender::default(),
+            stream: stream::Sender::default(),
             credit: Credit::new(credit),
             delivery_group: None,
             reset_stream: control::Signal::new(),
@@ -125,15 +126,15 @@ impl table::Reusable for Entry {
     }
 }
 
-impl Deref for Entry {
-    type Target = Sender;
+impl ops::Deref for Entry {
+    type Target = stream::Sender;
 
     fn deref(&self) -> &Self::Target {
         &self.stream
     }
 }
 
-impl DerefMut for Entry {
+impl ops::DerefMut for Entry {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.stream
     }
@@ -273,7 +274,7 @@ impl Schedule {
         mut control_work: usize,
     ) {
         out.clear();
-        let work = self.len.min(STREAM_SCHEDULE_WORK_LIMIT);
+        let work = self.len.min(crate::conn::STREAM_SCHEDULE_WORK_LIMIT);
         let mut current = self.cursor.or(self.head);
         for _ in 0..work {
             let handle = current.expect("nonempty ready schedule retains its cursor");
@@ -341,8 +342,11 @@ impl Iterator for Iter<'_> {
     }
 }
 
-const _: () =
-    assert!(size_of::<Credit<control::kind::StreamDataBlocked>>() == 2 * size_of::<u64>());
-const _: () = assert!(size_of::<Entry>() == size_of::<Sender>() + 4 * size_of::<u64>());
-const _: () = assert!(size_of::<Handle>() == size_of::<u64>());
-const _: () = assert!(size_of::<Option<Handle>>() == size_of::<u64>());
+const _: () = assert!(
+    mem::size_of::<Credit<control::kind::StreamDataBlocked>>() == 2 * mem::size_of::<u64>()
+);
+const _: () = assert!(
+    mem::size_of::<Entry>() == mem::size_of::<stream::Sender>() + 4 * mem::size_of::<u64>()
+);
+const _: () = assert!(mem::size_of::<Handle>() == mem::size_of::<u64>());
+const _: () = assert!(mem::size_of::<Option<Handle>>() == mem::size_of::<u64>());

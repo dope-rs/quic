@@ -1,44 +1,43 @@
-use crate::conn::{
-    Epoch,
-    delivery::{Control, Handle},
-};
+use crate::conn;
+use crate::conn::delivery;
 
-use super::linkage::Linkage;
-use super::records::Records;
-use super::{Effect, NONE, Pending, Status, kind_bit};
+use crate::conn::control;
+use crate::conn::control::linkage::Linkage as _;
+use crate::conn::control::records::Records as _;
 
 pub(in crate::conn) struct Delivery<'a> {
-    pending: &'a mut Pending,
+    pending: &'a mut control::Pending,
 }
 
 impl<'a> Delivery<'a> {
-    pub(in crate::conn) fn new(pending: &'a mut Pending) -> Self {
+    pub(in crate::conn) fn new(pending: &'a mut control::Pending) -> Self {
         Self { pending }
     }
 
     pub(in crate::conn) fn commit(
         &mut self,
-        epoch: Epoch,
-        record: Control,
-        selected: Handle<Control>,
-    ) -> Option<Handle<Control>> {
+        epoch: conn::Epoch,
+        record: delivery::Control,
+        selected: delivery::Handle<delivery::Control>,
+    ) -> Option<delivery::Handle<delivery::Control>> {
         let index = selected.index();
         let entry = self.pending.resolve(selected)?;
         match entry.status {
-            Status::Queued if entry.record == record => {
-                if kind_bit(record) != 0 {
+            control::Status::Queued if entry.record == record => {
+                if control::kind_bit(record) != 0 {
                     self.pending.unlink_ready(index);
                 }
                 let probe_round = self.pending.probe_round[epoch as usize];
-                self.pending.slots[index].entry.as_mut().unwrap().status = Status::InFlight {
-                    epoch,
-                    carriers: 1,
-                    probe_round,
-                };
+                self.pending.slots[index].entry.as_mut().unwrap().status =
+                    control::Status::InFlight {
+                        epoch,
+                        carriers: 1,
+                        probe_round,
+                    };
                 self.pending.link_flight(index, epoch);
                 Some(selected)
             }
-            Status::InFlight {
+            control::Status::InFlight {
                 epoch: delivery_epoch,
                 carriers,
                 ..
@@ -47,7 +46,7 @@ impl<'a> Delivery<'a> {
                 let next = entry.flight.next;
                 let round = self.pending.probe_round[epoch as usize];
                 let entry = self.pending.slots[index].entry.as_mut().unwrap();
-                entry.status = Status::InFlight {
+                entry.status = control::Status::InFlight {
                     epoch,
                     carriers,
                     probe_round: round,
@@ -55,41 +54,44 @@ impl<'a> Delivery<'a> {
                 self.pending.probe_cursor[epoch as usize] = next;
                 Some(selected)
             }
-            Status::Queued | Status::InFlight { .. } => None,
+            control::Status::Queued | control::Status::InFlight { .. } => None,
         }
     }
 
-    pub(in crate::conn) fn acknowledge(&mut self, handle: Handle<Control>) -> Effect {
+    pub(in crate::conn) fn acknowledge(
+        &mut self,
+        handle: delivery::Handle<delivery::Control>,
+    ) -> control::Effect {
         let index = handle.index();
         let Some(entry) = self.pending.resolve(handle) else {
-            return Effect::None;
+            return control::Effect::None;
         };
-        if !matches!(entry.status, Status::InFlight { .. }) {
-            return Effect::None;
+        if !matches!(entry.status, control::Status::InFlight { .. }) {
+            return control::Effect::None;
         }
         let record = entry.record;
         match record {
-            Control::DataBlocked(_) | Control::StreamDataBlocked(_, _) => {
+            delivery::Control::DataBlocked(_) | delivery::Control::StreamDataBlocked(_, _) => {
                 self.pending.remove(index);
-                Effect::None
+                control::Effect::None
             }
-            Control::ResetStream(stream_id, _, _) => {
+            delivery::Control::ResetStream(stream_id, _, _) => {
                 self.pending.remove(index);
-                Effect::RetireStream(stream_id)
+                control::Effect::RetireStream(stream_id)
             }
             _ => {
                 self.pending.remove(index);
-                Effect::None
+                control::Effect::None
             }
         }
     }
 
-    pub(in crate::conn) fn lose(&mut self, handle: Handle<Control>) {
+    pub(in crate::conn) fn lose(&mut self, handle: delivery::Handle<delivery::Control>) {
         let index = handle.index();
         let Some(entry) = self.pending.resolve(handle) else {
             return;
         };
-        let Status::InFlight {
+        let control::Status::InFlight {
             epoch,
             carriers,
             probe_round,
@@ -98,7 +100,7 @@ impl<'a> Delivery<'a> {
             return;
         };
         if carriers > 1 {
-            self.pending.slots[index].entry.as_mut().unwrap().status = Status::InFlight {
+            self.pending.slots[index].entry.as_mut().unwrap().status = control::Status::InFlight {
                 epoch,
                 carriers: carriers - 1,
                 probe_round,
@@ -110,10 +112,10 @@ impl<'a> Delivery<'a> {
         }
         self.pending.unlink_flight(index);
         let entry = self.pending.slots[index].entry.as_mut().unwrap();
-        entry.status = Status::Queued;
-        entry.flight.prev = NONE;
-        entry.flight.next = NONE;
-        if kind_bit(entry.record) != 0 {
+        entry.status = control::Status::Queued;
+        entry.flight.prev = crate::conn::control::NONE;
+        entry.flight.next = crate::conn::control::NONE;
+        if control::kind_bit(entry.record) != 0 {
             self.pending.link_ready(index);
         }
     }

@@ -1,40 +1,50 @@
-use std::net::SocketAddr;
-use std::time::Instant;
+use std::net;
+use std::time;
 
-use crate::clock::WallClock;
-use crate::conn::path::StatelessResetToken;
-use crate::conn::{self, Error};
-use crate::packet::{
-    ConnectionId, InitialHeader, MAX_CONNECTION_ID_LEN, QUIC_V1, RETRY_INTEGRITY_TAG_LEN, Retry,
-};
-use crate::secrets::{RetryTokenSecret, StatelessResetSecret};
-use crate::stream::ReceiveBuffer;
+use crate::conn;
+use crate::packet;
+
+use crate::stream;
 
 use super::{CidOps as _, DeadlineOps as _, SlotOps as _};
+use crate::mux;
 use crate::mux::drive::OutputOps as _;
-use crate::mux::{Handler, MAX_CIDS_PER_CONN, ROUTED_CID_LEN, RetryGate, Router};
 
 pub(in crate::mux) trait ResetOps {
     fn maybe_handle_retry_gating(
         &mut self,
-        from: SocketAddr,
+        from: net::SocketAddr,
         data: &[u8],
-    ) -> Result<RetryGate, Error>;
-    fn emit_stateless_reset(&mut self, from: SocketAddr, trigger: &[u8]) -> bool;
-    fn receive_stateless_reset(&mut self, from: SocketAddr, datagram: &[u8], now: Instant) -> bool;
-    fn gen_cid(&mut self, prefix: Option<u8>) -> Option<ConnectionId>;
+    ) -> Result<mux::RetryGate, conn::Error>;
+    fn emit_stateless_reset(&mut self, from: net::SocketAddr, trigger: &[u8]) -> bool;
+    fn receive_stateless_reset(
+        &mut self,
+        from: net::SocketAddr,
+        datagram: &[u8],
+        now: time::Instant,
+    ) -> bool;
+    fn gen_cid(&mut self, prefix: Option<u8>) -> Option<packet::ConnectionId>;
 }
 
-impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    ResetOps for Router<'tls, H, P, DOMAIN, B>
+impl<
+    'tls,
+    H: mux::Handler<DOMAIN, B>,
+    P: conn::server::Policy,
+    const DOMAIN: u8,
+    B: stream::ReceiveBuffer,
+> ResetOps for mux::Router<'tls, H, P, DOMAIN, B>
 {
     fn maybe_handle_retry_gating(
         &mut self,
-        from: SocketAddr,
+        from: net::SocketAddr,
         data: &[u8],
-    ) -> Result<RetryGate, Error> {
+    ) -> Result<mux::RetryGate, conn::Error> {
         let (require_address_validation, retry_token_secret, cid_prefix, configured_ceiling) = {
-            let server_config = &self.server.as_ref().ok_or(Error::HeaderDecode)?.config;
+            let server_config = &self
+                .server
+                .as_ref()
+                .ok_or(conn::Error::HeaderDecode)?
+                .config;
             (
                 server_config.require_address_validation,
                 server_config.retry_token_secret,
@@ -43,72 +53,78 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
             )
         };
         if !require_address_validation {
-            return Ok(RetryGate::Accept(None));
+            return Ok(mux::RetryGate::Accept(None));
         }
         let secret = match retry_token_secret {
-            Some(secret) => RetryTokenSecret(secret),
-            None => return Ok(RetryGate::Accept(None)),
+            Some(secret) => crate::secrets::RetryTokenSecret(secret),
+            None => return Ok(mux::RetryGate::Accept(None)),
         };
-        let prefix = InitialHeader::decode_pre_hp(data).map_err(|_| Error::HeaderDecode)?;
+        let prefix = crate::packet::InitialHeader::decode_pre_hp(data)
+            .map_err(|_| conn::Error::HeaderDecode)?;
         if prefix.token.is_empty() {
-            let now_secs = WallClock::now().unix_seconds();
+            let now_secs = crate::clock::WallClock::now().unix_seconds();
             let expiry = now_secs.saturating_add(10);
             let Some(new_scid) = self.gen_cid(cid_prefix) else {
-                return Ok(RetryGate::Drop);
+                return Ok(mux::RetryGate::Drop);
             };
             let packet_ceiling = configured_ceiling
                 .min(self.outgoing.bytes_capacity)
                 .min(data.len().saturating_mul(3));
-            let encoded_len = Retry::prefix_len(prefix.scid, new_scid.as_ref_id())
-                + RetryTokenSecret::encoded_len(prefix.dcid)
-                + RETRY_INTEGRITY_TAG_LEN;
+            let encoded_len = crate::packet::Retry::prefix_len(prefix.scid, new_scid.as_ref_id())
+                + crate::secrets::RetryTokenSecret::encoded_len(prefix.dcid)
+                + crate::packet::RETRY_INTEGRITY_TAG_LEN;
             if !self.packet_fits(encoded_len, packet_ceiling) {
-                return Ok(RetryGate::Drop);
+                return Ok(mux::RetryGate::Drop);
             }
             let pseudo_len = 1 + prefix.dcid.len();
             let Some(mut storage) = self.take_packet_buffer(pseudo_len + encoded_len) else {
-                return Ok(RetryGate::Drop);
+                return Ok(mux::RetryGate::Drop);
             };
             storage.push(prefix.dcid.len() as u8);
             storage.extend_from_slice(prefix.dcid.as_slice());
-            Retry::encode_prefix_into(&mut storage, QUIC_V1, prefix.scid, new_scid.as_ref_id());
+            crate::packet::Retry::encode_prefix_into(
+                &mut storage,
+                crate::packet::QUIC_V1,
+                prefix.scid,
+                new_scid.as_ref_id(),
+            );
             secret.issue_into(&mut storage, &from, prefix.dcid, expiry);
-            let Ok(integrity_tag) = Retry::tag_from_aad(&storage) else {
+            let Ok(integrity_tag) = crate::packet::Retry::tag_from_aad(&storage) else {
                 self.recycle_packet(storage);
-                return Ok(RetryGate::Drop);
+                return Ok(mux::RetryGate::Drop);
             };
             storage.extend_from_slice(&integrity_tag);
             let packet = match dope::manifold::datagram::OwnedSuffix::new(storage, pseudo_len) {
                 Ok(packet) => packet,
                 Err(storage) => {
                     self.recycle_packet(storage);
-                    return Ok(RetryGate::Drop);
+                    return Ok(mux::RetryGate::Drop);
                 }
             };
             return Ok(
                 if self.push_or_recycle(crate::mux::Outgoing::Suffix(from, packet)) {
-                    RetryGate::IssuedRetry
+                    mux::RetryGate::IssuedRetry
                 } else {
-                    RetryGate::Drop
+                    mux::RetryGate::Drop
                 },
             );
         }
-        let now_secs = WallClock::now().unix_seconds();
+        let now_secs = crate::clock::WallClock::now().unix_seconds();
         match secret.validate(&from, prefix.token, now_secs) {
-            None => Ok(RetryGate::Drop),
-            Some(odcid) => Ok(RetryGate::Accept(Some(odcid))),
+            None => Ok(mux::RetryGate::Drop),
+            Some(odcid) => Ok(mux::RetryGate::Accept(Some(odcid))),
         }
     }
 
-    fn emit_stateless_reset(&mut self, from: SocketAddr, trigger: &[u8]) -> bool {
+    fn emit_stateless_reset(&mut self, from: net::SocketAddr, trigger: &[u8]) -> bool {
         let Some(server_config) = self.server.as_ref().map(|server| &server.config) else {
             return false;
         };
         let Some(reset_secret) = server_config.stateless_reset_secret else {
             return false;
         };
-        let secret = StatelessResetSecret(reset_secret);
-        let Some(dcid) = crate::mux::setup::dcid(trigger, ROUTED_CID_LEN) else {
+        let secret = crate::secrets::StatelessResetSecret(reset_secret);
+        let Some(dcid) = crate::mux::setup::dcid(trigger, mux::ROUTED_CID_LEN) else {
             return false;
         };
         if trigger.len() < 23 {
@@ -134,8 +150,13 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
         self.push_or_recycle(crate::mux::Outgoing::Plain(from, reset))
     }
 
-    fn receive_stateless_reset(&mut self, from: SocketAddr, datagram: &[u8], now: Instant) -> bool {
-        let Some(token) = StatelessResetToken::from_datagram(datagram) else {
+    fn receive_stateless_reset(
+        &mut self,
+        from: net::SocketAddr,
+        datagram: &[u8],
+        now: time::Instant,
+    ) -> bool {
+        let Some(token) = crate::conn::path::StatelessResetToken::from_datagram(datagram) else {
             return false;
         };
         let Some(handle) = self.registry.indexes.reset.get(token) else {
@@ -155,25 +176,25 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
         true
     }
 
-    fn gen_cid(&mut self, prefix: Option<u8>) -> Option<ConnectionId> {
+    fn gen_cid(&mut self, prefix: Option<u8>) -> Option<packet::ConnectionId> {
         let attempts = self
             .registry
             .active_conns
-            .saturating_mul(MAX_CIDS_PER_CONN)
+            .saturating_mul(crate::mux::MAX_CIDS_PER_CONN)
             .saturating_add(1);
         for _ in 0..attempts {
             self.registry.indexes.cid_counter = self.registry.indexes.cid_counter.wrapping_add(1);
             let sequence = self.registry.indexes.cid_counter.to_le_bytes();
-            let mut out = [0; MAX_CONNECTION_ID_LEN];
+            let mut out = [0; crate::packet::MAX_CONNECTION_ID_LEN];
             let prefix_len = usize::from(prefix.is_some());
-            for index in 0..ROUTED_CID_LEN {
+            for index in 0..mux::ROUTED_CID_LEN {
                 out[index] =
                     sequence[(index.saturating_sub(prefix_len)) % sequence.len()] ^ index as u8;
             }
             if let Some(prefix) = prefix {
                 out[0] = prefix;
             }
-            let cid = ConnectionId::new(&out[..ROUTED_CID_LEN])
+            let cid = packet::ConnectionId::new(&out[..mux::ROUTED_CID_LEN])
                 .expect("the mux CID width is protocol-valid");
             if self.find_cid(cid.as_slice()).is_none() {
                 return Some(cid);

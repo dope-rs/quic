@@ -4,8 +4,8 @@ use shin::client;
 use crate::conn;
 use crate::errors;
 use crate::transport_params;
-use std::ops::{Deref, DerefMut};
-use std::time::Instant;
+use std::ops;
+use std::time;
 
 pub type ServerPool<
     V = shin::server::config::NoClientAuth,
@@ -123,7 +123,7 @@ impl<'pool, const DOMAIN: u8, B: crate::stream::ReceiveBuffer> Connection<'pool,
         &mut self,
         workspace: &mut conn::ReceiveWorkspace,
         wire: &mut [u8],
-        now: Instant,
+        now: time::Instant,
     ) -> Result<(), conn::Error> {
         conn::ingress::Ingress::new(&mut self.conn, workspace).recv_client_pooled(
             wire,
@@ -142,7 +142,7 @@ impl<'pool, const DOMAIN: u8, B: crate::stream::ReceiveBuffer> Connection<'pool,
     }
 }
 
-impl<const DOMAIN: u8, B: crate::stream::ReceiveBuffer> Deref for Connection<'_, DOMAIN, B> {
+impl<const DOMAIN: u8, B: crate::stream::ReceiveBuffer> ops::Deref for Connection<'_, DOMAIN, B> {
     type Target = conn::session::Connection<DOMAIN, B>;
 
     fn deref(&self) -> &Self::Target {
@@ -150,7 +150,9 @@ impl<const DOMAIN: u8, B: crate::stream::ReceiveBuffer> Deref for Connection<'_,
     }
 }
 
-impl<const DOMAIN: u8, B: crate::stream::ReceiveBuffer> DerefMut for Connection<'_, DOMAIN, B> {
+impl<const DOMAIN: u8, B: crate::stream::ReceiveBuffer> ops::DerefMut
+    for Connection<'_, DOMAIN, B>
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.conn
     }
@@ -189,7 +191,7 @@ where
         &mut self,
         workspace: &mut conn::ReceiveWorkspace,
         wire: &mut [u8],
-        now: Instant,
+        now: time::Instant,
     ) -> Result<(), conn::Error> {
         let result = match self.tls.as_mut() {
             Some(tls) => conn::ingress::Ingress::new(&mut self.conn, workspace)
@@ -203,7 +205,7 @@ where
     }
 }
 
-impl<G, V, const DOMAIN: u8, B: crate::stream::ReceiveBuffer> Deref
+impl<G, V, const DOMAIN: u8, B: crate::stream::ReceiveBuffer> ops::Deref
     for ServerConnection<'_, G, V, DOMAIN, B>
 where
     G: shin::server::config::EarlyDataGuard,
@@ -216,7 +218,7 @@ where
     }
 }
 
-impl<G, V, const DOMAIN: u8, B: crate::stream::ReceiveBuffer> DerefMut
+impl<G, V, const DOMAIN: u8, B: crate::stream::ReceiveBuffer> ops::DerefMut
     for ServerConnection<'_, G, V, DOMAIN, B>
 where
     G: shin::server::config::EarlyDataGuard,

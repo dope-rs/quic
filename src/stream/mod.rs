@@ -1,16 +1,14 @@
-use std::mem::size_of;
-use std::ops::Range;
+use std::mem;
+use std::ops;
 
-use o3::buffer::{
-    CapacityError,
-    bytes::{Bytes, Retained},
-    queue::Cursor,
-    storage::{self, inline},
-};
+use o3::buffer::bytes;
+use o3::buffer::queue;
+use o3::buffer::storage;
+use o3::buffer::storage::inline;
 
-use crate::range_buffer::{Arena, InsertError, MAX_RANGES, ReadySegments, Store};
+use crate::range_buffer;
 
-const MAX_RECV_SEGMENTS: usize = MAX_RANGES;
+const MAX_RECV_SEGMENTS: usize = range_buffer::MAX_RANGES;
 
 mod buffer;
 
@@ -25,8 +23,8 @@ pub trait ReceiveBuffer: buffer::Buffer + AsRef<[u8]> + Sized {
     #[doc(hidden)]
     fn insert_copied(
         stream: &mut Receiver<Self>,
-        arena: &mut Arena<Self>,
-        parts: &mut Vec<(u64, Range<usize>)>,
+        arena: &mut range_buffer::Arena<Self>,
+        parts: &mut Vec<(u64, ops::Range<usize>)>,
         offset: u64,
         bytes: &[u8],
         fin: bool,
@@ -36,8 +34,8 @@ pub trait ReceiveBuffer: buffer::Buffer + AsRef<[u8]> + Sized {
     fn from_vec(bytes: Vec<u8>) -> Self {
         Self::copy_from_slice(&bytes)
     }
-    fn slice(&self, range: Range<usize>) -> Self;
-    fn into_range(self, range: Range<usize>) -> Self {
+    fn slice(&self, range: ops::Range<usize>) -> Self;
+    fn into_range(self, range: ops::Range<usize>) -> Self {
         self.slice(range)
     }
     fn into_suffix(self, offset: usize) -> Self;
@@ -50,16 +48,17 @@ pub trait ReceiveBuffer: buffer::Buffer + AsRef<[u8]> + Sized {
 /// [`ReceiveBuffer`]. Applications should consume data through stream APIs.
 #[doc(hidden)]
 pub trait ReadyBuffer<B: ReceiveBuffer>: Default {
-    fn clear(&mut self, arena: &mut Arena<B>);
+    fn clear(&mut self, arena: &mut range_buffer::Arena<B>);
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
     fn segment_count(&self) -> usize;
-    fn try_push_back(&mut self, arena: &mut Arena<B>, buffer: B) -> Result<(), B>;
-    fn read_into(&mut self, arena: &mut Arena<B>, destination: &mut Vec<u8>) -> usize;
-    fn read_owned(&mut self, arena: &mut Arena<B>) -> Option<Vec<u8>>;
-    fn pop_front(&mut self, arena: &mut Arena<B>) -> Option<B>;
+    fn try_push_back(&mut self, arena: &mut range_buffer::Arena<B>, buffer: B) -> Result<(), B>;
+    fn read_into(&mut self, arena: &mut range_buffer::Arena<B>, destination: &mut Vec<u8>)
+    -> usize;
+    fn read_owned(&mut self, arena: &mut range_buffer::Arena<B>) -> Option<Vec<u8>>;
+    fn pop_front(&mut self, arena: &mut range_buffer::Arena<B>) -> Option<B>;
 }
 
 impl buffer::Buffer for Vec<u8> {}
@@ -74,8 +73,8 @@ impl ReceiveBuffer for Vec<u8> {
 
     fn insert_copied(
         stream: &mut Receiver<Self>,
-        arena: &mut Arena<Self>,
-        parts: &mut Vec<(u64, Range<usize>)>,
+        arena: &mut range_buffer::Arena<Self>,
+        parts: &mut Vec<(u64, ops::Range<usize>)>,
         offset: u64,
         bytes: &[u8],
         fin: bool,
@@ -87,11 +86,11 @@ impl ReceiveBuffer for Vec<u8> {
         bytes
     }
 
-    fn slice(&self, range: Range<usize>) -> Self {
+    fn slice(&self, range: ops::Range<usize>) -> Self {
         self[range].to_vec()
     }
 
-    fn into_range(mut self, range: Range<usize>) -> Self {
+    fn into_range(mut self, range: ops::Range<usize>) -> Self {
         self.truncate(range.end);
         self.into_suffix(range.start)
     }
@@ -110,7 +109,7 @@ impl ReceiveBuffer for Vec<u8> {
 }
 
 impl ReadyBuffer<Vec<u8>> for Vec<u8> {
-    fn clear(&mut self, _arena: &mut Arena<Vec<u8>>) {
+    fn clear(&mut self, _arena: &mut range_buffer::Arena<Vec<u8>>) {
         Vec::clear(self);
     }
 
@@ -124,7 +123,7 @@ impl ReadyBuffer<Vec<u8>> for Vec<u8> {
 
     fn try_push_back(
         &mut self,
-        _arena: &mut Arena<Vec<u8>>,
+        _arena: &mut range_buffer::Arena<Vec<u8>>,
         mut buffer: Vec<u8>,
     ) -> Result<(), Vec<u8>> {
         if self.is_empty() {
@@ -135,7 +134,11 @@ impl ReadyBuffer<Vec<u8>> for Vec<u8> {
         Ok(())
     }
 
-    fn read_into(&mut self, _arena: &mut Arena<Vec<u8>>, destination: &mut Vec<u8>) -> usize {
+    fn read_into(
+        &mut self,
+        _arena: &mut range_buffer::Arena<Vec<u8>>,
+        destination: &mut Vec<u8>,
+    ) -> usize {
         let count = self.len();
         if destination.is_empty() {
             std::mem::swap(destination, self);
@@ -145,11 +148,11 @@ impl ReadyBuffer<Vec<u8>> for Vec<u8> {
         count
     }
 
-    fn read_owned(&mut self, _arena: &mut Arena<Vec<u8>>) -> Option<Vec<u8>> {
+    fn read_owned(&mut self, _arena: &mut range_buffer::Arena<Vec<u8>>) -> Option<Vec<u8>> {
         (!self.is_empty()).then(|| std::mem::take(self))
     }
 
-    fn pop_front(&mut self, arena: &mut Arena<Vec<u8>>) -> Option<Vec<u8>> {
+    fn pop_front(&mut self, arena: &mut range_buffer::Arena<Vec<u8>>) -> Option<Vec<u8>> {
         self.read_owned(arena)
     }
 }
@@ -230,7 +233,7 @@ impl AsRef<[u8]> for RecvBuffer<'_> {
 }
 
 impl<'d> ReceiveBuffer for RecvBuffer<'d> {
-    type Ready = ReadySegments;
+    type Ready = range_buffer::ReadySegments;
     const SEGMENTED_READY: bool = true;
 
     fn copy_from_slice(bytes: &[u8]) -> Self {
@@ -245,7 +248,7 @@ impl<'d> ReceiveBuffer for RecvBuffer<'d> {
         }
     }
 
-    fn slice(&self, range: Range<usize>) -> Self {
+    fn slice(&self, range: ops::Range<usize>) -> Self {
         match &self.storage {
             RecvStorage::Owned(bytes) => Self::from_vec(bytes[range].to_vec()),
             RecvStorage::Compact(bytes) => Self::compact(
@@ -261,7 +264,7 @@ impl<'d> ReceiveBuffer for RecvBuffer<'d> {
         }
     }
 
-    fn into_range(self, range: Range<usize>) -> Self {
+    fn into_range(self, range: ops::Range<usize>) -> Self {
         match self.storage {
             RecvStorage::Owned(mut bytes) => {
                 bytes.truncate(range.end);
@@ -327,30 +330,34 @@ impl<'d> ReceiveBuffer for RecvBuffer<'d> {
     }
 }
 
-const _: () = assert!(size_of::<RecvBuffer<'static>>() <= 5 * size_of::<usize>());
+const _: () = assert!(mem::size_of::<RecvBuffer<'static>>() <= 5 * mem::size_of::<usize>());
 
-impl<'d> ReadyBuffer<RecvBuffer<'d>> for ReadySegments {
-    fn clear(&mut self, arena: &mut Arena<RecvBuffer<'d>>) {
-        ReadySegments::clear(self, arena);
+impl<'d> ReadyBuffer<RecvBuffer<'d>> for range_buffer::ReadySegments {
+    fn clear(&mut self, arena: &mut range_buffer::Arena<RecvBuffer<'d>>) {
+        range_buffer::ReadySegments::clear(self, arena);
     }
 
     fn len(&self) -> usize {
-        ReadySegments::len(self)
+        range_buffer::ReadySegments::len(self)
     }
 
     fn segment_count(&self) -> usize {
-        ReadySegments::segment_count(self)
+        range_buffer::ReadySegments::segment_count(self)
     }
 
     fn try_push_back(
         &mut self,
-        arena: &mut Arena<RecvBuffer<'d>>,
+        arena: &mut range_buffer::Arena<RecvBuffer<'d>>,
         buffer: RecvBuffer<'d>,
     ) -> Result<(), RecvBuffer<'d>> {
-        ReadySegments::push_back(self, arena, buffer)
+        range_buffer::ReadySegments::push_back(self, arena, buffer)
     }
 
-    fn read_into(&mut self, arena: &mut Arena<RecvBuffer<'d>>, destination: &mut Vec<u8>) -> usize {
+    fn read_into(
+        &mut self,
+        arena: &mut range_buffer::Arena<RecvBuffer<'d>>,
+        destination: &mut Vec<u8>,
+    ) -> usize {
         let count = self.len();
         while let Some(segment) = self.pop_front(arena) {
             destination.extend_from_slice(segment.as_ref());
@@ -358,7 +365,7 @@ impl<'d> ReadyBuffer<RecvBuffer<'d>> for ReadySegments {
         count
     }
 
-    fn read_owned(&mut self, arena: &mut Arena<RecvBuffer<'d>>) -> Option<Vec<u8>> {
+    fn read_owned(&mut self, arena: &mut range_buffer::Arena<RecvBuffer<'d>>) -> Option<Vec<u8>> {
         if self.len() == 0 {
             return None;
         }
@@ -374,8 +381,11 @@ impl<'d> ReadyBuffer<RecvBuffer<'d>> for ReadySegments {
         Some(bytes)
     }
 
-    fn pop_front(&mut self, arena: &mut Arena<RecvBuffer<'d>>) -> Option<RecvBuffer<'d>> {
-        ReadySegments::pop_front(self, arena)
+    fn pop_front(
+        &mut self,
+        arena: &mut range_buffer::Arena<RecvBuffer<'d>>,
+    ) -> Option<RecvBuffer<'d>> {
+        range_buffer::ReadySegments::pop_front(self, arena)
     }
 }
 
@@ -443,11 +453,13 @@ impl_error!(RecvError {
     Self::OffsetOverflow => "stream offset overflow",
 });
 
-impl From<InsertError> for RecvError {
-    fn from(error: InsertError) -> Self {
+impl From<range_buffer::InsertError> for RecvError {
+    fn from(error: range_buffer::InsertError) -> Self {
         match error {
-            InsertError::TooManyRanges | InsertError::BufferFull => Self::TooManyRanges,
-            InsertError::OffsetOverflow => Self::OffsetOverflow,
+            range_buffer::InsertError::TooManyRanges | range_buffer::InsertError::BufferFull => {
+                Self::TooManyRanges
+            }
+            range_buffer::InsertError::OffsetOverflow => Self::OffsetOverflow,
         }
     }
 }
@@ -457,7 +469,7 @@ pub struct Receiver<B: ReceiveBuffer = Vec<u8>> {
     assembled: B::Ready,
     delivered_to: u64,
     highest_offset: u64,
-    gaps: Store<B>,
+    gaps: range_buffer::Store<B>,
     final_size: Option<u64>,
     reset_error: Option<u64>,
 }
@@ -468,7 +480,7 @@ impl<B: ReceiveBuffer> Default for Receiver<B> {
             assembled: B::Ready::default(),
             delivered_to: 0,
             highest_offset: 0,
-            gaps: Store::default(),
+            gaps: range_buffer::Store::default(),
             final_size: None,
             reset_error: None,
         }
@@ -478,9 +490,9 @@ impl<B: ReceiveBuffer> Default for Receiver<B> {
 impl<B: ReceiveBuffer> Receiver<B> {
     pub(crate) fn receive_plan<'a>(
         &self,
-        arena: &Arena<B>,
-        segments: &'a mut Vec<Range<u64>>,
-        parts: &'a mut Vec<(u64, Range<usize>)>,
+        arena: &range_buffer::Arena<B>,
+        segments: &'a mut Vec<ops::Range<u64>>,
+        parts: &'a mut Vec<(u64, ops::Range<usize>)>,
     ) -> crate::range_buffer::Plan<'a> {
         self.gaps.plan(arena, segments, parts)
     }
@@ -489,7 +501,7 @@ impl<B: ReceiveBuffer> Receiver<B> {
         self.gaps.range_count()
     }
 
-    pub(crate) fn release_ranges(&mut self, arena: &mut Arena<B>) {
+    pub(crate) fn release_ranges(&mut self, arena: &mut range_buffer::Arena<B>) {
         self.gaps.recycle(arena);
         self.assembled.clear(arena);
     }
@@ -509,8 +521,8 @@ impl<B: ReceiveBuffer> Receiver<B> {
 
     pub(crate) fn insert(
         &mut self,
-        arena: &mut Arena<B>,
-        parts: &mut Vec<(u64, Range<usize>)>,
+        arena: &mut range_buffer::Arena<B>,
+        parts: &mut Vec<(u64, ops::Range<usize>)>,
         offset: u64,
         data: B,
         fin: bool,
@@ -524,7 +536,7 @@ impl<B: ReceiveBuffer> Receiver<B> {
                 parts,
                 offset,
                 data,
-                crate::range_buffer::InsertLimits::new(usize::MAX, MAX_RANGES),
+                crate::range_buffer::InsertLimits::new(usize::MAX, range_buffer::MAX_RANGES),
                 &mut self.assembled,
             )
             .map_err(RecvError::from)?;
@@ -556,13 +568,13 @@ impl<B: ReceiveBuffer> Receiver<B> {
         Ok(())
     }
 
-    pub(crate) fn read(&mut self, arena: &mut Arena<B>, dst: &mut Vec<u8>) -> usize {
+    pub(crate) fn read(&mut self, arena: &mut range_buffer::Arena<B>, dst: &mut Vec<u8>) -> usize {
         let n = self.assembled.read_into(arena, dst);
         self.delivered_to += n as u64;
         n
     }
 
-    pub(crate) fn read_owned(&mut self, arena: &mut Arena<B>) -> Option<Vec<u8>> {
+    pub(crate) fn read_owned(&mut self, arena: &mut range_buffer::Arena<B>) -> Option<Vec<u8>> {
         let bytes = self.assembled.read_owned(arena)?;
         let n = bytes.len();
         self.delivered_to += n as u64;
@@ -570,7 +582,7 @@ impl<B: ReceiveBuffer> Receiver<B> {
     }
 
     /// Transfers one contiguous receive owner without copying.
-    pub(crate) fn read_buffer(&mut self, arena: &mut Arena<B>) -> Option<B> {
+    pub(crate) fn read_buffer(&mut self, arena: &mut range_buffer::Arena<B>) -> Option<B> {
         let segment = self.assembled.pop_front(arena)?;
         self.delivered_to += segment.as_ref().len() as u64;
         Some(segment)
@@ -600,8 +612,8 @@ impl<B: ReceiveBuffer> Receiver<B> {
 impl Receiver<Vec<u8>> {
     fn insert_copy(
         &mut self,
-        arena: &mut Arena<Vec<u8>>,
-        parts: &mut Vec<(u64, Range<usize>)>,
+        arena: &mut range_buffer::Arena<Vec<u8>>,
+        parts: &mut Vec<(u64, ops::Range<usize>)>,
         offset: u64,
         data: &[u8],
         fin: bool,
@@ -615,7 +627,7 @@ impl Receiver<Vec<u8>> {
                 parts,
                 offset,
                 data,
-                crate::range_buffer::InsertLimits::new(usize::MAX, MAX_RANGES),
+                crate::range_buffer::InsertLimits::new(usize::MAX, range_buffer::MAX_RANGES),
                 &mut self.assembled,
             )
             .map_err(RecvError::from)?;
@@ -630,8 +642,8 @@ impl Receiver<Vec<u8>> {
 impl<'d> Receiver<RecvBuffer<'d>> {
     pub(crate) fn insert_retained(
         &mut self,
-        arena: &mut Arena<RecvBuffer<'d>>,
-        parts: &mut Vec<(u64, Range<usize>)>,
+        arena: &mut range_buffer::Arena<RecvBuffer<'d>>,
+        parts: &mut Vec<(u64, ops::Range<usize>)>,
         offset: u64,
         data: RecvBuffer<'d>,
         fin: bool,
@@ -645,7 +657,7 @@ impl<'d> Receiver<RecvBuffer<'d>> {
                 parts,
                 offset,
                 data,
-                crate::range_buffer::InsertLimits::new(usize::MAX, MAX_RANGES),
+                crate::range_buffer::InsertLimits::new(usize::MAX, range_buffer::MAX_RANGES),
                 &mut self.assembled,
             )
             .map_err(RecvError::from)?;
@@ -658,8 +670,8 @@ impl<'d> Receiver<RecvBuffer<'d>> {
 
     pub(crate) fn insert_compact(
         &mut self,
-        arena: &mut Arena<RecvBuffer<'d>>,
-        parts: &mut Vec<(u64, Range<usize>)>,
+        arena: &mut range_buffer::Arena<RecvBuffer<'d>>,
+        parts: &mut Vec<(u64, ops::Range<usize>)>,
         offset: u64,
         original_len: usize,
         data: storage::Shared,
@@ -673,7 +685,7 @@ impl<'d> Receiver<RecvBuffer<'d>> {
                 arena,
                 parts,
                 crate::range_buffer::InsertData::new(offset, original_len, data),
-                crate::range_buffer::InsertLimits::new(usize::MAX, MAX_RANGES),
+                crate::range_buffer::InsertLimits::new(usize::MAX, range_buffer::MAX_RANGES),
                 &mut self.assembled,
             )
             .map_err(RecvError::from)?;
@@ -689,11 +701,11 @@ impl<'d> Receiver<RecvBuffer<'d>> {
 pub enum SendBuffer {
     Inline(inline::Bytes),
     Owned(Vec<u8>),
-    Retained(Bytes<Retained>),
+    Retained(bytes::Bytes<bytes::Retained>),
 }
 
 impl SendBuffer {
-    pub fn inline(bytes: &[u8]) -> Result<Self, CapacityError> {
+    pub fn inline(bytes: &[u8]) -> Result<Self, o3::buffer::CapacityError> {
         inline::Bytes::from_slice(bytes).map(Self::Inline)
     }
 
@@ -726,15 +738,15 @@ impl From<Vec<u8>> for SendBuffer {
     }
 }
 
-impl From<Bytes<Retained>> for SendBuffer {
-    fn from(bytes: Bytes<Retained>) -> Self {
+impl From<bytes::Bytes<bytes::Retained>> for SendBuffer {
+    fn from(bytes: bytes::Bytes<bytes::Retained>) -> Self {
         Self::Retained(bytes)
     }
 }
 
 #[derive(Debug, Default)]
 pub struct Sender {
-    chunks: Cursor<SendBuffer>,
+    chunks: queue::Cursor<SendBuffer>,
     spare: Vec<u8>,
     base_offset: u64,
     sent_rel: usize,
@@ -954,5 +966,5 @@ impl Sender {
     }
 }
 
-const _: () = assert!(size_of::<SendBuffer>() == 32);
-const _: () = assert!(size_of::<Sender>() == 112);
+const _: () = assert!(mem::size_of::<SendBuffer>() == 32);
+const _: () = assert!(mem::size_of::<Sender>() == 112);

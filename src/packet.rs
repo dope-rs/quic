@@ -1,9 +1,9 @@
-use std::ops::{Deref, Range};
+use std::ops;
 
-use subtle::ConstantTimeEq;
+use subtle::ConstantTimeEq as _;
 
-use crate::packet_protection::{CryptoFailure, PacketProtection};
-use crate::varint::VarInt;
+use crate::packet_protection;
+use crate::varint;
 
 pub const FORM_LONG: u8 = 0x80;
 pub const FIXED_BIT: u8 = 0x40;
@@ -68,7 +68,7 @@ impl AsRef<[u8]> for ConnectionId {
     }
 }
 
-impl Deref for ConnectionId {
+impl ops::Deref for ConnectionId {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -155,7 +155,7 @@ impl AsRef<[u8]> for ConnectionIdRef<'_> {
     }
 }
 
-impl Deref for ConnectionIdRef<'_> {
+impl ops::Deref for ConnectionIdRef<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -229,12 +229,16 @@ fn validate_header_fields(pn_len: u8, dcid: &[u8], scid: &[u8]) -> Result<(), En
 
 struct LongPrefix {
     version: u32,
-    dcid: Range<usize>,
-    scid: Range<usize>,
+    dcid: ops::Range<usize>,
+    scid: ops::Range<usize>,
     pos: usize,
 }
 
-fn take_range(input: &[u8], pos: &mut usize, length: usize) -> Result<Range<usize>, DecodeError> {
+fn take_range(
+    input: &[u8],
+    pos: &mut usize,
+    length: usize,
+) -> Result<ops::Range<usize>, DecodeError> {
     let end = pos
         .checked_add(length)
         .filter(|&end| end <= input.len())
@@ -244,7 +248,7 @@ fn take_range(input: &[u8], pos: &mut usize, length: usize) -> Result<Range<usiz
     Ok(value)
 }
 
-fn take_connection_id(input: &[u8], pos: &mut usize) -> Result<Range<usize>, DecodeError> {
+fn take_connection_id(input: &[u8], pos: &mut usize) -> Result<ops::Range<usize>, DecodeError> {
     let length = usize::from(*input.get(*pos).ok_or(DecodeError::Underflow)?);
     *pos += 1;
     if length > MAX_CONNECTION_ID_LEN {
@@ -280,7 +284,8 @@ fn decode_long_prefix(input: &[u8], packet_type: u8) -> Result<LongPrefix, Decod
 }
 
 fn decode_length(input: &[u8], pos: &mut usize) -> Result<usize, DecodeError> {
-    let (length, consumed) = VarInt::decode(&input[*pos..]).map_err(|_| DecodeError::BadVarInt)?;
+    let (length, consumed) =
+        varint::VarInt::decode(&input[*pos..]).map_err(|_| DecodeError::BadVarInt)?;
     *pos += consumed;
     usize::try_from(length.get()).map_err(|_| DecodeError::BadVarInt)
 }
@@ -289,9 +294,9 @@ fn decode_length(input: &[u8], pos: &mut usize) -> Result<usize, DecodeError> {
 struct LongLayout {
     version: u32,
     kind: LongType,
-    dcid: Range<usize>,
-    scid: Range<usize>,
-    token: Option<Range<usize>>,
+    dcid: ops::Range<usize>,
+    scid: ops::Range<usize>,
+    token: Option<ops::Range<usize>>,
     pn_offset: usize,
     length: usize,
     packet_len: usize,
@@ -415,9 +420,9 @@ impl<P: LongBuffer> ParsedLong<P> {
 impl<P: AsRef<[u8]> + AsMut<[u8]>> ParsedLong<P> {
     pub(crate) fn decrypt(
         mut self,
-        protection: &PacketProtection,
+        protection: &packet_protection::PacketProtection,
         expected_packet_number: u64,
-    ) -> Result<DecryptedLong<P>, CryptoFailure> {
+    ) -> Result<DecryptedLong<P>, packet_protection::CryptoFailure> {
         let (packet_number, body) = protection.decrypt_long_in_place(
             self.packet.as_mut(),
             self.layout.pn_offset,
@@ -434,7 +439,7 @@ impl<P: AsRef<[u8]> + AsMut<[u8]>> ParsedLong<P> {
 pub(crate) struct DecryptedLong<P> {
     packet: P,
     packet_number: u64,
-    body: Range<usize>,
+    body: ops::Range<usize>,
 }
 
 impl<P: AsRef<[u8]>> DecryptedLong<P> {
@@ -446,7 +451,7 @@ impl<P: AsRef<[u8]>> DecryptedLong<P> {
         &self.packet.as_ref()[self.body.clone()]
     }
 
-    pub(crate) fn into_parts(self) -> (u64, P, Range<usize>) {
+    pub(crate) fn into_parts(self) -> (u64, P, ops::Range<usize>) {
         (self.packet_number, self.packet, self.body)
     }
 }
@@ -472,7 +477,7 @@ impl LongHeader<'_> {
             u64::try_from(body_len_after_pn).map_err(|_| EncodeError::ValueOutOfRange)?;
         let length = u64::from(self.packet_number_len)
             .checked_add(body_len)
-            .filter(|&length| length <= VarInt::MAX)
+            .filter(|&length| length <= varint::VarInt::MAX)
             .ok_or(EncodeError::ValueOutOfRange)?;
         out.push(FORM_LONG | FIXED_BIT | self.packet_type | (self.packet_number_len - 1));
         out.extend_from_slice(&self.version.to_be_bytes());
@@ -481,11 +486,12 @@ impl LongHeader<'_> {
         out.push(self.scid.len() as u8);
         out.extend_from_slice(self.scid);
         if let Some(token) = self.token {
-            let token_len = VarInt::from_usize(token.len()).ok_or(EncodeError::ValueOutOfRange)?;
+            let token_len =
+                varint::VarInt::from_usize(token.len()).ok_or(EncodeError::ValueOutOfRange)?;
             token_len.encode(out);
             out.extend_from_slice(token);
         }
-        VarInt::new(length)
+        varint::VarInt::new(length)
             .ok_or(EncodeError::ValueOutOfRange)?
             .encode(out);
         let pn_offset = out.len();

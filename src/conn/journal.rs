@@ -1,39 +1,39 @@
-use std::time::{Duration, Instant};
+use std::time;
 
 use o3::collections::fixed::{arena, index};
 
-use crate::frame::ack_ranges::Ranges;
-use crate::rtt::PACKET_THRESHOLD;
+use crate::frame::ack_ranges;
+use crate::rtt;
 
-use super::Epoch;
-use super::delivery::{self, Handle};
+use crate::conn;
+use crate::conn::delivery;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Packet {
-    pub(super) epoch: Epoch,
+    pub(super) epoch: conn::Epoch,
     pub(super) pn: u64,
     pub(super) early_data: bool,
-    pub(super) sent_time: Instant,
+    pub(super) sent_time: time::Instant,
     pub(super) ack_eliciting: bool,
     pub(super) in_flight: bool,
     pub(super) bytes_sent: usize,
     pub(super) pto_protected: bool,
-    pub(super) crypto: Option<Handle<delivery::Crypto>>,
+    pub(super) crypto: Option<delivery::Handle<delivery::Crypto>>,
 }
 
-pub(super) type ControlDrain<'a> = arena::StackDrain<'a, Handle<delivery::Control>>;
-pub(super) type StreamDrain<'a> = arena::StackDrain<'a, Handle<delivery::Stream>>;
+pub(super) type ControlDrain<'a> = arena::StackDrain<'a, delivery::Handle<delivery::Control>>;
+pub(super) type StreamDrain<'a> = arena::StackDrain<'a, delivery::Handle<delivery::Stream>>;
 
 #[derive(Clone, Copy)]
 pub(super) struct PacketKey {
-    epoch: Epoch,
+    epoch: conn::Epoch,
     slot: usize,
 }
 
 struct Ring {
     slots: index::Slots<Packet>,
-    controls: arena::Stack<Handle<delivery::Control>>,
-    streams: arena::Stack<Handle<delivery::Stream>>,
+    controls: arena::Stack<delivery::Handle<delivery::Control>>,
+    streams: arena::Stack<delivery::Handle<delivery::Stream>>,
     lowest: Option<u64>,
     highest: Option<u64>,
 }
@@ -81,12 +81,12 @@ impl Ring {
         Some(slot)
     }
 
-    fn push_control(&mut self, slot: usize, handle: Handle<delivery::Control>) -> bool {
+    fn push_control(&mut self, slot: usize, handle: delivery::Handle<delivery::Control>) -> bool {
         debug_assert!(self.slots.contains(slot));
         self.controls.push(slot, handle).is_ok()
     }
 
-    fn push_stream(&mut self, slot: usize, handle: Handle<delivery::Stream>) -> bool {
+    fn push_stream(&mut self, slot: usize, handle: delivery::Handle<delivery::Stream>) -> bool {
         debug_assert!(self.slots.contains(slot));
         self.streams.push(slot, handle).is_ok()
     }
@@ -248,11 +248,11 @@ impl Table {
         }
     }
 
-    fn ring(&self, epoch: Epoch) -> &Ring {
+    fn ring(&self, epoch: conn::Epoch) -> &Ring {
         &self.rings[epoch as usize]
     }
 
-    fn ring_mut(&mut self, epoch: Epoch) -> &mut Ring {
+    fn ring_mut(&mut self, epoch: conn::Epoch) -> &mut Ring {
         &mut self.rings[epoch as usize]
     }
 
@@ -269,21 +269,25 @@ impl Table {
     pub(super) fn push_control(
         &mut self,
         key: PacketKey,
-        handle: Handle<delivery::Control>,
+        handle: delivery::Handle<delivery::Control>,
     ) -> bool {
         self.ring_mut(key.epoch).push_control(key.slot, handle)
     }
 
-    pub(super) fn push_stream(&mut self, key: PacketKey, handle: Handle<delivery::Stream>) -> bool {
+    pub(super) fn push_stream(
+        &mut self,
+        key: PacketKey,
+        handle: delivery::Handle<delivery::Stream>,
+    ) -> bool {
         self.ring_mut(key.epoch).push_stream(key.slot, handle)
     }
 
     pub(super) fn drain_ack(
         &mut self,
-        epoch: Epoch,
+        epoch: conn::Epoch,
         largest: u64,
         first_range: u64,
-        additional: Ranges<'_>,
+        additional: ack_ranges::Ranges<'_>,
         mut emit: impl FnMut(Packet, ControlDrain<'_>, StreamDrain<'_>),
     ) {
         let ring = self.ring_mut(epoch);
@@ -301,9 +305,9 @@ impl Table {
 
     pub(super) fn drain_lost(
         &mut self,
-        epoch: Epoch,
+        epoch: conn::Epoch,
         largest_acked: u64,
-        lost_send_time: Instant,
+        lost_send_time: time::Instant,
         mut emit: impl FnMut(Packet, ControlDrain<'_>, StreamDrain<'_>),
     ) {
         let ring = self.ring_mut(epoch);
@@ -316,7 +320,7 @@ impl Table {
             let Some(journal) = ring.get(pn).copied() else {
                 continue;
             };
-            let lost = largest_acked.saturating_sub(pn) >= PACKET_THRESHOLD
+            let lost = largest_acked.saturating_sub(pn) >= rtt::PACKET_THRESHOLD
                 || (!journal.pto_protected && journal.sent_time <= lost_send_time);
             if lost {
                 if let Some((slot, journal)) = ring.remove_unindexed(pn) {
@@ -344,17 +348,17 @@ impl Table {
         self.recount();
     }
 
-    pub(super) fn iter_mut(&mut self, epoch: Epoch) -> impl Iterator<Item = &mut Packet> {
+    pub(super) fn iter_mut(&mut self, epoch: conn::Epoch) -> impl Iterator<Item = &mut Packet> {
         self.ring_mut(epoch).iter_mut()
     }
 
     pub(super) fn loss_candidate(
         &self,
-        epoch: Epoch,
+        epoch: conn::Epoch,
         largest_acked: u64,
-        loss_delay: Duration,
-    ) -> Option<Instant> {
-        let lowest = largest_acked.saturating_sub(PACKET_THRESHOLD - 1);
+        loss_delay: time::Duration,
+    ) -> Option<time::Instant> {
+        let lowest = largest_acked.saturating_sub(rtt::PACKET_THRESHOLD - 1);
         (lowest..=largest_acked)
             .filter_map(|pn| self.ring(epoch).get(pn))
             .filter(|journal| !journal.pto_protected)
@@ -362,21 +366,21 @@ impl Table {
             .min()
     }
 
-    pub(super) fn has_room_for(&self, epoch: Epoch, pn: u64, needed: usize) -> bool {
+    pub(super) fn has_room_for(&self, epoch: conn::Epoch, pn: u64, needed: usize) -> bool {
         self.len.saturating_add(needed) <= self.limit
             && (0..needed).all(|offset| self.ring(epoch).vacant(pn.saturating_add(offset as u64)))
     }
 
     pub(super) fn has_carrier_room(&self, controls: usize, streams: usize) -> bool {
-        self.ring(Epoch::Application)
+        self.ring(conn::Epoch::Application)
             .has_carrier_room(controls, streams)
     }
 
-    pub(super) fn count_epoch(&self, epoch: Epoch) -> usize {
+    pub(super) fn count_epoch(&self, epoch: conn::Epoch) -> usize {
         self.ring(epoch).len()
     }
 
-    pub(super) fn in_flight_bytes(&self, epoch: Epoch) -> u64 {
+    pub(super) fn in_flight_bytes(&self, epoch: conn::Epoch) -> u64 {
         self.ring(epoch)
             .slots
             .values()

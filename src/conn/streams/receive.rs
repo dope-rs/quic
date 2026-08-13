@@ -1,16 +1,17 @@
-use crate::stream::ReceiveBuffer;
-use crate::varint::VarInt;
+use crate::conn;
+use crate::conn::control;
+use crate::conn::event_queue;
+use crate::conn::receive_workspace;
+use crate::conn::recv;
+use crate::conn::send;
+use crate::conn::stream;
+use crate::frame;
+use crate::range_buffer;
 
-use crate::conn::receive_workspace::{
-    ParsedFrame, ReceiveAdmission, ReceiveAdmissions, ReceivePayloadPlans, StreamFrameIndex,
-};
-use crate::conn::{Error, MAX_STREAM_COUNT, control, event_queue, recv, send, stream};
-use crate::frame::Frame;
-use crate::range_buffer::{MAX_RANGES, Plan};
-
-use super::transmit::Transmit;
-use super::{Access, State, Streams, table};
 use crate::conn::control::Write as _;
+use crate::conn::streams;
+use crate::conn::streams::table;
+use crate::conn::streams::transmit::Transmit as _;
 
 const MAX_DATA_DIRTY: u8 = 1 << 0;
 const MAX_STREAMS_BIDI_DIRTY: u8 = 1 << 1;
@@ -38,7 +39,7 @@ impl super::ReceiveCredits {
     }
 }
 
-pub(in crate::conn) trait Incoming<B: ReceiveBuffer> {
+pub(in crate::conn) trait Incoming<B: crate::stream::ReceiveBuffer> {
     fn len(&self) -> usize;
     fn insert(
         self,
@@ -92,14 +93,14 @@ impl IncomingStream {
 }
 
 pub(in crate::conn) struct FrameGroup<'a> {
-    frame_indices: &'a [StreamFrameIndex],
-    parsed_frames: &'a [ParsedFrame],
+    frame_indices: &'a [receive_workspace::StreamFrameIndex],
+    parsed_frames: &'a [receive_workspace::ParsedFrame],
 }
 
 impl<'a> FrameGroup<'a> {
     pub(in crate::conn) const fn new(
-        frame_indices: &'a [StreamFrameIndex],
-        parsed_frames: &'a [ParsedFrame],
+        frame_indices: &'a [receive_workspace::StreamFrameIndex],
+        parsed_frames: &'a [receive_workspace::ParsedFrame],
     ) -> Self {
         Self {
             frame_indices,
@@ -109,8 +110,8 @@ impl<'a> FrameGroup<'a> {
 }
 
 pub(in crate::conn) struct PlanContext<'a> {
-    admissions: &'a mut ReceiveAdmissions,
-    payloads: &'a mut ReceivePayloadPlans,
+    admissions: &'a mut receive_workspace::ReceiveAdmissions,
+    payloads: &'a mut receive_workspace::ReceivePayloadPlans,
     segments: &'a mut Vec<std::ops::Range<u64>>,
     parts: &'a mut Vec<(u64, std::ops::Range<usize>)>,
     is_client: bool,
@@ -118,8 +119,8 @@ pub(in crate::conn) struct PlanContext<'a> {
 
 impl<'a> PlanContext<'a> {
     pub(in crate::conn) fn new(
-        admissions: &'a mut ReceiveAdmissions,
-        payloads: &'a mut ReceivePayloadPlans,
+        admissions: &'a mut receive_workspace::ReceiveAdmissions,
+        payloads: &'a mut receive_workspace::ReceivePayloadPlans,
         segments: &'a mut Vec<std::ops::Range<u64>>,
         parts: &'a mut Vec<(u64, std::ops::Range<usize>)>,
         is_client: bool,
@@ -135,8 +136,8 @@ impl<'a> PlanContext<'a> {
 }
 
 pub(in crate::conn) struct MaterializeContext<'a> {
-    admissions: &'a ReceiveAdmissions,
-    payloads: &'a mut ReceivePayloadPlans,
+    admissions: &'a receive_workspace::ReceiveAdmissions,
+    payloads: &'a mut receive_workspace::ReceivePayloadPlans,
     segments: &'a mut Vec<std::ops::Range<u64>>,
     parts: &'a mut Vec<(u64, std::ops::Range<usize>)>,
     body: &'a [u8],
@@ -145,8 +146,8 @@ pub(in crate::conn) struct MaterializeContext<'a> {
 
 impl<'a> MaterializeContext<'a> {
     pub(in crate::conn) fn new(
-        admissions: &'a ReceiveAdmissions,
-        payloads: &'a mut ReceivePayloadPlans,
+        admissions: &'a receive_workspace::ReceiveAdmissions,
+        payloads: &'a mut receive_workspace::ReceivePayloadPlans,
         segments: &'a mut Vec<std::ops::Range<u64>>,
         parts: &'a mut Vec<(u64, std::ops::Range<usize>)>,
         body: &'a [u8],
@@ -163,14 +164,18 @@ impl<'a> MaterializeContext<'a> {
     }
 }
 
-struct ReceiveControlDrain<'a, B: ReceiveBuffer> {
-    streams: &'a mut State<B>,
+struct ReceiveControlDrain<'a, B: crate::stream::ReceiveBuffer> {
+    streams: &'a mut streams::State<B>,
     control: &'a mut control::Pending,
     remaining: usize,
 }
 
-impl<'a, B: ReceiveBuffer> ReceiveControlDrain<'a, B> {
-    fn new(streams: &'a mut State<B>, control: &'a mut control::Pending, remaining: usize) -> Self {
+impl<'a, B: crate::stream::ReceiveBuffer> ReceiveControlDrain<'a, B> {
+    fn new(
+        streams: &'a mut streams::State<B>,
+        control: &'a mut control::Pending,
+        remaining: usize,
+    ) -> Self {
         Self {
             streams,
             control,
@@ -299,7 +304,7 @@ impl<'a, B: ReceiveBuffer> ReceiveControlDrain<'a, B> {
     }
 }
 
-impl<B: ReceiveBuffer> Incoming<B> for Copied<'_> {
+impl<B: crate::stream::ReceiveBuffer> Incoming<B> for Copied<'_> {
     fn len(&self) -> usize {
         self.0.len()
     }
@@ -342,7 +347,7 @@ impl<'d> Incoming<crate::stream::RecvBuffer<'d>> for RetainedIncoming<'d> {
     }
 }
 
-impl<B: ReceiveBuffer> Incoming<B> for B {
+impl<B: crate::stream::ReceiveBuffer> Incoming<B> for B {
     fn len(&self) -> usize {
         self.as_ref().len()
     }
@@ -359,7 +364,7 @@ impl<B: ReceiveBuffer> Incoming<B> for B {
     }
 }
 
-impl<B: ReceiveBuffer> State<B> {
+impl<B: crate::stream::ReceiveBuffer> streams::State<B> {
     pub(in crate::conn) fn receive_controls_pending(&self) -> bool {
         self.receive_credits.any() || !self.receive.control_schedule.is_empty()
     }
@@ -393,18 +398,18 @@ impl<B: ReceiveBuffer> State<B> {
     pub(in crate::conn) fn validate_or_open_peer_reserved(
         &mut self,
         stream_id: u64,
-        access: Access,
+        access: streams::Access,
         is_client: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<(), conn::Error> {
         let is_uni = stream_id & 0x2 != 0;
         let we_initiated = (stream_id & 0x1 == 0) == is_client;
         if we_initiated {
             return self.validate_access_reserved(stream_id, access, is_client);
         }
-        if is_uni && matches!(access, Access::Send)
+        if is_uni && matches!(access, streams::Access::Send)
             || stream_id >> 2 >= self.peer_initiated.max[usize::from(is_uni)]
         {
-            return Err(Error::ProtocolViolation);
+            return Err(conn::Error::ProtocolViolation);
         }
         self.peer_initiated.opened.open(stream_id);
         Ok(())
@@ -413,20 +418,20 @@ impl<B: ReceiveBuffer> State<B> {
     pub(in crate::conn) fn validate_access_reserved(
         &self,
         stream_id: u64,
-        access: Access,
+        access: streams::Access,
         is_client: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<(), conn::Error> {
         let is_uni = stream_id & 0x2 != 0;
         let we_initiated = (stream_id & 0x1 == 0) == is_client;
         if we_initiated {
             let opened = stream_id < self.local_initiated.next[usize::from(is_uni)];
-            if !opened || is_uni && matches!(access, Access::Receive) {
-                return Err(Error::ProtocolViolation);
+            if !opened || is_uni && matches!(access, streams::Access::Receive) {
+                return Err(conn::Error::ProtocolViolation);
             }
         } else if !self.peer_initiated.opened.contains(stream_id)
-            || is_uni && matches!(access, Access::Send)
+            || is_uni && matches!(access, streams::Access::Send)
         {
-            return Err(Error::ProtocolViolation);
+            return Err(conn::Error::ProtocolViolation);
         }
         Ok(())
     }
@@ -471,7 +476,7 @@ impl<B: ReceiveBuffer> State<B> {
         }
         let next = self.peer_initiated.max[kind]
             .saturating_add(self.peer_initiated.closed[kind])
-            .min(MAX_STREAM_COUNT);
+            .min(crate::conn::MAX_STREAM_COUNT);
         self.peer_initiated.closed[kind] = 0;
         if next > self.peer_initiated.max[kind] {
             self.peer_initiated.max[kind] = next;
@@ -515,7 +520,7 @@ impl<B: ReceiveBuffer> State<B> {
         data: D,
         parts: &mut Vec<(u64, std::ops::Range<usize>)>,
         events: &mut event_queue::Permit<'_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), conn::Error> {
         let IncomingStream {
             stream_id,
             offset,
@@ -528,8 +533,8 @@ impl<B: ReceiveBuffer> State<B> {
         let initial_limit = self.initial_receive_credit(stream_id, is_client);
         let data_len = data.len();
         let new_end = offset
-            .checked_add(u64::try_from(data_len).map_err(|_| Error::StreamBufferExceeded)?)
-            .ok_or(Error::StreamBufferExceeded)?;
+            .checked_add(u64::try_from(data_len).map_err(|_| conn::Error::StreamBufferExceeded)?)
+            .ok_or(conn::Error::StreamBufferExceeded)?;
         let receive = &mut self.receive;
         let (limit, previous_high, final_size, new_entry) = receive
             .map
@@ -543,18 +548,18 @@ impl<B: ReceiveBuffer> State<B> {
                 )
             });
         if new_end > limit {
-            return Err(Error::FlowControl);
+            return Err(conn::Error::FlowControl);
         }
         if final_size.is_some_and(|final_size| new_end > final_size || fin && new_end != final_size)
             || fin && new_end < previous_high
         {
-            return Err(Error::FinalSize);
+            return Err(conn::Error::FinalSize);
         }
         let projected_total = receive
             .total
             .checked_add(new_end.saturating_sub(previous_high))
             .filter(|&total| total <= receive.local_max_data)
-            .ok_or(Error::FlowControl)?;
+            .ok_or(conn::Error::FlowControl)?;
 
         let (handle, stream, event_position) = receive
             .map
@@ -569,7 +574,7 @@ impl<B: ReceiveBuffer> State<B> {
                 stream.release_ranges(&mut receive.ranges);
                 receive.map.remove(recv::Id::new(stream_id));
             }
-            return Err(Error::StreamBufferExceeded);
+            return Err(conn::Error::StreamBufferExceeded);
         }
         receive.total = projected_total;
         if data_len != 0 || fin {
@@ -586,14 +591,14 @@ impl<B: ReceiveBuffer> State<B> {
         fin: bool,
         is_client: bool,
         events: &mut event_queue::Permit<'_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), conn::Error> {
         if self.receive_side_closed(stream_id, is_client) {
             return Ok(());
         }
         let initial_limit = self.initial_receive_credit(stream_id, is_client);
         let new_end = offset
-            .checked_add(u64::try_from(data_len).map_err(|_| Error::StreamBufferExceeded)?)
-            .ok_or(Error::StreamBufferExceeded)?;
+            .checked_add(u64::try_from(data_len).map_err(|_| conn::Error::StreamBufferExceeded)?)
+            .ok_or(conn::Error::StreamBufferExceeded)?;
         let receive = &mut self.receive;
         let (limit, previous_high, final_size, new_entry) = receive
             .map
@@ -607,18 +612,18 @@ impl<B: ReceiveBuffer> State<B> {
                 )
             });
         if new_end > limit {
-            return Err(Error::FlowControl);
+            return Err(conn::Error::FlowControl);
         }
         if final_size.is_some_and(|final_size| new_end > final_size || fin && new_end != final_size)
             || fin && new_end < previous_high
         {
-            return Err(Error::FinalSize);
+            return Err(conn::Error::FinalSize);
         }
         let projected_total = receive
             .total
             .checked_add(new_end.saturating_sub(previous_high))
             .filter(|&total| total <= receive.local_max_data)
-            .ok_or(Error::FlowControl)?;
+            .ok_or(conn::Error::FlowControl)?;
 
         let (handle, stream, event_position) = receive
             .map
@@ -630,7 +635,7 @@ impl<B: ReceiveBuffer> State<B> {
                 stream.release_ranges(&mut receive.ranges);
                 receive.map.remove(recv::Id::new(stream_id));
             }
-            return Err(Error::StreamBufferExceeded);
+            return Err(conn::Error::StreamBufferExceeded);
         }
         receive.total = projected_total;
         if data_len != 0 || fin {
@@ -647,7 +652,7 @@ impl<B: ReceiveBuffer> State<B> {
         is_client: bool,
         control: &mut C,
         events: &mut event_queue::Permit<'_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), conn::Error> {
         if self.receive_side_closed(stream_id, is_client) {
             return Ok(());
         }
@@ -656,29 +661,29 @@ impl<B: ReceiveBuffer> State<B> {
         let projected_total = match receive.map.get(recv::Id::new(stream_id)) {
             Some(stream) => {
                 if final_size > stream.limit() {
-                    return Err(Error::FlowControl);
+                    return Err(conn::Error::FlowControl);
                 }
                 let previous_high = stream.highest_offset();
                 if final_size < previous_high
                     || stream.final_size().is_some_and(|known| known != final_size)
                 {
-                    return Err(Error::FinalSize);
+                    return Err(conn::Error::FinalSize);
                 }
                 receive
                     .total
                     .checked_add(final_size - previous_high)
                     .filter(|&total| total <= receive.local_max_data)
-                    .ok_or(Error::FlowControl)?
+                    .ok_or(conn::Error::FlowControl)?
             }
             None => {
                 if final_size > initial_limit {
-                    return Err(Error::FlowControl);
+                    return Err(conn::Error::FlowControl);
                 }
                 receive
                     .total
                     .checked_add(final_size)
                     .filter(|&total| total <= receive.local_max_data)
-                    .ok_or(Error::FlowControl)?
+                    .ok_or(conn::Error::FlowControl)?
             }
         };
         let (map, control_schedule, ranges) = (
@@ -785,7 +790,7 @@ impl<B: ReceiveBuffer> State<B> {
     }
 }
 
-impl<B: ReceiveBuffer> Streams<B> {
+impl<B: crate::stream::ReceiveBuffer> streams::Streams<B> {
     fn consume_receive<R>(
         &mut self,
         stream_id: u64,
@@ -878,7 +883,7 @@ impl<B: ReceiveBuffer> Streams<B> {
     }
 }
 
-pub(in crate::conn) trait Receive<B: ReceiveBuffer> {
+pub(in crate::conn) trait Receive<B: crate::stream::ReceiveBuffer> {
     fn read(
         &mut self,
         stream_id: u64,
@@ -899,12 +904,16 @@ pub(in crate::conn) trait Receive<B: ReceiveBuffer> {
         control: &mut control::Pending,
     ) -> Option<B>;
     fn release_local_capacity(&mut self, is_uni: bool);
-    fn validate_access(&self, stream_id: u64, access: Access, is_client: bool)
-    -> Result<(), Error>;
+    fn validate_access(
+        &self,
+        stream_id: u64,
+        access: streams::Access,
+        is_client: bool,
+    ) -> Result<(), conn::Error>;
     fn validate_operation(
         &self,
         stream_id: u64,
-        access: Access,
+        access: streams::Access,
         is_client: bool,
         available: bool,
     ) -> Result<(), stream::Error>;
@@ -913,12 +922,12 @@ pub(in crate::conn) trait Receive<B: ReceiveBuffer> {
     fn recv_fin_received(&self, stream_id: u64, is_client: bool) -> bool;
 }
 
-impl<B: ReceiveBuffer> State<B> {
+impl<B: crate::stream::ReceiveBuffer> streams::State<B> {
     pub(in crate::conn) fn plan_stream_frames(
         &self,
         frames: FrameGroup<'_>,
         context: PlanContext<'_>,
-    ) -> Result<AdmissionImpact, Error> {
+    ) -> Result<AdmissionImpact, conn::Error> {
         let FrameGroup {
             frame_indices,
             parsed_frames,
@@ -934,19 +943,18 @@ impl<B: ReceiveBuffer> State<B> {
             .first()
             .and_then(|&frame_index| parsed_frames.get(frame_index.get()))
             .and_then(|frame| match frame {
-                Frame::Stream { stream_id, .. } | Frame::ResetStream { stream_id, .. } => {
-                    Some(stream_id.get())
-                }
+                frame::Frame::Stream { stream_id, .. }
+                | frame::Frame::ResetStream { stream_id, .. } => Some(stream_id.get()),
                 _ => None,
             })
-            .ok_or(Error::FrameDecode)?;
+            .ok_or(conn::Error::FrameDecode)?;
 
         let is_uni = stream_id & 0x2 != 0;
         let we_initiated = (stream_id & 0x1 == 0) == is_client;
         if we_initiated {
-            self.validate_access_reserved(stream_id, Access::Receive, is_client)?;
+            self.validate_access_reserved(stream_id, streams::Access::Receive, is_client)?;
         } else if stream_id >> 2 >= self.peer_initiated.max[usize::from(is_uni)] {
-            return Err(Error::ProtocolViolation);
+            return Err(conn::Error::ProtocolViolation);
         }
         if self.receive_side_closed(stream_id, is_client) {
             return Ok(AdmissionImpact {
@@ -961,7 +969,7 @@ impl<B: ReceiveBuffer> State<B> {
         let will_reset = frame_indices.iter().any(|&frame_index| {
             matches!(
                 parsed_frames.get(frame_index.get()),
-                Some(Frame::ResetStream { .. })
+                Some(frame::Frame::ResetStream { .. })
             )
         });
         let initial_limit = self.initial_receive_credit(stream_id, is_client);
@@ -990,7 +998,7 @@ impl<B: ReceiveBuffer> State<B> {
                 None,
                 false,
                 false,
-                (!will_reset).then(|| Plan::empty(segments, parts)),
+                (!will_reset).then(|| range_buffer::Plan::empty(segments, parts)),
                 0,
             ),
         };
@@ -1006,28 +1014,30 @@ impl<B: ReceiveBuffer> State<B> {
                 continue;
             }
             match &parsed_frames[frame_index.get()] {
-                Frame::Stream {
+                frame::Frame::Stream {
                     offset, data, fin, ..
                 } => {
                     let offset = offset.get();
                     let len = data.len();
                     let end = offset
-                        .checked_add(u64::try_from(len).map_err(|_| Error::StreamBufferExceeded)?)
-                        .ok_or(Error::StreamBufferExceeded)?;
+                        .checked_add(
+                            u64::try_from(len).map_err(|_| conn::Error::StreamBufferExceeded)?,
+                        )
+                        .ok_or(conn::Error::StreamBufferExceeded)?;
                     if end > limit {
-                        return Err(Error::FlowControl);
+                        return Err(conn::Error::FlowControl);
                     }
                     if final_size.is_some_and(|known| end > known || *fin && end != known)
                         || *fin && end < highest
                     {
-                        return Err(Error::FinalSize);
+                        return Err(conn::Error::FinalSize);
                     }
                     let accepted = match &mut range_plan {
                         Some(range_plan) => range_plan
                             .insert_observed::<crate::range_buffer::InsertError>(
                                 offset,
                                 len,
-                                MAX_RANGES,
+                                range_buffer::MAX_RANGES,
                                 |_| {
                                     accepted_segments = accepted_segments
                                         .checked_add(1)
@@ -1035,15 +1045,15 @@ impl<B: ReceiveBuffer> State<B> {
                                     Ok(())
                                 },
                             )
-                            .map_err(|_| Error::StreamBufferExceeded)?,
+                            .map_err(|_| conn::Error::StreamBufferExceeded)?,
                         None => 0,
                     };
                     payloads
                         .set_accepted(frame_index.get(), accepted)
-                        .ok_or(Error::StreamBufferExceeded)?;
+                        .ok_or(conn::Error::StreamBufferExceeded)?;
                     accepted_bytes = accepted_bytes
                         .checked_add(accepted)
-                        .ok_or(Error::StreamBufferExceeded)?;
+                        .ok_or(conn::Error::StreamBufferExceeded)?;
                     if let Some(range_plan) = &range_plan {
                         peak_ranges = peak_ranges.max(range_plan.range_count());
                     }
@@ -1062,21 +1072,21 @@ impl<B: ReceiveBuffer> State<B> {
                     admissions.mark(
                         frame_index.get(),
                         if will_reset {
-                            ReceiveAdmission::StreamTransient
+                            receive_workspace::ReceiveAdmission::StreamTransient
                         } else {
-                            ReceiveAdmission::Stream
+                            receive_workspace::ReceiveAdmission::Stream
                         },
                     );
                 }
-                Frame::ResetStream {
+                frame::Frame::ResetStream {
                     final_size: reset, ..
                 } => {
                     let reset = reset.get();
                     if reset > limit {
-                        return Err(Error::FlowControl);
+                        return Err(conn::Error::FlowControl);
                     }
                     if reset < highest || final_size.is_some_and(|known| known != reset) {
-                        return Err(Error::FinalSize);
+                        return Err(conn::Error::FinalSize);
                     }
                     highest = highest.max(reset);
                     if !event_pending {
@@ -1085,10 +1095,13 @@ impl<B: ReceiveBuffer> State<B> {
                     // Earlier STREAM frames still apply their observable metadata
                     // in wire order, but their payload and gap topology can never
                     // escape the later RESET_STREAM.
-                    admissions.mark(frame_index.get(), ReceiveAdmission::Reset);
+                    admissions.mark(
+                        frame_index.get(),
+                        receive_workspace::ReceiveAdmission::Reset,
+                    );
                     closed = true;
                 }
-                _ => return Err(Error::FrameDecode),
+                _ => return Err(conn::Error::FrameDecode),
             }
         }
         Ok(AdmissionImpact {
@@ -1108,7 +1121,7 @@ impl<B: ReceiveBuffer> State<B> {
         &self,
         frames: FrameGroup<'_>,
         context: MaterializeContext<'_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), conn::Error> {
         let FrameGroup {
             frame_indices,
             parsed_frames,
@@ -1121,44 +1134,43 @@ impl<B: ReceiveBuffer> State<B> {
             body,
             output,
         } = context;
-        if !frame_indices
-            .iter()
-            .any(|&index| admissions.get(index.get()) == ReceiveAdmission::Stream)
-        {
+        if !frame_indices.iter().any(|&index| {
+            admissions.get(index.get()) == receive_workspace::ReceiveAdmission::Stream
+        }) {
             return Ok(());
         }
         let stream_id = frame_indices
             .first()
             .and_then(|&index| parsed_frames.get(index.get()))
             .and_then(|frame| match frame {
-                Frame::Stream { stream_id, .. } | Frame::ResetStream { stream_id, .. } => {
-                    Some(stream_id.get())
-                }
+                frame::Frame::Stream { stream_id, .. }
+                | frame::Frame::ResetStream { stream_id, .. } => Some(stream_id.get()),
                 _ => None,
             })
-            .ok_or(Error::FrameDecode)?;
+            .ok_or(conn::Error::FrameDecode)?;
         let receive = &self.receive;
         let mut range_plan = match receive.map.get(recv::Id::new(stream_id)) {
             Some(stream) => stream.receive_plan(&receive.ranges, segments, parts),
-            None => Plan::empty(segments, parts),
+            None => range_buffer::Plan::empty(segments, parts),
         };
 
         for &frame_index in frame_indices {
-            if admissions.get(frame_index.get()) != ReceiveAdmission::Stream {
+            if admissions.get(frame_index.get()) != receive_workspace::ReceiveAdmission::Stream {
                 continue;
             }
-            let Frame::Stream { offset, data, .. } = &parsed_frames[frame_index.get()] else {
-                return Err(Error::FrameDecode);
+            let frame::Frame::Stream { offset, data, .. } = &parsed_frames[frame_index.get()]
+            else {
+                return Err(conn::Error::FrameDecode);
             };
             let compact_start = output.len();
             payloads
                 .set_start(frame_index.get(), compact_start)
-                .ok_or(Error::StreamBufferExceeded)?;
+                .ok_or(conn::Error::StreamBufferExceeded)?;
             let accepted = range_plan
                 .insert_observed::<crate::range_buffer::InsertError>(
                     offset.get(),
                     data.len(),
-                    MAX_RANGES,
+                    range_buffer::MAX_RANGES,
                     |range| {
                         let start = data
                             .start
@@ -1176,16 +1188,16 @@ impl<B: ReceiveBuffer> State<B> {
                             .map_err(|_| crate::range_buffer::InsertError::BufferFull)
                     },
                 )
-                .map_err(|_| Error::StreamBufferExceeded)?;
+                .map_err(|_| conn::Error::StreamBufferExceeded)?;
             if accepted != payloads.get(frame_index.get()).accepted() {
-                return Err(Error::StreamBufferExceeded);
+                return Err(conn::Error::StreamBufferExceeded);
             }
         }
         Ok(())
     }
 }
 
-impl<B: ReceiveBuffer> Receive<B> for Streams<B> {
+impl<B: crate::stream::ReceiveBuffer> Receive<B> for streams::Streams<B> {
     fn read(
         &mut self,
         stream_id: u64,
@@ -1236,21 +1248,21 @@ impl<B: ReceiveBuffer> Receive<B> for Streams<B> {
     fn validate_access(
         &self,
         stream_id: u64,
-        access: Access,
+        access: streams::Access,
         is_client: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<(), conn::Error> {
         let is_uni = stream_id & 0x2 != 0;
         let initiator_is_client = stream_id & 0x1 == 0;
         let we_initiated = initiator_is_client == is_client;
         if we_initiated {
             let opened = stream_id < self.local_initiated.next[usize::from(is_uni)];
-            if !opened || is_uni && matches!(access, Access::Receive) {
-                return Err(Error::ProtocolViolation);
+            if !opened || is_uni && matches!(access, streams::Access::Receive) {
+                return Err(conn::Error::ProtocolViolation);
             }
         } else if !self.peer_initiated.opened.contains(stream_id)
-            || is_uni && matches!(access, Access::Send)
+            || is_uni && matches!(access, streams::Access::Send)
         {
-            return Err(Error::ProtocolViolation);
+            return Err(conn::Error::ProtocolViolation);
         }
         Ok(())
     }
@@ -1258,11 +1270,11 @@ impl<B: ReceiveBuffer> Receive<B> for Streams<B> {
     fn validate_operation(
         &self,
         stream_id: u64,
-        access: Access,
+        access: streams::Access,
         is_client: bool,
         available: bool,
     ) -> Result<(), stream::Error> {
-        if stream_id > VarInt::MAX {
+        if stream_id > crate::varint::VarInt::MAX {
             return Err(stream::Error::IdOverflow);
         }
         if !available {

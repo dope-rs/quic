@@ -1,10 +1,11 @@
 use std::{marker, ops};
 
-use crate::conn::receive_workspace::ReceivePayloadPlan;
-use crate::conn::{Error, streams};
-use crate::stream::{ReceiveBuffer, RecvBuffer};
+use crate::conn;
+use crate::conn::receive_workspace;
+use crate::conn::streams;
+use crate::stream;
 
-pub(in crate::conn::ingress) trait Source<B: ReceiveBuffer> {
+pub(in crate::conn::ingress) trait Source<B: stream::ReceiveBuffer> {
     type Stream<'a>: streams::receive::Incoming<B>
     where
         Self: 'a;
@@ -12,22 +13,22 @@ pub(in crate::conn::ingress) trait Source<B: ReceiveBuffer> {
     fn prepare(
         &mut self,
         _escaping_bytes: usize,
-        _materialize: impl FnOnce(&mut o3::buffer::storage::Owned) -> Result<(), Error>,
-    ) -> Result<(), Error> {
+        _materialize: impl FnOnce(&mut o3::buffer::storage::Owned) -> Result<(), conn::Error>,
+    ) -> Result<(), conn::Error> {
         Ok(())
     }
 
     fn take_datagram(
         &mut self,
         range: ops::Range<usize>,
-        payload: ReceivePayloadPlan,
+        payload: receive_workspace::ReceivePayloadPlan,
         bytes: &[u8],
     ) -> B;
 
     fn take_stream<'a>(
         &'a mut self,
         range: ops::Range<usize>,
-        payload: ReceivePayloadPlan,
+        payload: receive_workspace::ReceivePayloadPlan,
         bytes: &'a [u8],
     ) -> Self::Stream<'a>;
 }
@@ -40,7 +41,7 @@ impl<B> Copied<B> {
     }
 }
 
-impl<B: ReceiveBuffer> Source<B> for Copied<B> {
+impl<B: stream::ReceiveBuffer> Source<B> for Copied<B> {
     type Stream<'a>
         = streams::receive::Copied<'a>
     where
@@ -49,7 +50,7 @@ impl<B: ReceiveBuffer> Source<B> for Copied<B> {
     fn take_datagram(
         &mut self,
         _range: ops::Range<usize>,
-        _payload: ReceivePayloadPlan,
+        _payload: receive_workspace::ReceivePayloadPlan,
         bytes: &[u8],
     ) -> B {
         B::copy_from_slice(bytes)
@@ -58,7 +59,7 @@ impl<B: ReceiveBuffer> Source<B> for Copied<B> {
     fn take_stream<'a>(
         &'a mut self,
         _range: ops::Range<usize>,
-        _payload: ReceivePayloadPlan,
+        _payload: receive_workspace::ReceivePayloadPlan,
         bytes: &'a [u8],
     ) -> Self::Stream<'a> {
         streams::receive::Copied(bytes)
@@ -89,7 +90,7 @@ impl<'a, 'turn, 'retainer, 'd> Retained<'a, 'turn, 'retainer, 'd> {
     }
 }
 
-impl<'d> Source<RecvBuffer<'d>> for Retained<'_, '_, '_, 'd> {
+impl<'d> Source<stream::RecvBuffer<'d>> for Retained<'_, '_, '_, 'd> {
     type Stream<'a>
         = streams::receive::RetainedIncoming<'d>
     where
@@ -98,8 +99,8 @@ impl<'d> Source<RecvBuffer<'d>> for Retained<'_, '_, '_, 'd> {
     fn prepare(
         &mut self,
         escaping_bytes: usize,
-        materialize: impl FnOnce(&mut o3::buffer::storage::Owned) -> Result<(), Error>,
-    ) -> Result<(), Error> {
+        materialize: impl FnOnce(&mut o3::buffer::storage::Owned) -> Result<(), conn::Error>,
+    ) -> Result<(), conn::Error> {
         const MAX_RESIDENT_AMPLIFICATION: usize = 4;
         self.retained = if escaping_bytes != 0
             && self.packet.resident_bytes()
@@ -117,10 +118,10 @@ impl<'d> Source<RecvBuffer<'d>> for Retained<'_, '_, '_, 'd> {
             return Ok(());
         }
         let mut compact = o3::buffer::storage::Owned::try_with_capacity(escaping_bytes)
-            .map_err(|_| Error::StreamBufferExceeded)?;
+            .map_err(|_| conn::Error::StreamBufferExceeded)?;
         materialize(&mut compact)?;
         if compact.len() != escaping_bytes {
-            return Err(Error::StreamBufferExceeded);
+            return Err(conn::Error::StreamBufferExceeded);
         }
         self.compact = Some(compact.freeze());
         Ok(())
@@ -129,9 +130,9 @@ impl<'d> Source<RecvBuffer<'d>> for Retained<'_, '_, '_, 'd> {
     fn take_datagram(
         &mut self,
         range: ops::Range<usize>,
-        payload: ReceivePayloadPlan,
+        payload: receive_workspace::ReceivePayloadPlan,
         _bytes: &[u8],
-    ) -> RecvBuffer<'d> {
+    ) -> stream::RecvBuffer<'d> {
         if let Some(packet) = &self.retained {
             let start = self
                 .body_offset
@@ -141,13 +142,13 @@ impl<'d> Source<RecvBuffer<'d>> for Retained<'_, '_, '_, 'd> {
                 .body_offset
                 .checked_add(range.end)
                 .expect("a parsed payload end fits its packet");
-            return RecvBuffer::retained(
+            return stream::RecvBuffer::retained(
                 packet
                     .get(start..end)
                     .expect("a parsed payload range remains within its retained packet"),
             );
         }
-        RecvBuffer::compact(
+        stream::RecvBuffer::compact(
             self.compact
                 .as_ref()
                 .expect("a compact receive source was prepared before commit")
@@ -159,7 +160,7 @@ impl<'d> Source<RecvBuffer<'d>> for Retained<'_, '_, '_, 'd> {
     fn take_stream<'a>(
         &'a mut self,
         range: ops::Range<usize>,
-        payload: ReceivePayloadPlan,
+        payload: receive_workspace::ReceivePayloadPlan,
         bytes: &'a [u8],
     ) -> Self::Stream<'a> {
         if self.retained.is_some() {

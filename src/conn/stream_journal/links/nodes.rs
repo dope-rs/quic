@@ -1,19 +1,19 @@
-use crate::conn::stream_journal::journal::Journal;
-use crate::conn::stream_journal::{GroupId, NONE};
+use crate::conn::stream_journal;
+use crate::conn::stream_journal::journal;
 
 use super::groups::GroupOps as _;
 
 pub(in crate::conn::stream_journal) trait NodeOps {
-    fn link_all(&mut self, id: GroupId, index: u32);
-    fn unlink_all(&mut self, id: GroupId, index: u32);
-    fn link_retry(&mut self, id: GroupId, index: u32);
-    fn unlink_retry(&mut self, id: GroupId, index: u32);
-    fn link_inflight(&mut self, id: GroupId, index: u32);
-    fn unlink_inflight(&mut self, id: GroupId, index: u32);
+    fn link_all(&mut self, id: stream_journal::GroupId, index: u32);
+    fn unlink_all(&mut self, id: stream_journal::GroupId, index: u32);
+    fn link_retry(&mut self, id: stream_journal::GroupId, index: u32);
+    fn unlink_retry(&mut self, id: stream_journal::GroupId, index: u32);
+    fn link_inflight(&mut self, id: stream_journal::GroupId, index: u32);
+    fn unlink_inflight(&mut self, id: stream_journal::GroupId, index: u32);
 }
 
-impl NodeOps for Journal {
-    fn link_all(&mut self, id: GroupId, index: u32) {
+impl NodeOps for journal::Journal {
+    fn link_all(&mut self, id: stream_journal::GroupId, index: u32) {
         let group_index = id.index();
         let tail = self.storage.groups[group_index as usize]
             .value
@@ -28,7 +28,7 @@ impl NodeOps for Journal {
             .expect("allocated node")
             .all
             .previous = tail;
-        if tail == NONE {
+        if tail == stream_journal::NONE {
             self.storage.groups[group_index as usize]
                 .value
                 .as_mut()
@@ -52,12 +52,12 @@ impl NodeOps for Journal {
         group.len += 1;
     }
 
-    fn unlink_all(&mut self, id: GroupId, index: u32) {
+    fn unlink_all(&mut self, id: stream_journal::GroupId, index: u32) {
         let node = self.storage.nodes[index as usize]
             .value
             .expect("unlinking live node");
         let group_index = id.index();
-        if node.all.previous == NONE {
+        if node.all.previous == stream_journal::NONE {
             self.storage.groups[group_index as usize]
                 .value
                 .as_mut()
@@ -73,7 +73,7 @@ impl NodeOps for Journal {
                 .all
                 .next = node.all.next;
         }
-        if node.all.next == NONE {
+        if node.all.next == stream_journal::NONE {
             self.storage.groups[group_index as usize]
                 .value
                 .as_mut()
@@ -96,7 +96,7 @@ impl NodeOps for Journal {
             .len -= 1;
     }
 
-    fn link_retry(&mut self, id: GroupId, index: u32) {
+    fn link_retry(&mut self, id: stream_journal::GroupId, index: u32) {
         if self.storage.nodes[index as usize]
             .value
             .expect("validated node")
@@ -119,10 +119,10 @@ impl NodeOps for Journal {
                 .as_mut()
                 .expect("validated node");
             node.retry.links.previous = tail;
-            node.retry.links.next = NONE;
+            node.retry.links.next = stream_journal::NONE;
             node.retry.linked = true;
         }
-        if tail == NONE {
+        if tail == stream_journal::NONE {
             self.storage.groups[group_index as usize]
                 .value
                 .as_mut()
@@ -139,7 +139,7 @@ impl NodeOps for Journal {
                 .links
                 .next = index;
         }
-        let was_empty = tail == NONE;
+        let was_empty = tail == stream_journal::NONE;
         self.storage.groups[group_index as usize]
             .value
             .as_mut()
@@ -152,7 +152,7 @@ impl NodeOps for Journal {
         }
     }
 
-    fn unlink_retry(&mut self, id: GroupId, index: u32) {
+    fn unlink_retry(&mut self, id: stream_journal::GroupId, index: u32) {
         let node = self.storage.nodes[index as usize]
             .value
             .expect("unlinking retry node");
@@ -160,7 +160,7 @@ impl NodeOps for Journal {
             return;
         }
         let group_index = id.index();
-        if node.retry.links.previous == NONE {
+        if node.retry.links.previous == stream_journal::NONE {
             self.storage.groups[group_index as usize]
                 .value
                 .as_mut()
@@ -177,7 +177,7 @@ impl NodeOps for Journal {
                 .links
                 .next = node.retry.links.next;
         }
-        if node.retry.links.next == NONE {
+        if node.retry.links.next == stream_journal::NONE {
             self.storage.groups[group_index as usize]
                 .value
                 .as_mut()
@@ -198,8 +198,8 @@ impl NodeOps for Journal {
             .value
             .as_mut()
             .expect("validated node");
-        node.retry.links.previous = NONE;
-        node.retry.links.next = NONE;
+        node.retry.links.previous = stream_journal::NONE;
+        node.retry.links.next = stream_journal::NONE;
         node.retry.linked = false;
         if self.storage.groups[group_index as usize]
             .value
@@ -208,13 +208,13 @@ impl NodeOps for Journal {
             .nodes
             .retry
             .head
-            == NONE
+            == stream_journal::NONE
         {
             self.unlink_retry_group(group_index);
         }
     }
 
-    fn link_inflight(&mut self, id: GroupId, index: u32) {
+    fn link_inflight(&mut self, id: stream_journal::GroupId, index: u32) {
         if self.storage.nodes[index as usize]
             .value
             .expect("validated node")
@@ -237,10 +237,10 @@ impl NodeOps for Journal {
                 .as_mut()
                 .expect("validated node");
             node.inflight.links.previous = tail;
-            node.inflight.links.next = NONE;
+            node.inflight.links.next = stream_journal::NONE;
             node.inflight.linked = true;
         }
-        if tail == NONE {
+        if tail == stream_journal::NONE {
             self.storage.groups[group_index as usize]
                 .value
                 .as_mut()
@@ -257,7 +257,7 @@ impl NodeOps for Journal {
                 .links
                 .next = index;
         }
-        let was_empty = tail == NONE;
+        let was_empty = tail == stream_journal::NONE;
         self.storage.groups[group_index as usize]
             .value
             .as_mut()
@@ -270,7 +270,7 @@ impl NodeOps for Journal {
         }
     }
 
-    fn unlink_inflight(&mut self, id: GroupId, index: u32) {
+    fn unlink_inflight(&mut self, id: stream_journal::GroupId, index: u32) {
         let node = self.storage.nodes[index as usize]
             .value
             .expect("unlinking in-flight node");
@@ -281,7 +281,7 @@ impl NodeOps for Journal {
         if self.queues.probe.group_cursor == group_index && self.queues.probe.node_cursor == index {
             self.queues.probe.node_cursor = node.inflight.links.next;
         }
-        if node.inflight.links.previous == NONE {
+        if node.inflight.links.previous == stream_journal::NONE {
             self.storage.groups[group_index as usize]
                 .value
                 .as_mut()
@@ -298,7 +298,7 @@ impl NodeOps for Journal {
                 .links
                 .next = node.inflight.links.next;
         }
-        if node.inflight.links.next == NONE {
+        if node.inflight.links.next == stream_journal::NONE {
             self.storage.groups[group_index as usize]
                 .value
                 .as_mut()
@@ -319,8 +319,8 @@ impl NodeOps for Journal {
             .value
             .as_mut()
             .expect("validated node");
-        node.inflight.links.previous = NONE;
-        node.inflight.links.next = NONE;
+        node.inflight.links.previous = stream_journal::NONE;
+        node.inflight.links.next = stream_journal::NONE;
         node.inflight.linked = false;
         if self.storage.groups[group_index as usize]
             .value
@@ -329,7 +329,7 @@ impl NodeOps for Journal {
             .nodes
             .inflight
             .head
-            == NONE
+            == stream_journal::NONE
         {
             self.unlink_probe_group(group_index);
         }

@@ -1,4 +1,4 @@
-use std::error::Error;
+use std::error;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,8 +24,8 @@ impl fmt::Display for ConnectFailure {
     }
 }
 
-impl Error for ConnectFailure {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
+impl error::Error for ConnectFailure {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Self::InvalidTlsConfig(error) => Some(error),
             Self::Closed | Self::Capacity | Self::InvalidConfig | Self::Tls => None,
@@ -63,4 +63,4 @@ impl<T> fmt::Display for SendFailure<T> {
     }
 }
 
-impl<T: fmt::Debug> Error for SendFailure<T> {}
+impl<T: fmt::Debug> error::Error for SendFailure<T> {}

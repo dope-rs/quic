@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time;
 
 pub(crate) const MAX_DATAGRAM_SIZE: u64 = 1200;
 
@@ -13,7 +13,7 @@ pub(crate) struct NewReno {
     pub(crate) cwnd: u64,
     pub(crate) ssthresh: u64,
     pub(crate) bytes_in_flight: u64,
-    pub(crate) last_congestion_event: Option<Instant>,
+    pub(crate) last_congestion_event: Option<time::Instant>,
 }
 
 impl Default for NewReno {
@@ -54,7 +54,7 @@ impl NewReno {
         }
     }
 
-    pub fn packets_lost(&mut self, lost_bytes: u64, lost_sent_time: Instant) {
+    pub fn packets_lost(&mut self, lost_bytes: u64, lost_sent_time: time::Instant) {
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(lost_bytes);
 
         let in_recovery = matches!(

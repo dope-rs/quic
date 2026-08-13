@@ -1,6 +1,6 @@
-use std::marker::PhantomData;
-use std::mem::size_of;
-use std::num::NonZeroU64;
+use std::marker;
+use std::mem;
+use std::num;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Control {
@@ -33,7 +33,7 @@ pub(super) struct Crypto {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Handle<T>(NonZeroU64, PhantomData<fn() -> T>);
+pub(super) struct Handle<T>(num::NonZeroU64, marker::PhantomData<fn() -> T>);
 
 impl<T> Clone for Handle<T> {
     fn clone(&self) -> Self {
@@ -47,7 +47,7 @@ impl<T> Handle<T> {
     pub(super) fn new(index: usize, generation: u32) -> Option<Self> {
         let encoded_index = u32::try_from(index).ok()?.checked_add(1)?;
         let raw = (u64::from(generation) << 32) | u64::from(encoded_index);
-        Some(Self(NonZeroU64::new(raw)?, PhantomData))
+        Some(Self(num::NonZeroU64::new(raw)?, marker::PhantomData))
     }
 
     pub(super) fn index(self) -> usize {
@@ -59,4 +59,4 @@ impl<T> Handle<T> {
     }
 }
 
-const _: () = assert!(size_of::<Option<Handle<u8>>>() == size_of::<u64>());
+const _: () = assert!(mem::size_of::<Option<Handle<u8>>>() == mem::size_of::<u64>());

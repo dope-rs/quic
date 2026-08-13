@@ -1,23 +1,26 @@
-use crate::stream::SendBuffer;
-use crate::transport_params::Params;
-use crate::varint::VarInt;
+use crate::transport_params;
+use crate::varint;
 
-use crate::conn::{Error, control, event_queue, send, stream};
+use crate::conn;
+use crate::conn::control;
+use crate::conn::event_queue;
+use crate::conn::send;
+use crate::conn::stream;
 
-use super::receive::Receive;
-use super::{Access, State, Streams, table};
-use crate::stream::ReceiveBuffer;
+use crate::conn::streams;
+use crate::conn::streams::receive::Receive as _;
+use crate::conn::streams::table;
 
 pub(in crate::conn) struct SendParts {
-    first: SendBuffer,
-    second: Option<SendBuffer>,
+    first: crate::stream::SendBuffer,
+    second: Option<crate::stream::SendBuffer>,
     fin: bool,
 }
 
 impl SendParts {
     pub(in crate::conn) const fn new(
-        first: SendBuffer,
-        second: Option<SendBuffer>,
+        first: crate::stream::SendBuffer,
+        second: Option<crate::stream::SendBuffer>,
         fin: bool,
     ) -> Self {
         Self { first, second, fin }
@@ -29,15 +32,15 @@ pub(in crate::conn) trait Transmit {
         &mut self,
         stream_id: u64,
         data: &[u8],
-        peer_transport_params: Option<&Params>,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         available: bool,
     ) -> Result<(), stream::Error>;
     fn send_buffer(
         &mut self,
         stream_id: u64,
-        data: SendBuffer,
-        peer_transport_params: Option<&Params>,
+        data: crate::stream::SendBuffer,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         available: bool,
     ) -> Result<(), stream::Error>;
@@ -45,7 +48,7 @@ pub(in crate::conn) trait Transmit {
         &mut self,
         stream_id: u64,
         parts: SendParts,
-        peer_transport_params: Option<&Params>,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         available: bool,
     ) -> Result<(), stream::Error>;
@@ -54,7 +57,7 @@ pub(in crate::conn) trait Transmit {
     fn send_fin(
         &mut self,
         stream_id: u64,
-        peer_transport_params: Option<&Params>,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         available: bool,
     ) -> Result<(), stream::Error>;
@@ -62,7 +65,7 @@ pub(in crate::conn) trait Transmit {
         &mut self,
         stream_id: u64,
         error_code: u64,
-        peer_transport_params: Option<&Params>,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         available: bool,
         control: &mut control::Pending,
@@ -79,18 +82,18 @@ pub(in crate::conn) trait Transmit {
     fn open_local(
         &mut self,
         is_uni: bool,
-        peer_transport_params: Option<&Params>,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         available: bool,
     ) -> Result<u64, stream::Error>;
     fn peer_initial_credit(
-        peer_transport_params: Option<&Params>,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         stream_id: u64,
     ) -> u64;
 }
 
-impl<B: ReceiveBuffer> Streams<B> {
+impl<B: crate::stream::ReceiveBuffer> streams::Streams<B> {
     /// Resolves a wire stream ID once, retains the lifetime-bound entry for the
     /// whole mutation, and schedules through its typed slot handle.
     fn with_send_entry<R>(
@@ -124,12 +127,12 @@ impl<B: ReceiveBuffer> Streams<B> {
     }
 }
 
-impl<B: ReceiveBuffer> State<B> {
+impl<B: crate::stream::ReceiveBuffer> streams::State<B> {
     pub(in crate::conn) fn raise_stream_credit_reserved<C: control::Write>(
         &mut self,
         stream_id: u64,
         maximum: u64,
-        peer_transport_params: Option<&Params>,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         control: &mut C,
     ) {
@@ -140,7 +143,7 @@ impl<B: ReceiveBuffer> State<B> {
         {
             return;
         }
-        let credit = <Streams<B> as Transmit>::peer_initial_credit(
+        let credit = <streams::Streams<B> as Transmit>::peer_initial_credit(
             peer_transport_params,
             is_client,
             stream_id,
@@ -164,13 +167,13 @@ impl<B: ReceiveBuffer> State<B> {
         &self,
         stream_id: u64,
         is_client: bool,
-    ) -> Result<StopImpact, Error> {
+    ) -> Result<StopImpact, conn::Error> {
         let is_uni = stream_id & 0x2 != 0;
         let we_initiated = (stream_id & 0x1 == 0) == is_client;
         if we_initiated {
-            self.validate_access_reserved(stream_id, Access::Send, is_client)?;
+            self.validate_access_reserved(stream_id, streams::Access::Send, is_client)?;
         } else if is_uni || stream_id >> 2 >= self.peer_initiated.max[usize::from(is_uni)] {
-            return Err(Error::ProtocolViolation);
+            return Err(conn::Error::ProtocolViolation);
         }
         let peer_send_retired = (stream_id & 0x1 == 0) != is_client
             && stream_id & 0x2 == 0
@@ -198,7 +201,7 @@ impl<B: ReceiveBuffer> State<B> {
         &mut self,
         stream_id: u64,
         error_code: u64,
-        peer_transport_params: Option<&Params>,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         control: &mut control::Pending,
         events: &mut event_queue::Permit<'_>,
@@ -210,7 +213,7 @@ impl<B: ReceiveBuffer> State<B> {
         {
             return;
         }
-        let credit = <Streams<B> as Transmit>::peer_initial_credit(
+        let credit = <streams::Streams<B> as Transmit>::peer_initial_credit(
             peer_transport_params,
             is_client,
             stream_id,
@@ -272,16 +275,16 @@ impl StopImpact {
     };
 }
 
-impl<B: ReceiveBuffer> Transmit for Streams<B> {
+impl<B: crate::stream::ReceiveBuffer> Transmit for streams::Streams<B> {
     fn send_bytes(
         &mut self,
         stream_id: u64,
         data: &[u8],
-        peer_transport_params: Option<&Params>,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         available: bool,
     ) -> Result<(), stream::Error> {
-        self.validate_operation(stream_id, Access::Send, is_client, available)?;
+        self.validate_operation(stream_id, streams::Access::Send, is_client, available)?;
         if self.peer_send_retired(stream_id, is_client) {
             return Ok(());
         }
@@ -298,12 +301,12 @@ impl<B: ReceiveBuffer> Transmit for Streams<B> {
     fn send_buffer(
         &mut self,
         stream_id: u64,
-        data: SendBuffer,
-        peer_transport_params: Option<&Params>,
+        data: crate::stream::SendBuffer,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         available: bool,
     ) -> Result<(), stream::Error> {
-        self.validate_operation(stream_id, Access::Send, is_client, available)?;
+        self.validate_operation(stream_id, streams::Access::Send, is_client, available)?;
         if self.peer_send_retired(stream_id, is_client) {
             return Ok(());
         }
@@ -321,12 +324,12 @@ impl<B: ReceiveBuffer> Transmit for Streams<B> {
         &mut self,
         stream_id: u64,
         parts: SendParts,
-        peer_transport_params: Option<&Params>,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         available: bool,
     ) -> Result<(), stream::Error> {
         let SendParts { first, second, fin } = parts;
-        self.validate_operation(stream_id, Access::Send, is_client, available)?;
+        self.validate_operation(stream_id, streams::Access::Send, is_client, available)?;
         if self.peer_send_retired(stream_id, is_client) {
             return Ok(());
         }
@@ -367,11 +370,11 @@ impl<B: ReceiveBuffer> Transmit for Streams<B> {
     fn send_fin(
         &mut self,
         stream_id: u64,
-        peer_transport_params: Option<&Params>,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         available: bool,
     ) -> Result<(), stream::Error> {
-        self.validate_operation(stream_id, Access::Send, is_client, available)?;
+        self.validate_operation(stream_id, streams::Access::Send, is_client, available)?;
         if self.peer_send_retired(stream_id, is_client) {
             return Ok(());
         }
@@ -389,13 +392,13 @@ impl<B: ReceiveBuffer> Transmit for Streams<B> {
         &mut self,
         stream_id: u64,
         error_code: u64,
-        peer_transport_params: Option<&Params>,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         available: bool,
         control: &mut control::Pending,
     ) -> Result<(), stream::Error> {
-        self.validate_operation(stream_id, Access::Send, is_client, available)?;
-        if error_code > VarInt::MAX {
+        self.validate_operation(stream_id, streams::Access::Send, is_client, available)?;
+        if error_code > varint::VarInt::MAX {
             return Err(stream::Error::ValueOutOfRange);
         }
         if self.peer_send_retired(stream_id, is_client) {
@@ -428,8 +431,8 @@ impl<B: ReceiveBuffer> Transmit for Streams<B> {
         available: bool,
         control: &mut control::Pending,
     ) -> Result<(), stream::Error> {
-        self.validate_operation(stream_id, Access::Receive, is_client, available)?;
-        if error_code > VarInt::MAX {
+        self.validate_operation(stream_id, streams::Access::Receive, is_client, available)?;
+        if error_code > varint::VarInt::MAX {
             return Err(stream::Error::ValueOutOfRange);
         }
         if !self.recv_side_closed(stream_id, is_client) {
@@ -456,7 +459,7 @@ impl<B: ReceiveBuffer> Transmit for Streams<B> {
     fn open_local(
         &mut self,
         is_uni: bool,
-        peer_transport_params: Option<&Params>,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         available: bool,
     ) -> Result<u64, stream::Error> {
@@ -484,7 +487,7 @@ impl<B: ReceiveBuffer> Transmit for Streams<B> {
     }
 
     fn peer_initial_credit(
-        peer_transport_params: Option<&Params>,
+        peer_transport_params: Option<&transport_params::Params>,
         is_client: bool,
         stream_id: u64,
     ) -> u64 {

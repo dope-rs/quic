@@ -1,30 +1,31 @@
-use super::delivery::{self, Control, Handle, Stream};
-use super::{Epoch, PACKET_CONTROL_CAPACITY, PACKET_STREAM_CAPACITY};
-use o3::collections::fixed::array::CopyInline;
+use crate::conn;
+use crate::conn::delivery;
+use o3::collections::fixed::array;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Delivery<T> {
     pub(super) record: T,
     /// A generation-checked selected slot, probe, or retransmission.
-    pub(super) tracked: Option<Handle<T>>,
+    pub(super) tracked: Option<delivery::Handle<T>>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ControlDelivery {
-    pub(super) record: Control,
-    pub(super) handle: Handle<Control>,
+    pub(super) record: delivery::Control,
+    pub(super) handle: delivery::Handle<delivery::Control>,
 }
 
 pub(super) struct Packet {
-    pub(super) epoch: Epoch,
+    pub(super) epoch: conn::Epoch,
     pub(super) pn: u64,
     pub(super) bytes: usize,
     pub(super) ack_eliciting: bool,
     pub(super) in_flight: bool,
     pub(super) ack_included: bool,
     pub(super) crypto: Option<Delivery<delivery::Crypto>>,
-    pub(super) controls: CopyInline<ControlDelivery, PACKET_CONTROL_CAPACITY>,
-    pub(super) streams: CopyInline<Delivery<Stream>, PACKET_STREAM_CAPACITY>,
+    pub(super) controls: array::CopyInline<ControlDelivery, { conn::PACKET_CONTROL_CAPACITY }>,
+    pub(super) streams:
+        array::CopyInline<Delivery<delivery::Stream>, { conn::PACKET_STREAM_CAPACITY }>,
     pub(super) early_data: bool,
     pub(super) datagram: bool,
     pub(super) close: bool,
@@ -41,7 +42,7 @@ pub(super) struct Datagram {
 }
 
 impl Packet {
-    pub(super) fn new(epoch: Epoch, pn: u64) -> Self {
+    pub(super) fn new(epoch: conn::Epoch, pn: u64) -> Self {
         Self {
             epoch,
             pn,
@@ -50,8 +51,8 @@ impl Packet {
             in_flight: false,
             ack_included: false,
             crypto: None,
-            controls: CopyInline::new(),
-            streams: CopyInline::new(),
+            controls: array::CopyInline::new(),
+            streams: array::CopyInline::new(),
             early_data: false,
             datagram: false,
             close: false,
@@ -60,7 +61,7 @@ impl Packet {
         }
     }
 
-    pub(super) fn contains_control(&self, record: Control) -> bool {
+    pub(super) fn contains_control(&self, record: delivery::Control) -> bool {
         self.controls
             .as_slice()
             .iter()
@@ -69,25 +70,26 @@ impl Packet {
 
     pub(super) fn push_control_delivery(
         &mut self,
-        record: Control,
-        handle: Handle<Control>,
+        record: delivery::Control,
+        handle: delivery::Handle<delivery::Control>,
     ) -> bool {
         self.controls
             .push(ControlDelivery { record, handle })
             .is_ok()
     }
 
-    pub(super) fn push_stream(&mut self, record: Stream) -> bool {
+    pub(super) fn push_stream(&mut self, record: delivery::Stream) -> bool {
         self.push_stream_delivery(Delivery {
             record,
             tracked: None,
         })
     }
 
-    pub(super) fn push_stream_delivery(&mut self, delivery: Delivery<Stream>) -> bool {
+    pub(super) fn push_stream_delivery(&mut self, delivery: Delivery<delivery::Stream>) -> bool {
         self.streams.push(delivery).is_ok()
     }
 }
 
-const _: () =
-    assert!(std::mem::size_of::<ControlDelivery>() == std::mem::size_of::<Delivery<Control>>());
+const _: () = assert!(
+    std::mem::size_of::<ControlDelivery>() == std::mem::size_of::<Delivery<delivery::Control>>()
+);

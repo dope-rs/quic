@@ -1,10 +1,10 @@
 use dope::core::driver::schedule;
 
 use crate::conn;
-use crate::stream::ReceiveBuffer;
+use crate::stream;
 
 use super::routing::SlotOps as _;
-use super::{DIRECT_DRIVE_BUDGET, Handler, Router};
+use crate::mux;
 
 #[derive(Default)]
 pub(super) struct State {
@@ -12,24 +12,30 @@ pub(super) struct State {
     pub(super) cursor: usize,
 }
 
-pub struct Shutdown<'a, 'tls, H, P, const DOMAIN: u8, B: ReceiveBuffer = Vec<u8>>
+pub struct Shutdown<'a, 'tls, H, P, const DOMAIN: u8, B: stream::ReceiveBuffer = Vec<u8>>
 where
-    H: Handler<DOMAIN, B>,
+    H: mux::Handler<DOMAIN, B>,
     P: conn::server::Policy,
 {
-    mux: &'a mut Router<'tls, H, P, DOMAIN, B>,
+    mux: &'a mut mux::Router<'tls, H, P, DOMAIN, B>,
 }
 
-impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    Shutdown<'a, 'tls, H, P, DOMAIN, B>
+impl<
+    'a,
+    'tls,
+    H: mux::Handler<DOMAIN, B>,
+    P: conn::server::Policy,
+    const DOMAIN: u8,
+    B: stream::ReceiveBuffer,
+> Shutdown<'a, 'tls, H, P, DOMAIN, B>
 {
-    pub(super) fn new(mux: &'a mut Router<'tls, H, P, DOMAIN, B>) -> Self {
+    pub(super) fn new(mux: &'a mut mux::Router<'tls, H, P, DOMAIN, B>) -> Self {
         Self { mux }
     }
 
     pub fn bounded(&mut self) -> bool {
         self.begin();
-        for _ in 0..DIRECT_DRIVE_BUDGET {
+        for _ in 0..mux::DIRECT_DRIVE_BUDGET {
             if !self.step_inner() {
                 break;
             }

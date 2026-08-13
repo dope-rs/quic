@@ -1,26 +1,27 @@
-use std::time::Instant;
+use std::time;
 
 use dope::manifold::datagram;
 
-use crate::conn::{Epoch, Error, ReceiveWorkspace, handshake};
-use crate::packet::{LongType, ParsedLong, ShortHeader};
-use crate::stream::RecvBuffer;
+use crate::conn;
+use crate::conn::handshake;
+use crate::packet;
+use crate::stream;
 
-use super::Ingress;
 use super::frames::{self, ProcessFrames as _};
+use crate::conn::ingress;
 
 pub(crate) struct Retained<'a, 'd, const DOMAIN: u8> {
-    ingress: Ingress<'a, DOMAIN, RecvBuffer<'d>>,
+    ingress: ingress::Ingress<'a, DOMAIN, stream::RecvBuffer<'d>>,
 }
 
 impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
     pub(crate) fn routed(
-        connection: &'a mut crate::conn::session::Connection<DOMAIN, RecvBuffer<'d>>,
-        workspace: &'a mut ReceiveWorkspace,
+        connection: &'a mut crate::conn::session::Connection<DOMAIN, stream::RecvBuffer<'d>>,
+        workspace: &'a mut conn::ReceiveWorkspace,
         routed_local_cid: Option<crate::conn::path::LocalCidKey>,
     ) -> Self {
         Self {
-            ingress: Ingress::routed(connection, workspace, routed_local_cid),
+            ingress: ingress::Ingress::routed(connection, workspace, routed_local_cid),
         }
     }
 }
@@ -30,8 +31,8 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
         &mut self,
         packet: datagram::packet::Packet<'turn, 'd>,
         retainer: datagram::packet::Retainer<'_, 'd>,
-        now: Instant,
-    ) -> Result<(), Error> {
+        now: time::Instant,
+    ) -> Result<(), conn::Error> {
         self.recv_datagram_with(packet, retainer, now, &mut handshake::ClientReader)
     }
 
@@ -39,9 +40,9 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
         &mut self,
         packet: datagram::packet::Packet<'turn, 'd>,
         retainer: datagram::packet::Retainer<'_, 'd>,
-        now: Instant,
+        now: time::Instant,
         tls: &mut handshake::ClientTls<'_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), conn::Error> {
         self.recv_datagram_with(
             packet,
             retainer,
@@ -54,9 +55,9 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
         &mut self,
         packet: datagram::packet::Packet<'turn, 'd>,
         retainer: datagram::packet::Retainer<'_, 'd>,
-        now: Instant,
+        now: time::Instant,
         server: &mut shin::server::QuicConnection<handshake::Clock, DOMAIN, G, V>,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         G: shin::server::config::EarlyDataGuard,
         V: shin::server::config::ClientCertVerifier,
@@ -73,9 +74,9 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
         &mut self,
         packet: datagram::packet::Packet<'turn, 'd>,
         retainer: datagram::packet::Retainer<'_, 'd>,
-        now: Instant,
+        now: time::Instant,
         server: &mut shin::server::QuicPooledConnection<'_, handshake::Clock, DOMAIN, V, G>,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         G: shin::server::config::EarlyDataGuard,
         V: shin::server::config::ClientCertVerifier,
@@ -92,8 +93,8 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
         &mut self,
         packet: datagram::packet::Packet<'turn, 'd>,
         retainer: datagram::packet::Retainer<'_, 'd>,
-        now: Instant,
-    ) -> Result<(), Error> {
+        now: time::Instant,
+    ) -> Result<(), conn::Error> {
         self.recv_datagram_with(packet, retainer, now, &mut handshake::FinishedReader)
     }
 
@@ -101,9 +102,9 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
         &mut self,
         packet: datagram::packet::Packet<'turn, 'd>,
         retainer: datagram::packet::Retainer<'_, 'd>,
-        now: Instant,
+        now: time::Instant,
         read: &mut R,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
     {
@@ -134,14 +135,23 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
                 self.ingress.recv_retry(packet.as_ref())?;
                 break;
             }
-            let parsed = ParsedLong::parse(packet).map_err(|_| Error::HeaderDecode)?;
+            let parsed =
+                packet::ParsedLong::parse(packet).map_err(|_| conn::Error::HeaderDecode)?;
             let kind = parsed.kind();
-            let (packet, tail) = parsed.split_first().map_err(|_| Error::HeaderDecode)?;
+            let (packet, tail) = parsed
+                .split_first()
+                .map_err(|_| conn::Error::HeaderDecode)?;
             match kind {
-                LongType::Initial => self.recv_initial_datagram(packet, now, read)?,
-                LongType::ZeroRtt => self.recv_zero_rtt_datagram(packet, retainer, now, read)?,
-                LongType::Handshake => self.recv_handshake_datagram(packet, now, read)?,
-                LongType::Retry => return Err(Error::HeaderDecode),
+                crate::packet::LongType::Initial => {
+                    self.recv_initial_datagram(packet, now, read)?
+                }
+                crate::packet::LongType::ZeroRtt => {
+                    self.recv_zero_rtt_datagram(packet, retainer, now, read)?
+                }
+                crate::packet::LongType::Handshake => {
+                    self.recv_handshake_datagram(packet, now, read)?
+                }
+                crate::packet::LongType::Retry => return Err(conn::Error::HeaderDecode),
             }
             rest = Some(tail);
         }
@@ -150,24 +160,25 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
 
     fn recv_zero_rtt_datagram<'turn, R>(
         &mut self,
-        packet: ParsedLong<datagram::packet::Split<'turn, 'd>>,
+        packet: packet::ParsedLong<datagram::packet::Split<'turn, 'd>>,
         retainer: datagram::packet::Retainer<'_, 'd>,
-        now: Instant,
+        now: time::Instant,
         read: &mut R,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
     {
         let Some(zr) = self.ingress.connection.handshake.zero_rtt_read_key() else {
             return Ok(());
         };
-        let expected = self.ingress.connection.received[Epoch::Application as usize].expected_pn();
+        let expected =
+            self.ingress.connection.received[conn::Epoch::Application as usize].expected_pn();
         let packet = packet
             .decrypt(zr, expected)
-            .map_err(|_| Error::PacketDecrypt)?;
+            .map_err(|_| conn::Error::PacketDecrypt)?;
         let (pn, packet, body) = packet.into_parts();
         self.process_retained_body(
-            frames::PacketMeta::new(Epoch::Application, pn, now),
+            frames::PacketMeta::new(conn::Epoch::Application, pn, now),
             packet,
             body,
             retainer,
@@ -178,14 +189,19 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
 
     fn recv_initial_datagram<'turn, R>(
         &mut self,
-        packet: ParsedLong<datagram::packet::Split<'turn, 'd>>,
-        now: Instant,
+        packet: packet::ParsedLong<datagram::packet::Split<'turn, 'd>>,
+        now: time::Instant,
         read: &mut R,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
     {
-        let Some(initial_r) = self.ingress.connection.handshake.read_key(Epoch::Initial) else {
+        let Some(initial_r) = self
+            .ingress
+            .connection
+            .handshake
+            .read_key(conn::Epoch::Initial)
+        else {
             return Ok(());
         };
         if self.ingress.connection.is_client
@@ -196,14 +212,15 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
                 .path
                 .set_first_peer_cid(packet.scid());
         }
-        let expected = self.ingress.connection.received[Epoch::Initial as usize].expected_pn();
+        let expected =
+            self.ingress.connection.received[conn::Epoch::Initial as usize].expected_pn();
         let packet = packet
             .decrypt(initial_r, expected)
-            .map_err(|_| Error::PacketDecrypt)?;
+            .map_err(|_| conn::Error::PacketDecrypt)?;
         let pn = packet.packet_number();
-        let mut source = frames::Copied::<RecvBuffer<'d>>::new();
+        let mut source = frames::Copied::<stream::RecvBuffer<'d>>::new();
         self.ingress.process_packet_body(
-            frames::PacketMeta::new(Epoch::Initial, pn, now),
+            frames::PacketMeta::new(conn::Epoch::Initial, pn, now),
             None,
             packet.body(),
             read,
@@ -213,25 +230,31 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
 
     fn recv_handshake_datagram<'turn, R>(
         &mut self,
-        packet: ParsedLong<datagram::packet::Split<'turn, 'd>>,
-        now: Instant,
+        packet: packet::ParsedLong<datagram::packet::Split<'turn, 'd>>,
+        now: time::Instant,
         read: &mut R,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
     {
-        let Some(hr) = self.ingress.connection.handshake.read_key(Epoch::Handshake) else {
+        let Some(hr) = self
+            .ingress
+            .connection
+            .handshake
+            .read_key(conn::Epoch::Handshake)
+        else {
             return Ok(());
         };
-        let expected = self.ingress.connection.received[Epoch::Handshake as usize].expected_pn();
+        let expected =
+            self.ingress.connection.received[conn::Epoch::Handshake as usize].expected_pn();
         let packet = packet
             .decrypt(hr, expected)
-            .map_err(|_| Error::PacketDecrypt)?;
+            .map_err(|_| conn::Error::PacketDecrypt)?;
         self.ingress.connection.egress.peer_address_validated = true;
         let pn = packet.packet_number();
-        let mut source = frames::Copied::<RecvBuffer<'d>>::new();
+        let mut source = frames::Copied::<stream::RecvBuffer<'d>>::new();
         self.ingress.process_packet_body(
-            frames::PacketMeta::new(Epoch::Handshake, pn, now),
+            frames::PacketMeta::new(conn::Epoch::Handshake, pn, now),
             None,
             packet.body(),
             read,
@@ -243,9 +266,9 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
         &mut self,
         mut packet: datagram::packet::Split<'turn, 'd>,
         retainer: datagram::packet::Retainer<'_, 'd>,
-        now: Instant,
+        now: time::Instant,
         read: &mut R,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
     {
@@ -253,17 +276,19 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
             .ingress
             .connection
             .handshake
-            .read_key(Epoch::Application)
+            .read_key(conn::Epoch::Application)
         else {
             return Ok(());
         };
-        let pn_offset = ShortHeader::pn_offset_for(self.ingress.connection.path.local_cid().len());
-        let expected = self.ingress.connection.received[Epoch::Application as usize].expected_pn();
+        let pn_offset =
+            packet::ShortHeader::pn_offset_for(self.ingress.connection.path.local_cid().len());
+        let expected =
+            self.ingress.connection.received[conn::Epoch::Application as usize].expected_pn();
         let (pn, body) = ar
             .decrypt_short_in_place(packet.as_mut(), pn_offset, expected)
-            .map_err(|_| Error::PacketDecrypt)?;
+            .map_err(|_| conn::Error::PacketDecrypt)?;
         self.process_retained_body(
-            frames::PacketMeta::new(Epoch::Application, pn, now),
+            frames::PacketMeta::new(conn::Epoch::Application, pn, now),
             packet,
             body,
             retainer,
@@ -280,15 +305,16 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
         retainer: datagram::packet::Retainer<'_, 'd>,
         read: &mut R,
         one_rtt: bool,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
     {
         let packet = packet.freeze();
         let packet_cid = one_rtt.then(|| frames::PacketCid {
             routed: self.ingress.routed_local_cid,
-            bytes: &packet.as_ref()
-                [1..ShortHeader::pn_offset_for(self.ingress.connection.path.local_cid().len())],
+            bytes: &packet.as_ref()[1..packet::ShortHeader::pn_offset_for(
+                self.ingress.connection.path.local_cid().len(),
+            )],
         });
         let bytes = &packet.as_ref()[body.clone()];
         let mut source = frames::Retained::new(&packet, retainer, body.start);

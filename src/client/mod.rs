@@ -2,23 +2,21 @@ pub mod raw;
 mod sealed;
 
 use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::net;
+use std::pin;
+use std::time;
 
-use dope::core::driver::Context;
-use o3::collections::{heap::Min, queue::slot::Fifo};
-use pin_project::pin_project;
-use ring::rand::{SecureRandom, SystemRandom};
+use dope::core::driver;
+use o3::collections::heap;
+use o3::collections::queue::slot;
+use pin_project;
+use ring::rand::SecureRandom as _;
 
-use crate::SendFailure;
-use crate::conn::session::Connection;
-use crate::conn::{self, Handle};
-use crate::endpoint::{self, PooledSocket};
-use crate::mux::Handler;
-use crate::packet::ConnectionId;
-use std::io::Error;
-use std::io::ErrorKind;
+use crate::conn;
+use crate::conn::session;
+use crate::endpoint;
+use crate::mux;
+use crate::packet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct SlotId(u32);
@@ -34,7 +32,7 @@ impl SlotId {
 }
 
 pub trait BackoffPolicy: 'static {
-    fn next_retry_at(&self, attempt: u32, now: Instant) -> Instant;
+    fn next_retry_at(&self, attempt: u32, now: time::Instant) -> time::Instant;
 }
 
 pub trait Protocol: 'static {
@@ -57,14 +55,14 @@ impl ConfigProvider for StaticConfig {
 
 #[derive(Clone)]
 pub struct EndpointSpec {
-    pub addr: SocketAddr,
+    pub addr: net::SocketAddr,
     pub pubkey: [u8; 32],
 }
 
 #[derive(Clone, Copy)]
 /// One remote endpoint backed by externally owned, exactly reserved TLS state.
 pub struct PooledEndpointSpec<'tls> {
-    pub addr: SocketAddr,
+    pub addr: net::SocketAddr,
     pub pool: &'tls conn::tls::ClientPool,
 }
 
@@ -72,26 +70,26 @@ mod authority;
 
 #[doc(hidden)]
 pub trait EndpointAuthority<'tls>: Copy + authority::Authority {
-    fn connect<'d, const ID: u8, H: Handler<ID>>(
+    fn connect<'d, const ID: u8, H: mux::Handler<ID>>(
         self,
-        endpoint: Pin<&mut PooledSocket<'d, 'tls, ID, H>>,
-        addr: SocketAddr,
+        endpoint: pin::Pin<&mut endpoint::PooledSocket<'d, 'tls, ID, H>>,
+        addr: net::SocketAddr,
         config: conn::config::Options,
-        dcid: ConnectionId,
-    ) -> Result<Handle, crate::ConnectFailure>;
+        dcid: packet::ConnectionId,
+    ) -> Result<conn::Handle, crate::ConnectFailure>;
 }
 
 impl authority::Authority for [u8; 32] {}
 
 impl<'tls> EndpointAuthority<'tls> for [u8; 32] {
     #[inline]
-    fn connect<'d, const ID: u8, H: Handler<ID>>(
+    fn connect<'d, const ID: u8, H: mux::Handler<ID>>(
         self,
-        endpoint: Pin<&mut PooledSocket<'d, 'tls, ID, H>>,
-        addr: SocketAddr,
+        endpoint: pin::Pin<&mut endpoint::PooledSocket<'d, 'tls, ID, H>>,
+        addr: net::SocketAddr,
         config: conn::config::Options,
-        dcid: ConnectionId,
-    ) -> Result<Handle, crate::ConnectFailure> {
+        dcid: packet::ConnectionId,
+    ) -> Result<conn::Handle, crate::ConnectFailure> {
         endpoint.connect_with_config_id(addr, self, config, dcid)
     }
 }
@@ -100,13 +98,13 @@ impl authority::Authority for &conn::tls::ClientPool {}
 
 impl<'tls> EndpointAuthority<'tls> for &'tls conn::tls::ClientPool {
     #[inline]
-    fn connect<'d, const ID: u8, H: Handler<ID>>(
+    fn connect<'d, const ID: u8, H: mux::Handler<ID>>(
         self,
-        endpoint: Pin<&mut PooledSocket<'d, 'tls, ID, H>>,
-        addr: SocketAddr,
+        endpoint: pin::Pin<&mut endpoint::PooledSocket<'d, 'tls, ID, H>>,
+        addr: net::SocketAddr,
         config: conn::config::Options,
-        dcid: ConnectionId,
-    ) -> Result<Handle, crate::ConnectFailure> {
+        dcid: packet::ConnectionId,
+    ) -> Result<conn::Handle, crate::ConnectFailure> {
         endpoint.connect_pooled_with_config_id(addr, self, config, dcid)
     }
 }
@@ -120,34 +118,34 @@ pub struct Config {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PathStats {
-    pub srtt: Option<Duration>,
-    pub min_rtt: Option<Duration>,
+    pub srtt: Option<time::Duration>,
+    pub min_rtt: Option<time::Duration>,
     pub cwnd: u64,
     pub bytes_in_flight: u64,
 }
 
 struct EndpointSlot<A> {
-    addr: SocketAddr,
+    addr: net::SocketAddr,
     authority: A,
-    handle: Option<Handle>,
+    handle: Option<conn::Handle>,
     attempt: u32,
 }
 
 #[derive(Clone, Copy)]
 struct Binding {
-    handle: Handle,
+    handle: conn::Handle,
     slot: SlotId,
 }
 
 struct Bridge<P: Protocol> {
     protocol: P,
     handle_to_slot: Box<[Option<Binding>]>,
-    pending_close: Fifo<Binding>,
-    pending_established: Fifo<Binding>,
+    pending_close: slot::Fifo<Binding>,
+    pending_established: slot::Fifo<Binding>,
 }
 
 impl<P: Protocol> Bridge<P> {
-    fn lookup_slot(&self, handle: Handle) -> Option<SlotId> {
+    fn lookup_slot(&self, handle: conn::Handle) -> Option<SlotId> {
         self.handle_to_slot
             .get(handle.index() as usize)
             .copied()
@@ -156,7 +154,7 @@ impl<P: Protocol> Bridge<P> {
             .map(|binding| binding.slot)
     }
 
-    fn bind(&mut self, handle: Handle, slot: SlotId) -> bool {
+    fn bind(&mut self, handle: conn::Handle, slot: SlotId) -> bool {
         let Some(binding) = self.handle_to_slot.get_mut(handle.index() as usize) else {
             return false;
         };
@@ -167,7 +165,7 @@ impl<P: Protocol> Bridge<P> {
         true
     }
 
-    fn unbind(&mut self, handle: Handle) -> Option<SlotId> {
+    fn unbind(&mut self, handle: conn::Handle) -> Option<SlotId> {
         let binding = self.handle_to_slot.get_mut(handle.index() as usize)?;
         if !binding.is_some_and(|binding| binding.handle == handle) {
             return None;
@@ -176,16 +174,21 @@ impl<P: Protocol> Bridge<P> {
     }
 }
 
-impl<const DOMAIN: u8, P: Protocol> Handler<DOMAIN> for Bridge<P> {
+impl<const DOMAIN: u8, P: Protocol> mux::Handler<DOMAIN> for Bridge<P> {
     type Connection = ();
 
-    fn create_connection(&mut self, _conn: &mut Connection<DOMAIN>, _handle: Handle) {}
+    fn create_connection(
+        &mut self,
+        _conn: &mut session::Connection<DOMAIN>,
+        _handle: conn::Handle,
+    ) {
+    }
 
     fn established(
         &mut self,
         _connection: &mut (),
-        _conn: &mut Connection<DOMAIN>,
-        handle: Handle,
+        _conn: &mut session::Connection<DOMAIN>,
+        handle: conn::Handle,
     ) {
         if let Some(slot) = self.lookup_slot(handle) {
             let binding = Binding { handle, slot };
@@ -198,8 +201,8 @@ impl<const DOMAIN: u8, P: Protocol> Handler<DOMAIN> for Bridge<P> {
     fn datagram(
         &mut self,
         _connection: &mut (),
-        _conn: &mut Connection<DOMAIN>,
-        handle: Handle,
+        _conn: &mut session::Connection<DOMAIN>,
+        handle: conn::Handle,
         data: Vec<u8>,
     ) {
         if let Some(slot) = self.lookup_slot(handle) {
@@ -207,7 +210,7 @@ impl<const DOMAIN: u8, P: Protocol> Handler<DOMAIN> for Bridge<P> {
         }
     }
 
-    fn close(&mut self, _connection: (), handle: Handle) {
+    fn close(&mut self, _connection: (), handle: conn::Handle) {
         if let Some(slot) = self.unbind(handle) {
             self.protocol.close(slot);
             let binding = Binding { handle, slot };
@@ -218,7 +221,7 @@ impl<const DOMAIN: u8, P: Protocol> Handler<DOMAIN> for Bridge<P> {
     }
 }
 
-#[pin_project]
+#[pin_project::pin_project]
 pub struct Dialer<
     'd,
     'tls,
@@ -229,9 +232,9 @@ pub struct Dialer<
     C: ConfigProvider = StaticConfig,
 > {
     #[pin]
-    inner: PooledSocket<'d, 'tls, ID, Bridge<P>>,
+    inner: endpoint::PooledSocket<'d, 'tls, ID, Bridge<P>>,
     endpoints: Vec<EndpointSlot<A>>,
-    retries: Min<Instant>,
+    retries: heap::Min<time::Instant>,
     backoff: B,
     config_provider: C,
     event_budget: usize,
@@ -270,7 +273,7 @@ where
     A: EndpointAuthority<'tls>,
     C: ConfigProvider,
 {
-    inner: Pin<&'step mut Dialer<'d, 'tls, ID, P, B, A, C>>,
+    inner: pin::Pin<&'step mut Dialer<'d, 'tls, ID, P, B, A, C>>,
 }
 
 pub type Control<'step, 'd, const ID: u8, P, B, C = StaticConfig> =
@@ -291,7 +294,7 @@ where
         self.inner.as_ref().get_ref().protocol()
     }
 
-    pub fn smoothed_rtt(&self, slot: SlotId) -> Option<Duration> {
+    pub fn smoothed_rtt(&self, slot: SlotId) -> Option<time::Duration> {
         self.inner.as_ref().get_ref().smoothed_rtt(slot)
     }
 
@@ -303,7 +306,7 @@ where
         &mut self,
         slot: SlotId,
         data: Vec<u8>,
-    ) -> Result<(), SendFailure<Vec<u8>>> {
+    ) -> Result<(), crate::SendFailure<Vec<u8>>> {
         self.inner.as_mut().try_send_datagram(slot, data)
     }
 }
@@ -312,20 +315,20 @@ impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy>
     Dialer<'d, 'static, ID, P, B, [u8; 32], StaticConfig>
 {
     pub fn build(
-        bind: SocketAddr,
+        bind: net::SocketAddr,
         endpoints: Vec<EndpointSpec>,
         client_config: conn::config::Options,
         protocol: P,
         backoff: B,
         config: Config,
-        driver: &mut Context<'_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> io::Result<Self> {
         client_config
             .validate()
-            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         client_config
             .duplicate_connection()
-            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         Self::build_with_config_provider(
             bind,
             endpoints,
@@ -345,13 +348,13 @@ where
     C: ConfigProvider,
 {
     pub fn build_with_config_provider(
-        bind: SocketAddr,
+        bind: net::SocketAddr,
         endpoints: Vec<EndpointSpec>,
         config_provider: C,
         protocol: P,
         backoff: B,
         config: Config,
-        driver: &mut Context<'_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> io::Result<Self> {
         let endpoints = endpoints
             .into_iter()
@@ -378,20 +381,20 @@ impl<'d, 'tls, const ID: u8, P: Protocol, B: BackoffPolicy>
     Dialer<'d, 'tls, ID, P, B, &'tls conn::tls::ClientPool, StaticConfig>
 {
     pub fn build_pooled(
-        bind: SocketAddr,
+        bind: net::SocketAddr,
         endpoints: Vec<PooledEndpointSpec<'tls>>,
         client_config: conn::config::Options,
         protocol: P,
         backoff: B,
         config: Config,
-        driver: &mut Context<'_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> io::Result<Self> {
         client_config
             .validate_pooled_client()
-            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         client_config
             .duplicate_connection()
-            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         Self::build_pooled_with_config_provider(
             bind,
             endpoints,
@@ -411,13 +414,13 @@ where
     C: ConfigProvider,
 {
     pub fn build_pooled_with_config_provider(
-        bind: SocketAddr,
+        bind: net::SocketAddr,
         endpoints: Vec<PooledEndpointSpec<'tls>>,
         config_provider: C,
         protocol: P,
         backoff: B,
         config: Config,
-        driver: &mut Context<'_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> io::Result<Self> {
         let endpoints = endpoints
             .into_iter()
@@ -448,13 +451,13 @@ where
     C: ConfigProvider,
 {
     fn build_inner(
-        bind: SocketAddr,
+        bind: net::SocketAddr,
         endpoints: Vec<EndpointSlot<A>>,
         config_provider: C,
         protocol: P,
         backoff: B,
         config: Config,
-        driver: &mut Context<'_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> io::Result<Self> {
         let endpoint_config = config.endpoint.validate()?;
         if config.event_budget == 0
@@ -462,35 +465,36 @@ where
             || config.retry_budget == 0
             || config.retry_budget > crate::mux::MAX_OUTGOING_CAPACITY
         {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
                 "invalid QUIC client work budget",
             ));
         }
         let capacity = endpoints.len();
         if endpoint_config.max_conns != capacity {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
                 "QUIC endpoint capacity mismatch",
             ));
         }
         let mut seed = [0; 8];
-        SystemRandom::new()
+        ring::rand::SystemRandom::new()
             .fill(&mut seed)
-            .map_err(|_| Error::other("QUIC DCID entropy unavailable"))?;
+            .map_err(|_| io::Error::other("QUIC DCID entropy unavailable"))?;
         let bridge = Bridge {
             protocol,
             handle_to_slot: vec![None; capacity].into_boxed_slice(),
-            pending_close: Fifo::with_capacity(capacity),
-            pending_established: Fifo::with_capacity(capacity),
+            pending_close: slot::Fifo::with_capacity(capacity),
+            pending_established: slot::Fifo::with_capacity(capacity),
         };
-        let inner = PooledSocket::build_client_pooled(bind, bridge, endpoint_config, driver)?;
-        let now = Instant::now();
-        let mut retries = Min::with_capacity(capacity);
+        let inner =
+            endpoint::PooledSocket::build_client_pooled(bind, bridge, endpoint_config, driver)?;
+        let now = time::Instant::now();
+        let mut retries = heap::Min::with_capacity(capacity);
         for index in 0..capacity {
             retries
                 .insert(index, now)
-                .map_err(|_| Error::other("QUIC retry scheduler capacity mismatch"))?;
+                .map_err(|_| io::Error::other("QUIC retry scheduler capacity mismatch"))?;
         }
         Ok(Self {
             inner,
@@ -508,11 +512,11 @@ where
         &self.inner.handler().protocol
     }
 
-    pub(crate) fn protocol_mut(self: Pin<&mut Self>) -> &mut P {
+    pub(crate) fn protocol_mut(self: pin::Pin<&mut Self>) -> &mut P {
         &mut self.project().inner.handler_mut().protocol
     }
 
-    pub fn local_addr(&self) -> SocketAddr {
+    pub fn local_addr(&self) -> net::SocketAddr {
         self.inner.local_addr()
     }
 
@@ -528,7 +532,7 @@ where
     }
 
     /// Smoothed RTT of the QUIC connection on `slot`, if connected.
-    pub fn smoothed_rtt(&self, slot: SlotId) -> Option<Duration> {
+    pub fn smoothed_rtt(&self, slot: SlotId) -> Option<time::Duration> {
         let handle = self.endpoints.get(slot.index() as usize)?.handle?;
         self.inner.conn(handle)?.status().smoothed_rtt()
     }
@@ -546,35 +550,35 @@ where
     }
 
     pub fn try_send_datagram(
-        self: Pin<&mut Self>,
+        self: pin::Pin<&mut Self>,
         slot: SlotId,
         data: Vec<u8>,
-    ) -> Result<(), SendFailure<Vec<u8>>> {
+    ) -> Result<(), crate::SendFailure<Vec<u8>>> {
         let mut this = self.project();
         let index = slot.index() as usize;
         let Some(ep) = this.endpoints.get_mut(index) else {
-            return Err(SendFailure::Closed(data));
+            return Err(crate::SendFailure::Closed(data));
         };
         let Some(handle) = ep.handle else {
-            return Err(SendFailure::Closed(data));
+            return Err(crate::SendFailure::Closed(data));
         };
         match this.inner.as_mut().try_send_datagram(handle, data) {
             Ok(()) => Ok(()),
-            Err(SendFailure::Closed(data)) => {
+            Err(crate::SendFailure::Closed(data)) => {
                 this.inner.as_mut().close(handle);
                 this.inner.as_mut().handler_mut().unbind(handle);
                 ep.handle = None;
                 ep.attempt = ep.attempt.saturating_add(1);
-                let retry_at = this.backoff.next_retry_at(ep.attempt, Instant::now());
+                let retry_at = this.backoff.next_retry_at(ep.attempt, time::Instant::now());
                 this.retries.remove(index);
                 let _ = this.retries.insert(index, retry_at);
-                Err(SendFailure::Closed(data))
+                Err(crate::SendFailure::Closed(data))
             }
             Err(error) => Err(error),
         }
     }
 
-    fn try_connect(self: Pin<&mut Self>, slot: SlotId) -> bool {
+    fn try_connect(self: pin::Pin<&mut Self>, slot: SlotId) -> bool {
         let mut this = self.project();
         let index = slot.index() as usize;
         let (addr, authority) = match this.endpoints.get(index) {
@@ -583,13 +587,15 @@ where
             Some(_) => return false,
         };
         *this.dcid_seed = this.dcid_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let Ok(dcid) = ConnectionId::try_from(this.dcid_seed.to_be_bytes()) else {
+        let Ok(dcid) = packet::ConnectionId::try_from(this.dcid_seed.to_be_bytes()) else {
             return false;
         };
         let Some(config) = this.config_provider.config(slot) else {
             if let Some(endpoint) = this.endpoints.get_mut(index) {
                 endpoint.attempt = endpoint.attempt.saturating_add(1);
-                let retry_at = this.backoff.next_retry_at(endpoint.attempt, Instant::now());
+                let retry_at = this
+                    .backoff
+                    .next_retry_at(endpoint.attempt, time::Instant::now());
                 this.retries.remove(index);
                 let _ = this.retries.insert(index, retry_at);
             }
@@ -599,7 +605,9 @@ where
         let Ok(handle) = connection else {
             if let Some(endpoint) = this.endpoints.get_mut(index) {
                 endpoint.attempt = endpoint.attempt.saturating_add(1);
-                let retry_at = this.backoff.next_retry_at(endpoint.attempt, Instant::now());
+                let retry_at = this
+                    .backoff
+                    .next_retry_at(endpoint.attempt, time::Instant::now());
                 this.retries.remove(index);
                 let _ = this.retries.insert(index, retry_at);
             }
@@ -614,7 +622,9 @@ where
         this.inner.as_mut().close(handle);
         if let Some(endpoint) = this.endpoints.get_mut(index) {
             endpoint.attempt = endpoint.attempt.saturating_add(1);
-            let retry_at = this.backoff.next_retry_at(endpoint.attempt, Instant::now());
+            let retry_at = this
+                .backoff
+                .next_retry_at(endpoint.attempt, time::Instant::now());
             this.retries.remove(index);
             let _ = this.retries.insert(index, retry_at);
         }

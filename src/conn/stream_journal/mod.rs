@@ -1,14 +1,14 @@
 use std::marker;
-use std::num::NonZeroU64;
-use std::ops::{Index, IndexMut};
+use std::num;
+use std::ops;
 
-use crate::stream::Sender;
+use crate::stream;
 
 use super::{delivery, send};
 
 pub(super) mod journal;
 mod links;
-use journal::Journal;
+
 use links::storage::StorageOps as _;
 
 const NONE: u32 = u32::MAX;
@@ -60,12 +60,12 @@ struct GroupNodes {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
-pub(super) struct GroupId(NonZeroU64);
+pub(super) struct GroupId(num::NonZeroU64);
 
 impl GroupId {
     fn new(index: u32, generation: u32) -> Self {
         let raw = (u64::from(generation) << 32) | u64::from(index + 1);
-        Self(NonZeroU64::new(raw).expect("group index is encoded as nonzero"))
+        Self(num::NonZeroU64::new(raw).expect("group index is encoded as nonzero"))
     }
 
     fn index(self) -> u32 {
@@ -188,7 +188,7 @@ impl<T> Arena<T> {
     }
 }
 
-impl<T> Index<usize> for Arena<T> {
+impl<T> ops::Index<usize> for Arena<T> {
     type Output = Slot<T>;
 
     fn index(&self, index: usize) -> &Self::Output {
@@ -196,7 +196,7 @@ impl<T> Index<usize> for Arena<T> {
     }
 }
 
-impl<T> IndexMut<usize> for Arena<T> {
+impl<T> ops::IndexMut<usize> for Arena<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.slots[index]
     }
@@ -222,7 +222,7 @@ pub(super) struct InvalidPrefix;
 /// remain charged to the journal's fixed capacity.
 #[must_use]
 pub(super) struct Acknowledged<'journal> {
-    journal: &'journal mut Journal,
+    journal: &'journal mut journal::Journal,
     group: GroupId,
 }
 
@@ -235,7 +235,7 @@ impl Acknowledged<'_> {
     }
 
     /// Advances the byte owner before returning any journal node to the pool.
-    pub(super) fn commit(self, stream: &mut Sender) -> Result<bool, InvalidPrefix> {
+    pub(super) fn commit(self, stream: &mut stream::Sender) -> Result<bool, InvalidPrefix> {
         let Some((offset, bytes, fin, nodes)) = self.span() else {
             self.journal.cancel(self.group);
             return Err(InvalidPrefix);

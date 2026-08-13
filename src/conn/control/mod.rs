@@ -1,10 +1,8 @@
-use std::{marker, num::NonZeroU64};
+use std::marker;
+use std::num;
 
-use super::{
-    Epoch,
-    delivery::{Control, Handle},
-    send,
-};
+use crate::conn;
+use crate::conn::send;
 
 pub(super) mod cursor;
 pub(super) mod delivery;
@@ -12,7 +10,7 @@ pub(super) mod encode;
 mod linkage;
 mod records;
 
-use records::Records;
+use crate::conn::control::records::Records as _;
 
 const HANDSHAKE_DONE: u16 = 1 << 0;
 const NEW_CONNECTION_ID: u16 = 1 << 1;
@@ -49,13 +47,13 @@ pub(super) mod kind;
 /// delivery handles use a separate generation, so loss and replacement can
 /// invalidate stale packets without invalidating the owner's identity.
 #[repr(transparent)]
-pub(super) struct OwnerKey<Kind>(NonZeroU64, marker::PhantomData<fn() -> Kind>);
+pub(super) struct OwnerKey<Kind>(num::NonZeroU64, marker::PhantomData<fn() -> Kind>);
 
 impl<Kind> OwnerKey<Kind> {
     fn new(index: usize, generation: u32) -> Option<Self> {
         let encoded_index = u32::try_from(index).ok()?.checked_add(1)?;
         let raw = (u64::from(generation) << 32) | u64::from(encoded_index);
-        Some(Self(NonZeroU64::new(raw)?, marker::PhantomData))
+        Some(Self(num::NonZeroU64::new(raw)?, marker::PhantomData))
     }
 
     fn index(self) -> usize {
@@ -67,7 +65,7 @@ impl<Kind> OwnerKey<Kind> {
     }
 
     fn from_raw(raw: u64) -> Option<Self> {
-        Some(Self(NonZeroU64::new(raw)?, marker::PhantomData))
+        Some(Self(num::NonZeroU64::new(raw)?, marker::PhantomData))
     }
 }
 
@@ -146,7 +144,7 @@ pub(super) enum Effect {
 enum Status {
     Queued,
     InFlight {
-        epoch: Epoch,
+        epoch: conn::Epoch,
         carriers: u16,
         probe_round: u32,
     },
@@ -183,7 +181,7 @@ struct NewConnectionId {
 }
 
 struct Entry {
-    record: Control,
+    record: crate::conn::delivery::Control,
     new_connection_id: Option<NewConnectionId>,
     status: Status,
     ready: Links,
@@ -254,7 +252,7 @@ impl Permit<'_> {
     fn queue<Kind>(
         &mut self,
         owner: &mut Option<OwnerKey<Kind>>,
-        record: Control,
+        record: crate::conn::delivery::Control,
         new_connection_id: Option<NewConnectionId>,
     ) {
         if self.pending.resolve_owner(*owner).is_none() {
@@ -268,7 +266,7 @@ impl Permit<'_> {
     fn queue_signal<Kind>(
         &mut self,
         signal: &mut Signal<Kind>,
-        record: Control,
+        record: crate::conn::delivery::Control,
         new_connection_id: Option<NewConnectionId>,
     ) {
         let mut owner = signal.owner();
@@ -343,8 +341,14 @@ pub(in crate::conn) trait Write {
         owner: &mut Option<OwnerKey<kind::PathChallenge>>,
         data: [u8; 8],
     );
-    fn acknowledge_control(&mut self, handle: Handle<Control>) -> Effect;
-    fn lose_control(&mut self, handle: Handle<Control>);
+    fn acknowledge_control(
+        &mut self,
+        handle: crate::conn::delivery::Handle<crate::conn::delivery::Control>,
+    ) -> Effect;
+    fn lose_control(
+        &mut self,
+        handle: crate::conn::delivery::Handle<crate::conn::delivery::Control>,
+    );
 }
 
 impl Write for Pending {
@@ -438,11 +442,17 @@ impl Write for Pending {
         Pending::queue_path_challenge(self, owner, data);
     }
 
-    fn acknowledge_control(&mut self, handle: Handle<Control>) -> Effect {
+    fn acknowledge_control(
+        &mut self,
+        handle: crate::conn::delivery::Handle<crate::conn::delivery::Control>,
+    ) -> Effect {
         delivery::Delivery::new(self).acknowledge(handle)
     }
 
-    fn lose_control(&mut self, handle: Handle<Control>) {
+    fn lose_control(
+        &mut self,
+        handle: crate::conn::delivery::Handle<crate::conn::delivery::Control>,
+    ) {
         delivery::Delivery::new(self).lose(handle);
     }
 }
@@ -468,7 +478,11 @@ impl Write for Permit<'_> {
 
     fn handshake_done(&mut self) {
         let mut owner = self.pending.handshake_done.take();
-        self.queue(&mut owner, Control::HandshakeDone, None);
+        self.queue(
+            &mut owner,
+            crate::conn::delivery::Control::HandshakeDone,
+            None,
+        );
         self.pending.handshake_done = owner;
     }
 
@@ -480,7 +494,7 @@ impl Write for Permit<'_> {
     ) {
         self.queue(
             owner,
-            Control::NewConnectionId(sequence),
+            crate::conn::delivery::Control::NewConnectionId(sequence),
             Some(NewConnectionId { key }),
         );
     }
@@ -490,7 +504,11 @@ impl Write for Permit<'_> {
         owner: &mut Option<OwnerKey<kind::RetireConnectionId>>,
         sequence: u64,
     ) {
-        self.queue(owner, Control::RetireConnectionId(sequence), None);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::RetireConnectionId(sequence),
+            None,
+        );
     }
 
     fn queue_reset_stream(
@@ -502,7 +520,7 @@ impl Write for Permit<'_> {
     ) {
         self.queue_signal(
             signal,
-            Control::ResetStream(stream_id, error, final_size),
+            crate::conn::delivery::Control::ResetStream(stream_id, error, final_size),
             None,
         );
     }
@@ -513,11 +531,19 @@ impl Write for Permit<'_> {
         stream_id: u64,
         error: u64,
     ) {
-        self.queue_signal(signal, Control::StopSending(stream_id, error), None);
+        self.queue_signal(
+            signal,
+            crate::conn::delivery::Control::StopSending(stream_id, error),
+            None,
+        );
     }
 
     fn queue_max_data(&mut self, owner: &mut Option<OwnerKey<kind::MaxData>>, maximum: u64) {
-        self.queue(owner, Control::MaxData(maximum), None);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::MaxData(maximum),
+            None,
+        );
     }
 
     fn queue_max_stream_data(
@@ -526,7 +552,11 @@ impl Write for Permit<'_> {
         stream_id: u64,
         maximum: u64,
     ) {
-        self.queue(owner, Control::MaxStreamData(stream_id, maximum), None);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::MaxStreamData(stream_id, maximum),
+            None,
+        );
     }
 
     fn queue_max_streams(
@@ -535,7 +565,11 @@ impl Write for Permit<'_> {
         uni: bool,
         maximum: u64,
     ) {
-        self.queue(owner, Control::MaxStreams(uni, maximum), None);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::MaxStreams(uni, maximum),
+            None,
+        );
     }
 
     fn queue_path_response(
@@ -543,7 +577,11 @@ impl Write for Permit<'_> {
         owner: &mut Option<OwnerKey<kind::PathResponse>>,
         data: [u8; 8],
     ) {
-        self.queue(owner, Control::PathResponse(data), None);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::PathResponse(data),
+            None,
+        );
     }
 
     fn queue_path_challenge(
@@ -551,10 +589,17 @@ impl Write for Permit<'_> {
         owner: &mut Option<OwnerKey<kind::PathChallenge>>,
         data: [u8; 8],
     ) {
-        self.queue(owner, Control::PathChallenge(data), None);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::PathChallenge(data),
+            None,
+        );
     }
 
-    fn acknowledge_control(&mut self, handle: Handle<Control>) -> Effect {
+    fn acknowledge_control(
+        &mut self,
+        handle: crate::conn::delivery::Handle<crate::conn::delivery::Control>,
+    ) -> Effect {
         let previous_len = self.pending.len;
         let effect = delivery::Delivery::new(self.pending).acknowledge(handle);
         if self.pending.len != previous_len && self.pending.free_head == handle.index() as u32 {
@@ -563,7 +608,10 @@ impl Write for Permit<'_> {
         effect
     }
 
-    fn lose_control(&mut self, handle: Handle<Control>) {
+    fn lose_control(
+        &mut self,
+        handle: crate::conn::delivery::Handle<crate::conn::delivery::Control>,
+    ) {
         delivery::Delivery::new(self.pending).lose(handle);
     }
 }
@@ -643,7 +691,11 @@ impl Pending {
 
     pub(super) fn handshake_done(&mut self) {
         let mut owner = self.handshake_done.take();
-        self.queue(&mut owner, Control::HandshakeDone, None);
+        self.queue(
+            &mut owner,
+            crate::conn::delivery::Control::HandshakeDone,
+            None,
+        );
         self.handshake_done = owner;
     }
 
@@ -655,7 +707,7 @@ impl Pending {
     ) {
         self.queue(
             owner,
-            Control::NewConnectionId(sequence),
+            crate::conn::delivery::Control::NewConnectionId(sequence),
             Some(NewConnectionId { key }),
         );
     }
@@ -665,7 +717,11 @@ impl Pending {
         owner: &mut Option<OwnerKey<kind::RetireConnectionId>>,
         sequence: u64,
     ) {
-        self.queue(owner, Control::RetireConnectionId(sequence), None);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::RetireConnectionId(sequence),
+            None,
+        );
     }
 
     pub(super) fn queue_stop_sending(
@@ -692,7 +748,11 @@ impl Pending {
         owner: &mut Option<OwnerKey<kind::MaxData>>,
         maximum: u64,
     ) {
-        self.queue(owner, Control::MaxData(maximum), None);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::MaxData(maximum),
+            None,
+        );
     }
 
     pub(super) fn queue_max_stream_data(
@@ -701,7 +761,11 @@ impl Pending {
         stream_id: u64,
         maximum: u64,
     ) {
-        self.queue(owner, Control::MaxStreamData(stream_id, maximum), None);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::MaxStreamData(stream_id, maximum),
+            None,
+        );
     }
 
     pub(super) fn queue_max_streams(
@@ -710,7 +774,11 @@ impl Pending {
         uni: bool,
         maximum: u64,
     ) {
-        self.queue(owner, Control::MaxStreams(uni, maximum), None);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::MaxStreams(uni, maximum),
+            None,
+        );
     }
 
     pub(super) fn queue_path_response(
@@ -718,7 +786,11 @@ impl Pending {
         owner: &mut Option<OwnerKey<kind::PathResponse>>,
         data: [u8; 8],
     ) {
-        self.queue(owner, Control::PathResponse(data), None);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::PathResponse(data),
+            None,
+        );
     }
 
     pub(super) fn queue_path_challenge(
@@ -726,18 +798,25 @@ impl Pending {
         owner: &mut Option<OwnerKey<kind::PathChallenge>>,
         data: [u8; 8],
     ) {
-        self.queue(owner, Control::PathChallenge(data), None);
+        self.queue(
+            owner,
+            crate::conn::delivery::Control::PathChallenge(data),
+            None,
+        );
     }
 
     pub(super) fn data_blocked_sendable(&self, credit: &send::Credit<kind::DataBlocked>) -> bool {
-        self.blocked_sendable(credit.blocked(), Control::DataBlocked(credit.limit()))
+        self.blocked_sendable(
+            credit.blocked(),
+            crate::conn::delivery::Control::DataBlocked(credit.limit()),
+        )
     }
 
     pub(super) fn queue_data_blocked(
         &mut self,
         credit: &mut send::Credit<kind::DataBlocked>,
-    ) -> Option<Handle<Control>> {
-        let record = Control::DataBlocked(credit.limit());
+    ) -> Option<crate::conn::delivery::Handle<crate::conn::delivery::Control>> {
+        let record = crate::conn::delivery::Control::DataBlocked(credit.limit());
         self.queue_blocked(credit.blocked_mut(), record)
     }
 
@@ -748,7 +827,7 @@ impl Pending {
     ) -> bool {
         self.blocked_sendable(
             credit.blocked(),
-            Control::StreamDataBlocked(stream_id, credit.limit()),
+            crate::conn::delivery::Control::StreamDataBlocked(stream_id, credit.limit()),
         )
     }
 
@@ -756,12 +835,16 @@ impl Pending {
         &mut self,
         credit: &mut send::Credit<kind::StreamDataBlocked>,
         stream_id: u64,
-    ) -> Option<Handle<Control>> {
-        let record = Control::StreamDataBlocked(stream_id, credit.limit());
+    ) -> Option<crate::conn::delivery::Handle<crate::conn::delivery::Control>> {
+        let record = crate::conn::delivery::Control::StreamDataBlocked(stream_id, credit.limit());
         self.queue_blocked(credit.blocked_mut(), record)
     }
 
-    fn blocked_sendable<Kind>(&self, owner: Option<OwnerKey<Kind>>, record: Control) -> bool {
+    fn blocked_sendable<Kind>(
+        &self,
+        owner: Option<OwnerKey<Kind>>,
+        record: crate::conn::delivery::Control,
+    ) -> bool {
         // A stale typed key is the natural owner's ACK tombstone. Only an
         // absent key may allocate for this limit; a queued live key may retry.
         match owner {
@@ -776,8 +859,8 @@ impl Pending {
     fn queue_blocked<Kind>(
         &mut self,
         owner: &mut Option<OwnerKey<Kind>>,
-        record: Control,
-    ) -> Option<Handle<Control>> {
+        record: crate::conn::delivery::Control,
+    ) -> Option<crate::conn::delivery::Handle<crate::conn::delivery::Control>> {
         // BLOCKED frames are advisory. Capacity pressure defers a first
         // emission, while a stale ACK tombstone suppresses the same limit.
         match *owner {
@@ -788,7 +871,7 @@ impl Pending {
         self.queue(owner, record, None)
     }
 
-    pub(super) fn arm_probes(&mut self, epoch: Epoch) {
+    pub(super) fn arm_probes(&mut self, epoch: conn::Epoch) {
         let epoch_index = epoch as usize;
         let next = self.probe_round[epoch_index].wrapping_add(1);
         if next == 0 {
@@ -810,9 +893,12 @@ impl Pending {
 
     pub(super) fn next_probe(
         &self,
-        epoch: Epoch,
-        mut excluded: impl FnMut(Handle<Control>) -> bool,
-    ) -> Option<(Handle<Control>, Control)> {
+        epoch: conn::Epoch,
+        mut excluded: impl FnMut(crate::conn::delivery::Handle<crate::conn::delivery::Control>) -> bool,
+    ) -> Option<(
+        crate::conn::delivery::Handle<crate::conn::delivery::Control>,
+        crate::conn::delivery::Control,
+    )> {
         let epoch_index = epoch as usize;
         let round = self.probe_round[epoch_index];
         let mut current = self.probe_cursor[epoch_index];
@@ -829,7 +915,7 @@ impl Pending {
                 && entry_epoch == epoch
                 && probe_round != round
             {
-                let handle = Handle::new(index, slot.delivery_generation)?;
+                let handle = crate::conn::delivery::Handle::new(index, slot.delivery_generation)?;
                 if !excluded(handle) {
                     return Some((handle, entry.record));
                 }
@@ -840,7 +926,7 @@ impl Pending {
 
     pub(super) fn local_cid_key(
         &self,
-        handle: Handle<Control>,
+        handle: crate::conn::delivery::Handle<crate::conn::delivery::Control>,
     ) -> Option<super::path::LocalCidKey> {
         Some(self.resolve(handle)?.new_connection_id.as_ref()?.key)
     }
@@ -870,20 +956,21 @@ fn lane(bit: u16) -> usize {
     bit.trailing_zeros() as usize
 }
 
-fn kind_bit(record: Control) -> u16 {
+fn kind_bit(record: crate::conn::delivery::Control) -> u16 {
     match record {
-        Control::HandshakeDone => HANDSHAKE_DONE,
-        Control::NewConnectionId(_) => NEW_CONNECTION_ID,
-        Control::RetireConnectionId(_) => RETIRE_CONNECTION_ID,
-        Control::StopSending(_, _) => STOP_SENDING,
-        Control::ResetStream(_, _, _) => RESET_STREAM,
-        Control::MaxData(_) => MAX_DATA,
-        Control::MaxStreamData(_, _) => MAX_STREAM_DATA,
-        Control::MaxStreams(false, _) => MAX_STREAMS_BIDI,
-        Control::MaxStreams(true, _) => MAX_STREAMS_UNI,
-        Control::PathResponse(_) => PATH_RESPONSE,
-        Control::PathChallenge(_) => PATH_CHALLENGE,
-        Control::DataBlocked(_) | Control::StreamDataBlocked(_, _) => 0,
+        crate::conn::delivery::Control::HandshakeDone => HANDSHAKE_DONE,
+        crate::conn::delivery::Control::NewConnectionId(_) => NEW_CONNECTION_ID,
+        crate::conn::delivery::Control::RetireConnectionId(_) => RETIRE_CONNECTION_ID,
+        crate::conn::delivery::Control::StopSending(_, _) => STOP_SENDING,
+        crate::conn::delivery::Control::ResetStream(_, _, _) => RESET_STREAM,
+        crate::conn::delivery::Control::MaxData(_) => MAX_DATA,
+        crate::conn::delivery::Control::MaxStreamData(_, _) => MAX_STREAM_DATA,
+        crate::conn::delivery::Control::MaxStreams(false, _) => MAX_STREAMS_BIDI,
+        crate::conn::delivery::Control::MaxStreams(true, _) => MAX_STREAMS_UNI,
+        crate::conn::delivery::Control::PathResponse(_) => PATH_RESPONSE,
+        crate::conn::delivery::Control::PathChallenge(_) => PATH_CHALLENGE,
+        crate::conn::delivery::Control::DataBlocked(_)
+        | crate::conn::delivery::Control::StreamDataBlocked(_, _) => 0,
     }
 }
 

@@ -2,11 +2,13 @@ pub(crate) mod build;
 
 use shin::crypto;
 
-use crate::{conn, errors, packet::ConnectionId};
+use crate::conn;
+use crate::errors;
+use crate::packet;
 
 pub struct Client<const DOMAIN: u8 = 0> {
-    initial_dcid: ConnectionId,
-    local_cid: ConnectionId,
+    initial_dcid: packet::ConnectionId,
+    local_cid: packet::ConnectionId,
     server_pubkey: [u8; 32],
     options: conn::config::Options,
 }
@@ -18,16 +20,16 @@ impl<const DOMAIN: u8> Client<DOMAIN> {
         pool: &'pool conn::tls::ClientPool,
         options: conn::config::Options,
     ) -> Result<conn::tls::Connection<'pool, DOMAIN>, errors::ConnectFailure> {
-        let initial_dcid =
-            ConnectionId::new(&initial_dcid).ok_or(errors::ConnectFailure::InvalidConfig)?;
+        let initial_dcid = packet::ConnectionId::new(&initial_dcid)
+            .ok_or(errors::ConnectFailure::InvalidConfig)?;
         let local_cid =
-            ConnectionId::new(&local_cid).ok_or(errors::ConnectFailure::InvalidConfig)?;
+            packet::ConnectionId::new(&local_cid).ok_or(errors::ConnectFailure::InvalidConfig)?;
         Self::connect_pooled_buffer(initial_dcid, local_cid, pool, options)
     }
 
     pub(crate) fn connect_pooled_buffer<'pool, B: crate::stream::ReceiveBuffer>(
-        initial_dcid: ConnectionId,
-        local_cid: ConnectionId,
+        initial_dcid: packet::ConnectionId,
+        local_cid: packet::ConnectionId,
         pool: &'pool conn::tls::ClientPool,
         options: conn::config::Options,
     ) -> Result<conn::tls::Connection<'pool, DOMAIN, B>, errors::ConnectFailure> {
@@ -50,16 +52,16 @@ impl<const DOMAIN: u8> Client<DOMAIN> {
         server_pubkey: [u8; 32],
         options: conn::config::Options,
     ) -> Result<conn::session::Connection<DOMAIN>, errors::ConnectFailure> {
-        let initial_dcid =
-            ConnectionId::new(&initial_dcid).ok_or(errors::ConnectFailure::InvalidConfig)?;
+        let initial_dcid = packet::ConnectionId::new(&initial_dcid)
+            .ok_or(errors::ConnectFailure::InvalidConfig)?;
         let local_cid =
-            ConnectionId::new(&local_cid).ok_or(errors::ConnectFailure::InvalidConfig)?;
+            packet::ConnectionId::new(&local_cid).ok_or(errors::ConnectFailure::InvalidConfig)?;
         Self::connect_buffer(initial_dcid, local_cid, server_pubkey, options)
     }
 
     pub(crate) fn connect_buffer<B: crate::stream::ReceiveBuffer>(
-        initial_dcid: ConnectionId,
-        local_cid: ConnectionId,
+        initial_dcid: packet::ConnectionId,
+        local_cid: packet::ConnectionId,
         server_pubkey: [u8; 32],
         options: conn::config::Options,
     ) -> Result<conn::session::Connection<DOMAIN, B>, errors::ConnectFailure> {
@@ -130,12 +132,12 @@ impl<const DOMAIN: u8> Server<DOMAIN> {
         signing_key: crypto::sig::SigningKey,
         options: conn::config::Options,
     ) -> Result<Self, errors::ConnectFailure> {
-        let initial_dcid = ConnectionId::try_from(initial_dcid)
+        let initial_dcid = packet::ConnectionId::try_from(initial_dcid)
             .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
-        let local_cid =
-            ConnectionId::try_from(local_cid).map_err(|_| errors::ConnectFailure::InvalidConfig)?;
-        let peer_cid =
-            ConnectionId::try_from(peer_cid).map_err(|_| errors::ConnectFailure::InvalidConfig)?;
+        let local_cid = packet::ConnectionId::try_from(local_cid)
+            .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
+        let peer_cid = packet::ConnectionId::try_from(peer_cid)
+            .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
         Ok(Self {
             ids: conn::server::Ids::initial(initial_dcid, local_cid, peer_cid),
             signing_key,
@@ -177,15 +179,15 @@ impl<const DOMAIN: u8> Server<DOMAIN> {
         >,
         errors::ConnectFailure,
     > {
-        let initial_dcid = ConnectionId::try_from(initial_dcid)
+        let initial_dcid = packet::ConnectionId::try_from(initial_dcid)
             .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
-        let local_cid =
-            ConnectionId::try_from(local_cid).map_err(|_| errors::ConnectFailure::InvalidConfig)?;
-        let peer_cid =
-            ConnectionId::try_from(peer_cid).map_err(|_| errors::ConnectFailure::InvalidConfig)?;
-        let original_dcid = ConnectionId::try_from(original_dcid)
+        let local_cid = packet::ConnectionId::try_from(local_cid)
             .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
-        let retry_scid = ConnectionId::try_from(retry_scid)
+        let peer_cid = packet::ConnectionId::try_from(peer_cid)
+            .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
+        let original_dcid = packet::ConnectionId::try_from(original_dcid)
+            .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
+        let retry_scid = packet::ConnectionId::try_from(retry_scid)
             .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
         let setup = Self {
             ids: conn::server::Ids::retry(

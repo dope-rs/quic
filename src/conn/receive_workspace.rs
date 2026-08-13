@@ -1,16 +1,16 @@
-use std::ops::Range;
+use std::ops;
 
-use crate::frame::Frame;
+use crate::frame;
 
-use super::MAX_FRAMES_PER_PACKET;
+use crate::conn;
 
 #[derive(Clone)]
 pub(crate) struct ParsedAckRanges {
-    pub(crate) bytes: Range<usize>,
+    pub(crate) bytes: ops::Range<usize>,
     pub(crate) count: usize,
 }
 
-pub(crate) type ParsedFrame = Frame<Range<usize>, ParsedAckRanges>;
+pub(crate) type ParsedFrame = frame::Frame<ops::Range<usize>, ParsedAckRanges>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -25,14 +25,14 @@ pub(crate) enum ReceiveAdmission {
 }
 
 pub(crate) struct ReceiveAdmissions {
-    values: [ReceiveAdmission; MAX_FRAMES_PER_PACKET],
+    values: [ReceiveAdmission; conn::MAX_FRAMES_PER_PACKET],
     len: usize,
 }
 
 impl ReceiveAdmissions {
     pub(crate) fn push(&mut self, frame_index: usize) {
         debug_assert_eq!(self.len, frame_index);
-        debug_assert!(frame_index < MAX_FRAMES_PER_PACKET);
+        debug_assert!(frame_index < conn::MAX_FRAMES_PER_PACKET);
         self.values[frame_index] = ReceiveAdmission::Drop;
         self.len += 1;
     }
@@ -56,7 +56,7 @@ impl ReceiveAdmissions {
 impl Default for ReceiveAdmissions {
     fn default() -> Self {
         Self {
-            values: [ReceiveAdmission::Drop; MAX_FRAMES_PER_PACKET],
+            values: [ReceiveAdmission::Drop; conn::MAX_FRAMES_PER_PACKET],
             len: 0,
         }
     }
@@ -73,14 +73,14 @@ impl ReceivePayloadPlan {
         self.accepted as usize
     }
 
-    pub(crate) fn compact_range(self) -> Range<usize> {
+    pub(crate) fn compact_range(self) -> ops::Range<usize> {
         let start = self.start as usize;
         start..start + self.accepted as usize
     }
 }
 
 pub(crate) struct ReceivePayloadPlans {
-    values: [ReceivePayloadPlan; MAX_FRAMES_PER_PACKET],
+    values: [ReceivePayloadPlan; conn::MAX_FRAMES_PER_PACKET],
     len: usize,
 }
 
@@ -114,7 +114,7 @@ impl ReceivePayloadPlans {
 impl Default for ReceivePayloadPlans {
     fn default() -> Self {
         Self {
-            values: [ReceivePayloadPlan::default(); MAX_FRAMES_PER_PACKET],
+            values: [ReceivePayloadPlan::default(); conn::MAX_FRAMES_PER_PACKET],
             len: 0,
         }
     }
@@ -168,14 +168,14 @@ const _: () = assert!(std::mem::size_of::<StreamFrameIndex>() == 1);
 const _: () = assert!(std::mem::size_of::<StopFrameIndex>() == 1);
 
 pub(crate) struct FrameIndices<I: Copy> {
-    values: [I; MAX_FRAMES_PER_PACKET],
+    values: [I; conn::MAX_FRAMES_PER_PACKET],
     len: usize,
 }
 
 impl<I: Copy + Default> Default for FrameIndices<I> {
     fn default() -> Self {
         Self {
-            values: [I::default(); MAX_FRAMES_PER_PACKET],
+            values: [I::default(); conn::MAX_FRAMES_PER_PACKET],
             len: 0,
         }
     }
@@ -208,8 +208,8 @@ pub struct ReceiveWorkspace {
     pub(super) payloads: ReceivePayloadPlans,
     pub(super) stream_frames: FrameIndices<StreamFrameIndex>,
     pub(super) stop_frames: FrameIndices<StopFrameIndex>,
-    pub(super) segments: Vec<Range<u64>>,
-    pub(super) parts: Vec<(u64, Range<usize>)>,
+    pub(super) segments: Vec<ops::Range<u64>>,
+    pub(super) parts: Vec<(u64, ops::Range<usize>)>,
 }
 
 impl ReceiveWorkspace {
@@ -221,7 +221,7 @@ impl ReceiveWorkspace {
 impl Default for ReceiveWorkspace {
     fn default() -> Self {
         Self {
-            parsed_frames: Vec::with_capacity(MAX_FRAMES_PER_PACKET),
+            parsed_frames: Vec::with_capacity(conn::MAX_FRAMES_PER_PACKET),
             admissions: ReceiveAdmissions::default(),
             payloads: ReceivePayloadPlans::default(),
             stream_frames: FrameIndices::default(),

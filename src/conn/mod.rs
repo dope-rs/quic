@@ -1,5 +1,5 @@
-use crate::frame::MAX_ADDITIONAL_ACK_RANGES;
-use crate::transport_params::TransportParameterError;
+use crate::frame;
+use crate::transport_params;
 
 mod commit;
 pub mod config;
@@ -32,8 +32,6 @@ mod streams;
 pub mod tls;
 pub mod transmit;
 
-use session::Connection;
-
 const MIN_INITIAL_LEN: usize = 1200;
 const TAG_LEN: usize = 16;
 const PN_LEN: u8 = 4;
@@ -50,7 +48,8 @@ const MAX_PATH_TOKENS: usize = 64;
 pub(crate) const MAX_FRAMES_PER_PACKET: usize = 256;
 const _: () = assert!(MAX_FRAMES_PER_PACKET == u8::MAX as usize + 1);
 // Generated gaps and range lengths are at most 512, hence two wire bytes each.
-const MAX_GENERATED_ACK_FRAME_BYTES: usize = 1 + 8 + 1 + 2 + 2 + MAX_ADDITIONAL_ACK_RANGES * 4;
+const MAX_GENERATED_ACK_FRAME_BYTES: usize =
+    1 + 8 + 1 + 2 + 2 + frame::MAX_ADDITIONAL_ACK_RANGES * 4;
 const MAX_BATCH_PACKETS: usize = 64;
 const MAX_QUEUE_CAPACITY: usize = 65_536;
 const MAX_STREAMS: u64 = 65_536;
@@ -131,8 +130,8 @@ impl_error!(Error {
     Self::ProtocolViolation => "QUIC protocol violation",
 });
 
-impl From<TransportParameterError> for Error {
-    fn from(_: TransportParameterError) -> Self {
+impl From<transport_params::TransportParameterError> for Error {
+    fn from(_: transport_params::TransportParameterError) -> Self {
         Self::TransportParameterDecode
     }
 }

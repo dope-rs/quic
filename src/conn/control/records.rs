@@ -1,40 +1,43 @@
-use crate::conn::delivery::{Control, Handle};
+use crate::conn::delivery;
 
-use super::linkage::Linkage;
-use super::{Entry, Links, NONE, NewConnectionId, OwnerKey, Pending, Slot, Status, kind_bit, lane};
+use crate::conn::control;
+use crate::conn::control::linkage::Linkage as _;
 
 pub(super) trait Records {
     fn queue<Kind>(
         &mut self,
-        owner: &mut Option<OwnerKey<Kind>>,
-        record: Control,
-        new_connection_id: Option<NewConnectionId>,
-    ) -> Option<Handle<Control>>;
+        owner: &mut Option<control::OwnerKey<Kind>>,
+        record: delivery::Control,
+        new_connection_id: Option<control::NewConnectionId>,
+    ) -> Option<delivery::Handle<delivery::Control>>;
     fn replace(
         &mut self,
         index: usize,
-        record: Control,
-        new_connection_id: Option<NewConnectionId>,
+        record: delivery::Control,
+        new_connection_id: Option<control::NewConnectionId>,
     );
     fn allocate(&mut self) -> Option<usize>;
-    fn remove_owner<Kind>(&mut self, owner: &mut Option<OwnerKey<Kind>>) -> bool;
-    fn remove(&mut self, index: usize) -> Option<Control>;
-    fn add_kind(&mut self, record: Control);
-    fn remove_kind(&mut self, record: Control);
+    fn remove_owner<Kind>(&mut self, owner: &mut Option<control::OwnerKey<Kind>>) -> bool;
+    fn remove(&mut self, index: usize) -> Option<delivery::Control>;
+    fn add_kind(&mut self, record: delivery::Control);
+    fn remove_kind(&mut self, record: delivery::Control);
     fn bump_generation(&mut self, index: usize) -> bool;
-    fn handle(&self, index: usize) -> Option<Handle<Control>>;
-    fn resolve(&self, handle: Handle<Control>) -> Option<&Entry>;
-    fn resolve_owner<Kind>(&self, owner: Option<OwnerKey<Kind>>) -> Option<&Entry>;
-    fn owner_index<Kind>(&self, owner: OwnerKey<Kind>) -> Option<usize>;
+    fn handle(&self, index: usize) -> Option<delivery::Handle<delivery::Control>>;
+    fn resolve(&self, handle: delivery::Handle<delivery::Control>) -> Option<&control::Entry>;
+    fn resolve_owner<Kind>(
+        &self,
+        owner: Option<control::OwnerKey<Kind>>,
+    ) -> Option<&control::Entry>;
+    fn owner_index<Kind>(&self, owner: control::OwnerKey<Kind>) -> Option<usize>;
 }
 
-impl Records for Pending {
+impl Records for control::Pending {
     fn queue<Kind>(
         &mut self,
-        owner: &mut Option<OwnerKey<Kind>>,
-        record: Control,
-        new_connection_id: Option<NewConnectionId>,
-    ) -> Option<Handle<Control>> {
+        owner: &mut Option<control::OwnerKey<Kind>>,
+        record: delivery::Control,
+        new_connection_id: Option<control::NewConnectionId>,
+    ) -> Option<delivery::Handle<delivery::Control>> {
         if let Some(index) = (*owner).and_then(|owner| self.owner_index(owner)) {
             let unchanged = {
                 let entry = self.slots[index].entry.as_ref().unwrap();
@@ -60,25 +63,25 @@ impl Records for Pending {
             self.overflowed = true;
             return None;
         };
-        self.slots[index].entry = Some(Entry {
+        self.slots[index].entry = Some(control::Entry {
             record,
             new_connection_id,
-            status: Status::Queued,
-            ready: Links::EMPTY,
-            flight: Links::EMPTY,
+            status: control::Status::Queued,
+            ready: control::Links::EMPTY,
+            flight: control::Links::EMPTY,
         });
         self.len += 1;
         self.add_kind(record);
         self.link_ready(index);
-        *owner = OwnerKey::new(index, self.slots[index].owner_generation);
+        *owner = control::OwnerKey::new(index, self.slots[index].owner_generation);
         self.handle(index)
     }
 
     fn replace(
         &mut self,
         index: usize,
-        record: Control,
-        new_connection_id: Option<NewConnectionId>,
+        record: delivery::Control,
+        new_connection_id: Option<control::NewConnectionId>,
     ) {
         let entry = self.slots[index].entry.as_ref().unwrap();
         let status = entry.status;
@@ -86,14 +89,18 @@ impl Records for Pending {
         if !self.bump_generation(index) {
             return;
         }
-        if matches!(status, Status::InFlight { .. }) {
+        if matches!(status, control::Status::InFlight { .. }) {
             self.unlink_flight(index);
         }
-        let previous_bit = kind_bit(previous);
-        let next_bit = kind_bit(record);
-        let remains_ready =
-            matches!(status, Status::Queued) && previous_bit != 0 && previous_bit == next_bit;
-        if matches!(status, Status::Queued) && previous_bit != 0 && previous_bit != next_bit {
+        let previous_bit = control::kind_bit(previous);
+        let next_bit = control::kind_bit(record);
+        let remains_ready = matches!(status, control::Status::Queued)
+            && previous_bit != 0
+            && previous_bit == next_bit;
+        if matches!(status, control::Status::Queued)
+            && previous_bit != 0
+            && previous_bit != next_bit
+        {
             self.unlink_ready(index);
         }
         if previous_bit != next_bit {
@@ -103,35 +110,35 @@ impl Records for Pending {
         let entry = self.slots[index].entry.as_mut().unwrap();
         entry.record = record;
         entry.new_connection_id = new_connection_id;
-        entry.status = Status::Queued;
-        entry.flight = Links::EMPTY;
+        entry.status = control::Status::Queued;
+        entry.flight = control::Links::EMPTY;
         if !remains_ready && next_bit != 0 {
-            entry.ready = Links::EMPTY;
+            entry.ready = control::Links::EMPTY;
             self.link_ready(index);
         }
     }
 
     fn allocate(&mut self) -> Option<usize> {
-        if self.free_head != NONE {
+        if self.free_head != crate::conn::control::NONE {
             let index = self.free_head as usize;
             self.free_head = self.slots[index].next_free;
-            self.slots[index].next_free = NONE;
+            self.slots[index].next_free = crate::conn::control::NONE;
             return Some(index);
         }
         if self.slots.len() >= self.limit {
             return None;
         }
         let index = self.slots.len();
-        self.slots.push(Slot {
+        self.slots.push(crate::conn::control::Slot {
             delivery_generation: 0,
             owner_generation: 0,
-            next_free: NONE,
+            next_free: crate::conn::control::NONE,
             entry: None,
         });
         Some(index)
     }
 
-    fn remove_owner<Kind>(&mut self, owner: &mut Option<OwnerKey<Kind>>) -> bool {
+    fn remove_owner<Kind>(&mut self, owner: &mut Option<control::OwnerKey<Kind>>) -> bool {
         if let Some(index) = owner.take().and_then(|owner| self.owner_index(owner)) {
             self.remove(index);
             self.free_head == index as u32
@@ -140,12 +147,12 @@ impl Records for Pending {
         }
     }
 
-    fn remove(&mut self, index: usize) -> Option<Control> {
+    fn remove(&mut self, index: usize) -> Option<delivery::Control> {
         let entry = self.slots.get(index)?.entry.as_ref()?;
         let record = entry.record;
-        if matches!(entry.status, Status::Queued) && kind_bit(record) != 0 {
+        if matches!(entry.status, control::Status::Queued) && control::kind_bit(record) != 0 {
             self.unlink_ready(index);
-        } else if matches!(entry.status, Status::InFlight { .. }) {
+        } else if matches!(entry.status, control::Status::InFlight { .. }) {
             self.unlink_flight(index);
         }
         self.slots[index].entry.take();
@@ -168,22 +175,22 @@ impl Records for Pending {
         Some(record)
     }
 
-    fn add_kind(&mut self, record: Control) {
-        let bit = kind_bit(record);
+    fn add_kind(&mut self, record: delivery::Control) {
+        let bit = control::kind_bit(record);
         if bit == 0 {
             return;
         }
-        let lane = lane(bit);
+        let lane = control::lane(bit);
         self.kind_counts[lane] += 1;
         self.bits |= bit;
     }
 
-    fn remove_kind(&mut self, record: Control) {
-        let bit = kind_bit(record);
+    fn remove_kind(&mut self, record: delivery::Control) {
+        let bit = control::kind_bit(record);
         if bit == 0 {
             return;
         }
-        let lane = lane(bit);
+        let lane = control::lane(bit);
         self.kind_counts[lane] -= 1;
         if self.kind_counts[lane] == 0 {
             self.bits &= !bit;
@@ -199,23 +206,26 @@ impl Records for Pending {
         true
     }
 
-    fn handle(&self, index: usize) -> Option<Handle<Control>> {
-        Handle::new(index, self.slots.get(index)?.delivery_generation)
+    fn handle(&self, index: usize) -> Option<delivery::Handle<delivery::Control>> {
+        delivery::Handle::new(index, self.slots.get(index)?.delivery_generation)
     }
 
-    fn resolve(&self, handle: Handle<Control>) -> Option<&Entry> {
+    fn resolve(&self, handle: delivery::Handle<delivery::Control>) -> Option<&control::Entry> {
         let slot = self.slots.get(handle.index())?;
         (slot.delivery_generation == handle.generation())
             .then_some(slot.entry.as_ref())
             .flatten()
     }
 
-    fn resolve_owner<Kind>(&self, owner: Option<OwnerKey<Kind>>) -> Option<&Entry> {
+    fn resolve_owner<Kind>(
+        &self,
+        owner: Option<control::OwnerKey<Kind>>,
+    ) -> Option<&control::Entry> {
         let index = self.owner_index(owner?)?;
         self.slots[index].entry.as_ref()
     }
 
-    fn owner_index<Kind>(&self, owner: OwnerKey<Kind>) -> Option<usize> {
+    fn owner_index<Kind>(&self, owner: control::OwnerKey<Kind>) -> Option<usize> {
         let slot = self.slots.get(owner.index())?;
         (slot.owner_generation == owner.generation() && slot.entry.is_some())
             .then_some(owner.index())

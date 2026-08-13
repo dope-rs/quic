@@ -1,25 +1,26 @@
-use crate::conn::{Epoch, commit, delivery};
-use crate::varint::VarInt;
+use crate::conn;
+use crate::conn::commit;
+use crate::conn::delivery;
 
-use super::Builder;
-use crate::stream::ReceiveBuffer;
+use crate::conn::transmit::builder;
+use crate::stream;
 
 pub(in crate::conn) trait Crypto {
     fn crypto_data_limit(offset: u64, frame_room: usize) -> usize;
     fn peek_crypto_chunk(
         tx: &crate::conn::crypto_tx::Tx,
-        epoch: Epoch,
+        epoch: conn::Epoch,
         frame_room: usize,
     ) -> Option<(commit::Delivery<delivery::Crypto>, &[u8])>;
     fn encode_crypto(out: &mut Vec<u8>, offset: u64, data: &[u8]) -> bool;
     fn crypto_probe(
         &self,
-        epoch: Epoch,
+        epoch: conn::Epoch,
         frame_room: usize,
     ) -> Option<(commit::Delivery<delivery::Crypto>, &[u8])>;
 }
 
-impl<const DOMAIN: u8, B: ReceiveBuffer> Crypto for Builder<'_, DOMAIN, B> {
+impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Crypto for builder::Builder<'_, DOMAIN, B> {
     fn crypto_data_limit(offset: u64, frame_room: usize) -> usize {
         let fixed = 1 + Self::varint_len(offset as usize);
         let mut data = frame_room.saturating_sub(fixed + 1);
@@ -34,7 +35,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Crypto for Builder<'_, DOMAIN, B> {
 
     fn peek_crypto_chunk(
         tx: &crate::conn::crypto_tx::Tx,
-        epoch: Epoch,
+        epoch: conn::Epoch,
         frame_room: usize,
     ) -> Option<(commit::Delivery<delivery::Crypto>, &[u8])> {
         let candidate = tx.peek(epoch)?;
@@ -52,11 +53,11 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Crypto for Builder<'_, DOMAIN, B> {
     fn encode_crypto(out: &mut Vec<u8>, offset: u64, data: &[u8]) -> bool {
         let start = out.len();
         out.push(0x06);
-        let Some(offset) = VarInt::new(offset) else {
+        let Some(offset) = crate::varint::VarInt::new(offset) else {
             out.truncate(start);
             return false;
         };
-        let Some(len) = VarInt::from_usize(data.len()) else {
+        let Some(len) = crate::varint::VarInt::from_usize(data.len()) else {
             out.truncate(start);
             return false;
         };
@@ -68,7 +69,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Crypto for Builder<'_, DOMAIN, B> {
 
     fn crypto_probe(
         &self,
-        epoch: Epoch,
+        epoch: conn::Epoch,
         frame_room: usize,
     ) -> Option<(commit::Delivery<delivery::Crypto>, &[u8])> {
         let tx = self.connection.handshake.crypto();

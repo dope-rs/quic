@@ -1,16 +1,16 @@
 use std::iter;
-use std::time::Instant;
+use std::time;
 
-use o3::collections::queue::fixed::Fifo;
+use o3::collections::queue::fixed;
 
 use crate::conn;
-use crate::stream::ReceiveBuffer;
+use crate::stream;
 
 use super::drive::DriveOps as _;
-use super::{DIRECT_DRIVE_BUDGET, Handler, Outgoing, Router};
+use crate::mux;
 
 pub(super) struct Storage {
-    pub(super) pending: Fifo<Outgoing>,
+    pub(super) pending: fixed::Fifo<mux::Outgoing>,
     pub(super) packets: usize,
     pub(super) bytes: usize,
     pub(super) bytes_capacity: usize,
@@ -21,7 +21,7 @@ pub(super) struct Storage {
 impl Storage {
     pub(super) fn new(capacity: usize, bytes_capacity: usize) -> Self {
         Self {
-            pending: Fifo::with_capacity(capacity),
+            pending: fixed::Fifo::with_capacity(capacity),
             packets: 0,
             bytes: 0,
             bytes_capacity,
@@ -58,35 +58,46 @@ pub(crate) trait State {
     fn has_buffered_output(&self) -> bool;
 }
 
-impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer> State
-    for Router<'tls, H, P, DOMAIN, B>
+impl<
+    'tls,
+    H: mux::Handler<DOMAIN, B>,
+    P: conn::server::Policy,
+    const DOMAIN: u8,
+    B: stream::ReceiveBuffer,
+> State for mux::Router<'tls, H, P, DOMAIN, B>
 {
     fn has_buffered_output(&self) -> bool {
         !self.outgoing.pending.is_empty()
     }
 }
 
-pub struct Queue<'a, 'tls, H, P, const DOMAIN: u8, B: ReceiveBuffer = Vec<u8>>
+pub struct Queue<'a, 'tls, H, P, const DOMAIN: u8, B: stream::ReceiveBuffer = Vec<u8>>
 where
-    H: Handler<DOMAIN, B>,
+    H: mux::Handler<DOMAIN, B>,
     P: conn::server::Policy,
 {
-    mux: &'a mut Router<'tls, H, P, DOMAIN, B>,
+    mux: &'a mut mux::Router<'tls, H, P, DOMAIN, B>,
 }
 
-impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    Queue<'a, 'tls, H, P, DOMAIN, B>
+impl<
+    'a,
+    'tls,
+    H: mux::Handler<DOMAIN, B>,
+    P: conn::server::Policy,
+    const DOMAIN: u8,
+    B: stream::ReceiveBuffer,
+> Queue<'a, 'tls, H, P, DOMAIN, B>
 {
-    pub(super) fn new(mux: &'a mut Router<'tls, H, P, DOMAIN, B>) -> Self {
+    pub(super) fn new(mux: &'a mut mux::Router<'tls, H, P, DOMAIN, B>) -> Self {
         Self { mux }
     }
 
-    pub fn drain(mut self) -> impl Iterator<Item = Outgoing> + 'a {
-        let now = Instant::now();
+    pub fn drain(mut self) -> impl Iterator<Item = mux::Outgoing> + 'a {
+        let now = time::Instant::now();
         let mut work_remaining = if self.mux.lifecycle.shutting_down {
             0
         } else {
-            DIRECT_DRIVE_BUDGET
+            mux::DIRECT_DRIVE_BUDGET
         };
         let mut output_remaining = work_remaining;
         iter::from_fn(move || {
@@ -131,18 +142,18 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
     /// Custom transports should call this after they no longer access the
     /// packet. The integrated endpoint does so automatically after the kernel
     /// releases the send buffer.
-    pub fn recycle(&mut self, outgoing: Outgoing) {
+    pub fn recycle(&mut self, outgoing: mux::Outgoing) {
         self.mux.outgoing.recycle_packet(outgoing.into_storage());
     }
 
-    pub(crate) fn pop(&mut self) -> Option<Outgoing> {
+    pub(crate) fn pop(&mut self) -> Option<mux::Outgoing> {
         let outgoing = self.mux.outgoing.pending.pop_front()?;
         self.mux.outgoing.packets -= outgoing.packets();
         self.mux.outgoing.bytes -= outgoing.bytes();
         Some(outgoing)
     }
 
-    pub(crate) fn push_front(&mut self, outgoing: Outgoing) -> Result<(), Outgoing> {
+    pub(crate) fn push_front(&mut self, outgoing: mux::Outgoing) -> Result<(), mux::Outgoing> {
         let packets = outgoing.packets();
         let bytes = outgoing.bytes();
         self.mux.outgoing.pending.push_front(outgoing)?;
@@ -151,12 +162,12 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
         Ok(())
     }
 
-    pub fn drive_bounded(&mut self, now: Instant) -> usize {
+    pub fn drive_bounded(&mut self, now: time::Instant) -> usize {
         if self.mux.lifecycle.shutting_down {
             return 0;
         }
         let mut driven = 0;
-        while driven != DIRECT_DRIVE_BUDGET && self.mux.drive_one_inner(now) {
+        while driven != mux::DIRECT_DRIVE_BUDGET && self.mux.drive_one_inner(now) {
             driven += 1;
         }
         driven

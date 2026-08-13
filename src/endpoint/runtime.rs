@@ -1,16 +1,16 @@
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::time::Instant;
+use std::net;
+use std::pin;
+use std::time;
 
 use dope::core::driver::{self, schedule};
-use dope::manifold::datagram::{self, Socket};
+use dope::manifold::datagram;
 
 use crate::conn;
-use crate::endpoint::Storage;
+use crate::endpoint;
+use crate::mux;
 use crate::mux::drive::{DriveOps as _, OutputOps as _};
 use crate::mux::output::State as _;
-use crate::mux::{self, Outgoing, PooledRouter};
-use crate::stream::ReceiveBuffer;
+use crate::stream;
 
 pub(super) struct Runtime<
     'd,
@@ -18,19 +18,25 @@ pub(super) struct Runtime<
     H: mux::Handler<ID, B>,
     P: conn::server::Policy,
     const ID: u8,
-    B: ReceiveBuffer,
+    B: stream::ReceiveBuffer,
 > {
-    pub(super) mux: PooledRouter<'tls, H, P, ID, B>,
+    pub(super) mux: mux::PooledRouter<'tls, H, P, ID, B>,
     flush_blocked: bool,
     prefer_output: bool,
     stopping: bool,
     driver: std::marker::PhantomData<&'d ()>,
 }
 
-impl<'d, 'tls, H: mux::Handler<ID, B>, P: conn::server::Policy, const ID: u8, B: ReceiveBuffer>
-    Runtime<'d, 'tls, H, P, ID, B>
+impl<
+    'd,
+    'tls,
+    H: mux::Handler<ID, B>,
+    P: conn::server::Policy,
+    const ID: u8,
+    B: stream::ReceiveBuffer,
+> Runtime<'d, 'tls, H, P, ID, B>
 {
-    pub(super) fn new(mux: PooledRouter<'tls, H, P, ID, B>) -> Self {
+    pub(super) fn new(mux: mux::PooledRouter<'tls, H, P, ID, B>) -> Self {
         Self {
             mux,
             flush_blocked: false,
@@ -45,14 +51,14 @@ impl<'d, 'tls, const ID: u8, H, P, B> datagram::Handler<'d, ID> for Runtime<'d, 
 where
     H: mux::Handler<ID, B>,
     P: conn::server::Policy,
-    B: Storage<'d>,
+    B: endpoint::Storage<'d>,
 {
     fn packet<'turn>(
         &mut self,
-        addr: SocketAddr,
+        addr: net::SocketAddr,
         packet: datagram::packet::Packet<'turn, 'd>,
-        socket: Pin<&'turn mut Socket<'d, ID>>,
-        now: Instant,
+        socket: pin::Pin<&'turn mut datagram::Socket<'d, ID>>,
+        now: time::Instant,
     ) {
         let len = packet.as_ref().len();
         let received = B::receive_packet(&mut self.mux, addr, packet, socket, now);
@@ -67,8 +73,8 @@ where
 
     fn pre_park<'turn>(
         &mut self,
-        mut socket: Pin<&mut Socket<'d, ID>>,
-        now: Instant,
+        mut socket: pin::Pin<&mut datagram::Socket<'d, ID>>,
+        now: time::Instant,
         work: driver::schedule::Application<'turn, 'd>,
     ) {
         if self.stopping {
@@ -114,10 +120,10 @@ where
         if self.mux.has_buffered_output() && !self.flush_blocked {
             progress = progress.reduce(schedule::Progress::Runnable);
         }
-        if self.mux.has_drive_work(Instant::now()) {
+        if self.mux.has_drive_work(time::Instant::now()) {
             progress = progress.reduce(schedule::Progress::Runnable);
         }
-        if let Some(deadline) = self.mux.next_deadline(Instant::now()) {
+        if let Some(deadline) = self.mux.next_deadline(time::Instant::now()) {
             progress = progress.reduce(schedule::Progress::until(region, deadline));
         }
         progress
@@ -130,36 +136,42 @@ where
 }
 
 fn queue_one<'turn, 'd, 'tls, const ID: u8, H, P, B>(
-    mut socket: Pin<&mut Socket<'d, ID>>,
-    mux: &mut PooledRouter<'tls, H, P, ID, B>,
+    mut socket: pin::Pin<&mut datagram::Socket<'d, ID>>,
+    mux: &mut mux::PooledRouter<'tls, H, P, ID, B>,
     _permit: driver::schedule::ApplicationPermit<'turn, 'd>,
 ) -> bool
 where
     H: mux::Handler<ID, B>,
     P: conn::server::Policy,
-    B: ReceiveBuffer,
+    B: stream::ReceiveBuffer,
 {
     let Some(item) = mux.output().pop() else {
         return true;
     };
     match item {
-        Outgoing::Plain(addr, payload) => {
+        crate::mux::Outgoing::Plain(addr, payload) => {
             if let Err(payload) = socket.as_mut().queue_to(payload, addr) {
-                let _ = mux.output().push_front(Outgoing::Plain(addr, payload));
-                return false;
-            }
-        }
-        Outgoing::Suffix(addr, payload) => {
-            if let Err(payload) = socket.as_mut().queue_suffix(payload, addr) {
-                let _ = mux.output().push_front(Outgoing::Suffix(addr, payload));
-                return false;
-            }
-        }
-        Outgoing::Batch(addr, payload, segment_size) => {
-            if let Err(payload) = socket.as_mut().queue_gso(payload, segment_size, addr) {
                 let _ = mux
                     .output()
-                    .push_front(Outgoing::Batch(addr, payload, segment_size));
+                    .push_front(crate::mux::Outgoing::Plain(addr, payload));
+                return false;
+            }
+        }
+        crate::mux::Outgoing::Suffix(addr, payload) => {
+            if let Err(payload) = socket.as_mut().queue_suffix(payload, addr) {
+                let _ = mux
+                    .output()
+                    .push_front(crate::mux::Outgoing::Suffix(addr, payload));
+                return false;
+            }
+        }
+        crate::mux::Outgoing::Batch(addr, payload, segment_size) => {
+            if let Err(payload) = socket.as_mut().queue_gso(payload, segment_size, addr) {
+                let _ = mux.output().push_front(crate::mux::Outgoing::Batch(
+                    addr,
+                    payload,
+                    segment_size,
+                ));
                 return false;
             }
         }

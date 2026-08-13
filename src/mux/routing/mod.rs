@@ -1,113 +1,122 @@
 pub(super) mod registry;
 pub(super) mod reset;
 
-use std::hash::BuildHasher;
-use std::net::SocketAddr;
-use std::time::Instant;
+use std::hash::BuildHasher as _;
+use std::net;
+use std::time;
 
-use crate::conn::path::{LocalCidKey, RouteUpdate};
-use crate::conn::session::Connection;
-use crate::conn::{self, Error, Handle, MAX_ACTIVE_CONNECTION_IDS};
-use crate::packet::{ConnectionId, InitialHeader};
-use crate::pmtud::BASE_PMTU;
-use crate::stream::ReceiveBuffer;
+use crate::conn;
+use crate::conn::path;
+use crate::conn::session;
+use crate::packet;
+
+use crate::stream;
 
 use self::reset::ResetOps as _;
 use super::drive::{DriveOps as _, QueueOps as _};
-use super::{
-    CidLink, CidRecord, Handler, MAX_CIDS_PER_CONN, NONE, QueueKind, RoutedCid, Router,
-    ServerShard, Slot, TlsSession,
-};
+use crate::mux;
 
 pub(super) trait AcceptOps {
     fn try_accept(
         &mut self,
-        from: SocketAddr,
+        from: net::SocketAddr,
         data: &mut [u8],
-        retry_odcid: Option<ConnectionId>,
-    ) -> Result<Handle, Error>;
+        retry_odcid: Option<packet::ConnectionId>,
+    ) -> Result<conn::Handle, conn::Error>;
 }
 
 pub(super) trait CidOps {
     fn cid_hash(&self, value: &[u8]) -> u64;
     fn cid_bucket(&self, value: &[u8]) -> usize;
-    fn cid_record(&self, link: CidLink) -> Option<&CidRecord>;
-    fn cid_record_mut(&mut self, link: CidLink) -> Option<&mut CidRecord>;
-    fn find_cid(&self, value: &[u8]) -> Option<RoutedCid>;
-    fn register_local_cid(&mut self, handle: Handle, key: LocalCidKey, value: ConnectionId)
-    -> bool;
-    fn register_cid_alias(&mut self, handle: Handle, value: ConnectionId) -> bool;
-    fn apply_cid_routes(&mut self, handle: Handle, updates: &[RouteUpdate]) -> bool;
-    fn unregister_local_cid(&mut self, handle: Handle, key: LocalCidKey) -> bool;
-    fn unregister_cids(&mut self, handle: Handle);
+    fn cid_record(&self, link: mux::CidLink) -> Option<&mux::CidRecord>;
+    fn cid_record_mut(&mut self, link: mux::CidLink) -> Option<&mut mux::CidRecord>;
+    fn find_cid(&self, value: &[u8]) -> Option<mux::RoutedCid>;
+    fn register_local_cid(
+        &mut self,
+        handle: conn::Handle,
+        key: path::LocalCidKey,
+        value: packet::ConnectionId,
+    ) -> bool;
+    fn register_cid_alias(&mut self, handle: conn::Handle, value: packet::ConnectionId) -> bool;
+    fn apply_cid_routes(&mut self, handle: conn::Handle, updates: &[path::RouteUpdate]) -> bool;
+    fn unregister_local_cid(&mut self, handle: conn::Handle, key: path::LocalCidKey) -> bool;
+    fn unregister_cids(&mut self, handle: conn::Handle);
 }
 
-pub(super) trait DeadlineOps<H, P, const DOMAIN: u8, B: ReceiveBuffer>
+pub(super) trait DeadlineOps<H, P, const DOMAIN: u8, B: stream::ReceiveBuffer>
 where
-    H: Handler<DOMAIN, B>,
+    H: mux::Handler<DOMAIN, B>,
     P: conn::server::Policy,
 {
-    fn deadline_peek(&self) -> Option<(usize, Instant)>;
-    fn deadline_remove(&mut self, index: usize) -> Option<Instant>;
-    fn deadline_set(&mut self, index: usize, deadline: Instant) -> bool;
-    fn refresh_deadline(&mut self, handle: Handle, now: Instant);
+    fn deadline_peek(&self) -> Option<(usize, time::Instant)>;
+    fn deadline_remove(&mut self, index: usize) -> Option<time::Instant>;
+    fn deadline_set(&mut self, index: usize, deadline: time::Instant) -> bool;
+    fn refresh_deadline(&mut self, handle: conn::Handle, now: time::Instant);
     fn slot_deadline(
-        slot: &Slot<'_, H::Connection, P, DOMAIN, B>,
+        slot: &mux::Slot<'_, H::Connection, P, DOMAIN, B>,
         flush_linked: bool,
-        now: Instant,
-    ) -> Option<Instant>;
+        now: time::Instant,
+    ) -> Option<time::Instant>;
     fn notify_one(&mut self) -> bool;
 }
 
-pub(super) trait SlotOps<'tls, H, P, const DOMAIN: u8, B: ReceiveBuffer>
+pub(super) trait SlotOps<'tls, H, P, const DOMAIN: u8, B: stream::ReceiveBuffer>
 where
-    H: Handler<DOMAIN, B>,
+    H: mux::Handler<DOMAIN, B>,
     P: conn::server::Policy,
 {
     fn insert_connection(
         &mut self,
-        conn: Connection<DOMAIN, B>,
-        tls: Option<TlsSession<'tls, P, DOMAIN>>,
-        peer_addr: SocketAddr,
+        conn: session::Connection<DOMAIN, B>,
+        tls: Option<mux::TlsSession<'tls, P, DOMAIN>>,
+        peer_addr: net::SocketAddr,
         max_packet_bytes: usize,
-    ) -> Option<Handle>;
-    fn remove_slot(&mut self, handle: Handle) -> bool;
-    fn finish_connection_mut(&mut self, handle: Handle);
+    ) -> Option<conn::Handle>;
+    fn remove_slot(&mut self, handle: conn::Handle) -> bool;
+    fn finish_connection_mut(&mut self, handle: conn::Handle);
     fn sync_dirty_connection(&mut self);
-    fn sync_reset_tokens(&mut self, handle: Handle) -> bool;
-    fn handle_for_index(&self, index: usize) -> Handle;
-    fn handle_index(&self, handle: Handle) -> Option<usize>;
+    fn sync_reset_tokens(&mut self, handle: conn::Handle) -> bool;
+    fn handle_for_index(&self, index: usize) -> conn::Handle;
+    fn handle_index(&self, handle: conn::Handle) -> Option<usize>;
 }
 
-impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    AcceptOps for Router<'tls, H, P, DOMAIN, B>
+impl<
+    'tls,
+    H: mux::Handler<DOMAIN, B>,
+    P: conn::server::Policy,
+    const DOMAIN: u8,
+    B: stream::ReceiveBuffer,
+> AcceptOps for mux::Router<'tls, H, P, DOMAIN, B>
 {
     fn try_accept(
         &mut self,
-        from: SocketAddr,
+        from: net::SocketAddr,
         data: &mut [u8],
-        retry_odcid: Option<ConnectionId>,
-    ) -> Result<Handle, Error> {
+        retry_odcid: Option<packet::ConnectionId>,
+    ) -> Result<conn::Handle, conn::Error> {
         let server_config = self
             .server
             .as_ref()
-            .ok_or(Error::HeaderDecode)?
+            .ok_or(conn::Error::HeaderDecode)?
             .config
             .duplicate_connection()
-            .map_err(|_| Error::Tls)?;
+            .map_err(|_| conn::Error::Tls)?;
         if !matches!(data.first(), Some(&b) if b & 0xb0 == 0x80) {
-            return Err(Error::HeaderDecode);
+            return Err(conn::Error::HeaderDecode);
         }
         let cid_prefix = server_config.cid_prefix;
-        let prefix = InitialHeader::decode_pre_hp(data).map_err(|_| Error::HeaderDecode)?;
+        let prefix = crate::packet::InitialHeader::decode_pre_hp(data)
+            .map_err(|_| conn::Error::HeaderDecode)?;
         let initial_dcid = prefix.dcid.into_owned();
         let peer_cid = prefix.scid.into_owned();
-        let local_cid = self.gen_cid(cid_prefix).ok_or(Error::ConnectionIdLimit)?;
+        let local_cid = self
+            .gen_cid(cid_prefix)
+            .ok_or(conn::Error::ConnectionIdLimit)?;
         let client_initial_dcid = initial_dcid;
         let max_packet_bytes =
             super::setup::connection_ceiling(&server_config, self.outgoing.bytes_capacity);
-        if max_packet_bytes < BASE_PMTU as usize {
-            return Err(Error::PacketCeiling);
+        if max_packet_bytes < crate::pmtud::BASE_PMTU as usize {
+            return Err(conn::Error::PacketCeiling);
         }
         let ids = match retry_odcid {
             Some(odcid) => {
@@ -115,51 +124,57 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
             }
             None => conn::server::Ids::initial(initial_dcid, local_cid, peer_cid),
         };
-        let (connection, tls) = match &self.server.as_ref().ok_or(Error::HeaderDecode)?.shard {
-            ServerShard::Owned(shard) => {
+        let (connection, tls) = match &self.server.as_ref().ok_or(conn::Error::HeaderDecode)?.shard
+        {
+            crate::mux::ServerShard::Owned(shard) => {
                 let (connection, tls) =
                     conn::setup::build::Builder::server(ids, server_config, shard)
                         .finish()
-                        .map_err(|_| Error::Tls)?
+                        .map_err(|_| conn::Error::Tls)?
                         .into_server()
-                        .ok_or(Error::Tls)?;
-                (connection, TlsSession::OwnedServer(tls))
+                        .ok_or(conn::Error::Tls)?;
+                (connection, mux::TlsSession::OwnedServer(tls))
             }
-            ServerShard::Pooled { pool, .. } => {
+            crate::mux::ServerShard::Pooled { pool, .. } => {
                 let built = conn::setup::build::Builder::server_pooled(ids, server_config, *pool)
                     .finish()
-                    .map_err(|_| Error::Tls)?;
+                    .map_err(|_| conn::Error::Tls)?;
                 let conn::setup::build::Built::ServerPooled { connection, tls } = built else {
-                    return Err(Error::Tls);
+                    return Err(conn::Error::Tls);
                 };
-                (connection, TlsSession::Server(tls))
+                (connection, mux::TlsSession::Server(tls))
             }
         };
         let handle = self
             .insert_connection(connection, Some(tls), from, max_packet_bytes)
-            .ok_or(Error::EventCapacity)?;
-        let index = self.handle_index(handle).ok_or(Error::HeaderDecode)?;
+            .ok_or(conn::Error::EventCapacity)?;
+        let index = self.handle_index(handle).ok_or(conn::Error::HeaderDecode)?;
         let (local_key, local_cid) = self.registry.entries[index]
             .slot_mut()
-            .ok_or(Error::HeaderDecode)?
+            .ok_or(conn::Error::HeaderDecode)?
             .conn
             .enable_cid_routing();
         if !self.register_local_cid(handle, local_key, local_cid) {
             self.remove_slot(handle);
-            return Err(Error::HeaderDecode);
+            return Err(conn::Error::HeaderDecode);
         }
         if self.find_cid(&client_initial_dcid).is_none()
             && !self.register_cid_alias(handle, client_initial_dcid)
         {
             self.remove_slot(handle);
-            return Err(Error::HeaderDecode);
+            return Err(conn::Error::HeaderDecode);
         }
         Ok(handle)
     }
 }
 
-impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    CidOps for Router<'tls, H, P, DOMAIN, B>
+impl<
+    'tls,
+    H: mux::Handler<DOMAIN, B>,
+    P: conn::server::Policy,
+    const DOMAIN: u8,
+    B: stream::ReceiveBuffer,
+> CidOps for mux::Router<'tls, H, P, DOMAIN, B>
 {
     fn cid_hash(&self, value: &[u8]) -> u64 {
         self.registry.indexes.cid_hasher.hash_one(value)
@@ -169,7 +184,7 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
         self.cid_hash(value) as usize & (self.registry.indexes.cid_buckets.len() - 1)
     }
 
-    fn cid_record(&self, link: CidLink) -> Option<&CidRecord> {
+    fn cid_record(&self, link: mux::CidLink) -> Option<&mux::CidRecord> {
         self.registry.entries[link.index()]
             .slot()?
             .identifiers
@@ -177,7 +192,7 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
             .get(link.ordinal())
     }
 
-    fn cid_record_mut(&mut self, link: CidLink) -> Option<&mut CidRecord> {
+    fn cid_record_mut(&mut self, link: mux::CidLink) -> Option<&mut mux::CidRecord> {
         self.registry.entries[link.index()]
             .slot_mut()?
             .identifiers
@@ -185,12 +200,12 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
             .get_mut(link.ordinal())
     }
 
-    fn find_cid(&self, value: &[u8]) -> Option<RoutedCid> {
+    fn find_cid(&self, value: &[u8]) -> Option<mux::RoutedCid> {
         let mut current = self.registry.indexes.cid_buckets[self.cid_bucket(value)];
         while let Some(link) = current {
             let record = self.cid_record(link)?;
-            if record.value.as_ref().map(ConnectionId::as_slice) == Some(value) {
-                return Some(RoutedCid {
+            if record.value.as_ref().map(packet::ConnectionId::as_slice) == Some(value) {
+                return Some(mux::RoutedCid {
                     handle: self.handle_for_index(link.index()),
                     local: record.local,
                 });
@@ -202,18 +217,18 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
 
     fn register_local_cid(
         &mut self,
-        handle: Handle,
-        key: LocalCidKey,
-        value: ConnectionId,
+        handle: conn::Handle,
+        key: path::LocalCidKey,
+        value: packet::ConnectionId,
     ) -> bool {
         let ordinal = key.slot();
-        if ordinal >= MAX_ACTIVE_CONNECTION_IDS {
+        if ordinal >= conn::MAX_ACTIVE_CONNECTION_IDS {
             return false;
         }
         self.register_cid_at(handle, ordinal, value, Some(key))
     }
 
-    fn register_cid_alias(&mut self, handle: Handle, value: ConnectionId) -> bool {
+    fn register_cid_alias(&mut self, handle: conn::Handle, value: packet::ConnectionId) -> bool {
         let Some(index) = self.handle_index(handle) else {
             return false;
         };
@@ -221,20 +236,20 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
             slot.identifiers
                 .cids
                 .iter()
-                .skip(MAX_ACTIVE_CONNECTION_IDS)
+                .skip(conn::MAX_ACTIVE_CONNECTION_IDS)
                 .position(|record| record.value.is_none())
-                .map(|offset| MAX_ACTIVE_CONNECTION_IDS + offset)
+                .map(|offset| conn::MAX_ACTIVE_CONNECTION_IDS + offset)
         }) else {
             return false;
         };
         self.register_cid_at(handle, ordinal, value, None)
     }
 
-    fn apply_cid_routes(&mut self, handle: Handle, updates: &[RouteUpdate]) -> bool {
+    fn apply_cid_routes(&mut self, handle: conn::Handle, updates: &[path::RouteUpdate]) -> bool {
         for update in updates {
             let applied = match *update {
-                RouteUpdate::Add { key, cid } => self.register_local_cid(handle, key, cid),
-                RouteUpdate::Remove(key) => self.unregister_local_cid(handle, key),
+                path::RouteUpdate::Add { key, cid } => self.register_local_cid(handle, key, cid),
+                path::RouteUpdate::Remove(key) => self.unregister_local_cid(handle, key),
             };
             if !applied {
                 return false;
@@ -243,37 +258,42 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
         true
     }
 
-    fn unregister_local_cid(&mut self, handle: Handle, key: LocalCidKey) -> bool {
+    fn unregister_local_cid(&mut self, handle: conn::Handle, key: path::LocalCidKey) -> bool {
         let Some(index) = self.handle_index(handle) else {
             return false;
         };
-        let Some(link) = CidLink::new(index, key.slot()) else {
+        let Some(link) = mux::CidLink::new(index, key.slot()) else {
             return false;
         };
         self.unregister_cid_link(link, Some(key))
     }
 
-    fn unregister_cids(&mut self, handle: Handle) {
+    fn unregister_cids(&mut self, handle: conn::Handle) {
         let Some(index) = self.handle_index(handle) else {
             return;
         };
-        for ordinal in 0..MAX_CIDS_PER_CONN {
-            if let Some(link) = CidLink::new(index, ordinal) {
+        for ordinal in 0..mux::MAX_CIDS_PER_CONN {
+            if let Some(link) = mux::CidLink::new(index, ordinal) {
                 self.unregister_cid_link(link, None);
             }
         }
     }
 }
 
-impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    Router<'tls, H, P, DOMAIN, B>
+impl<
+    'tls,
+    H: mux::Handler<DOMAIN, B>,
+    P: conn::server::Policy,
+    const DOMAIN: u8,
+    B: stream::ReceiveBuffer,
+> mux::Router<'tls, H, P, DOMAIN, B>
 {
     fn register_cid_at(
         &mut self,
-        handle: Handle,
+        handle: conn::Handle,
         ordinal: usize,
-        value: ConnectionId,
-        local: Option<LocalCidKey>,
+        value: packet::ConnectionId,
+        local: Option<path::LocalCidKey>,
     ) -> bool {
         if let Some(routed) = self.find_cid(value.as_slice()) {
             return routed.handle == handle && routed.local == local;
@@ -290,7 +310,7 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
         }
         let bucket = self.cid_bucket(value.as_slice());
         let next = self.registry.indexes.cid_buckets[bucket];
-        let Some(link) = CidLink::new(index, ordinal) else {
+        let Some(link) = mux::CidLink::new(index, ordinal) else {
             return false;
         };
         let Some(slot) = self.registry.entries[index].slot_mut() else {
@@ -311,7 +331,11 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
         true
     }
 
-    fn unregister_cid_link(&mut self, link: CidLink, expected: Option<LocalCidKey>) -> bool {
+    fn unregister_cid_link(
+        &mut self,
+        link: mux::CidLink,
+        expected: Option<path::LocalCidKey>,
+    ) -> bool {
         let index = link.index();
         let Some((bucket, prev, next)) = self.registry.entries[index]
             .slot()
@@ -341,43 +365,48 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
             record.prev = prev;
         }
         if let Some(slot) = self.registry.entries[index].slot_mut() {
-            slot.identifiers.cids[link.ordinal()] = CidRecord::default();
+            slot.identifiers.cids[link.ordinal()] = mux::CidRecord::default();
         }
         true
     }
 }
 
-impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    DeadlineOps<H, P, DOMAIN, B> for Router<'tls, H, P, DOMAIN, B>
+impl<
+    'tls,
+    H: mux::Handler<DOMAIN, B>,
+    P: conn::server::Policy,
+    const DOMAIN: u8,
+    B: stream::ReceiveBuffer,
+> DeadlineOps<H, P, DOMAIN, B> for mux::Router<'tls, H, P, DOMAIN, B>
 {
-    fn deadline_peek(&self) -> Option<(usize, Instant)> {
+    fn deadline_peek(&self) -> Option<(usize, time::Instant)> {
         self.registry
             .deadlines
             .peek()
             .map(|(index, deadline)| (index, *deadline))
     }
 
-    fn deadline_remove(&mut self, index: usize) -> Option<Instant> {
+    fn deadline_remove(&mut self, index: usize) -> Option<time::Instant> {
         self.registry.deadlines.remove(index)
     }
 
-    fn deadline_set(&mut self, index: usize, deadline: Instant) -> bool {
+    fn deadline_set(&mut self, index: usize, deadline: time::Instant) -> bool {
         self.deadline_remove(index);
         self.registry.deadlines.insert(index, deadline).is_ok()
     }
 
-    fn refresh_deadline(&mut self, handle: Handle, now: Instant) {
+    fn refresh_deadline(&mut self, handle: conn::Handle, now: time::Instant) {
         let Some(index) = self.handle_index(handle) else {
             return;
         };
-        self.queue_remove(QueueKind::Reap, index);
+        self.queue_remove(mux::QueueKind::Reap, index);
         let Some(slot) = self.registry.entries[index].slot() else {
             self.deadline_remove(index);
             return;
         };
         if slot.conn.status().is_closed() {
             self.deadline_remove(index);
-            self.queue_push_back(QueueKind::Reap, index);
+            self.queue_push_back(mux::QueueKind::Reap, index);
             return;
         }
         let deadline = Self::slot_deadline(slot, self.registry.entries[index].flush.linked, now);
@@ -392,10 +421,10 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
     }
 
     fn slot_deadline(
-        slot: &Slot<'_, H::Connection, P, DOMAIN, B>,
+        slot: &mux::Slot<'_, H::Connection, P, DOMAIN, B>,
         flush_linked: bool,
-        now: Instant,
-    ) -> Option<Instant> {
+        now: time::Instant,
+    ) -> Option<time::Instant> {
         if slot.conn.status().is_closed() {
             return Some(now);
         }
@@ -409,7 +438,7 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
     }
 
     fn notify_one(&mut self) -> bool {
-        let Some(index) = self.queue_pop_front(QueueKind::Notify) else {
+        let Some(index) = self.queue_pop_front(mux::QueueKind::Notify) else {
             return false;
         };
         let handle = self.handle_for_index(index);
@@ -453,17 +482,22 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
     }
 }
 
-impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    SlotOps<'tls, H, P, DOMAIN, B> for Router<'tls, H, P, DOMAIN, B>
+impl<
+    'tls,
+    H: mux::Handler<DOMAIN, B>,
+    P: conn::server::Policy,
+    const DOMAIN: u8,
+    B: stream::ReceiveBuffer,
+> SlotOps<'tls, H, P, DOMAIN, B> for mux::Router<'tls, H, P, DOMAIN, B>
 {
     fn insert_connection(
         &mut self,
-        mut conn: Connection<DOMAIN, B>,
-        tls: Option<TlsSession<'tls, P, DOMAIN>>,
-        peer_addr: SocketAddr,
+        mut conn: session::Connection<DOMAIN, B>,
+        tls: Option<mux::TlsSession<'tls, P, DOMAIN>>,
+        peer_addr: net::SocketAddr,
         max_packet_bytes: usize,
-    ) -> Option<Handle> {
-        while self.registry.free_head != NONE {
+    ) -> Option<conn::Handle> {
+        while self.registry.free_head != crate::mux::NONE {
             let index = self.registry.free_head as usize;
             let entry = &mut self.registry.entries[index];
             self.registry.free_head = entry.free_next;
@@ -477,10 +511,10 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
                 0
             };
             entry.generation = generation;
-            entry.free_next = NONE;
-            let handle = Handle::from_parts(index as u32, generation);
+            entry.free_next = crate::mux::NONE;
+            let handle = conn::Handle::from_parts(index as u32, generation);
             let connection = self.handler.create_connection(&mut conn, handle);
-            self.registry.entries[index].insert(Slot::new(
+            self.registry.entries[index].insert(mux::Slot::new(
                 conn,
                 tls,
                 connection,
@@ -497,16 +531,16 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
         None
     }
 
-    fn remove_slot(&mut self, handle: Handle) -> bool {
+    fn remove_slot(&mut self, handle: conn::Handle) -> bool {
         let Some(idx) = self.handle_index(handle) else {
             return false;
         };
         if self.registry.dirty_connection == Some(handle) {
             self.registry.dirty_connection = None;
         }
-        self.queue_remove(QueueKind::Notify, idx);
+        self.queue_remove(mux::QueueKind::Notify, idx);
         self.unschedule_flush(handle);
-        self.queue_remove(QueueKind::Reap, idx);
+        self.queue_remove(mux::QueueKind::Reap, idx);
         self.deadline_remove(idx);
         self.unregister_cids(handle);
         let Some(slot) = self.registry.entries[idx].take() else {
@@ -522,7 +556,7 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
         true
     }
 
-    fn finish_connection_mut(&mut self, handle: Handle) {
+    fn finish_connection_mut(&mut self, handle: conn::Handle) {
         if self.registry.dirty_connection != Some(handle) {
             return;
         }
@@ -541,11 +575,11 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
         }
     }
 
-    fn sync_reset_tokens(&mut self, handle: Handle) -> bool {
+    fn sync_reset_tokens(&mut self, handle: conn::Handle) -> bool {
         let Some(index) = self.handle_index(handle) else {
             return false;
         };
-        let mut current = [None; MAX_ACTIVE_CONNECTION_IDS];
+        let mut current = [None; conn::MAX_ACTIVE_CONNECTION_IDS];
         let previous = {
             let slot = self.registry.entries[index]
                 .slot_mut()
@@ -573,11 +607,11 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
         true
     }
 
-    fn handle_for_index(&self, index: usize) -> Handle {
-        Handle::from_parts(index as u32, self.registry.entries[index].generation)
+    fn handle_for_index(&self, index: usize) -> conn::Handle {
+        conn::Handle::from_parts(index as u32, self.registry.entries[index].generation)
     }
 
-    fn handle_index(&self, handle: Handle) -> Option<usize> {
+    fn handle_index(&self, handle: conn::Handle) -> Option<usize> {
         let index = handle.index() as usize;
         self.registry
             .entries

@@ -3,16 +3,21 @@ use std::{collections, time};
 
 use shin::client;
 
-use crate::{
-    clock, conn, errors, new_reno, packet::ConnectionId, packet_protection, qkdf, secrets,
-    transport_params,
-};
+use crate::clock;
+use crate::conn;
+use crate::errors;
+use crate::new_reno;
+use crate::packet;
+use crate::packet_protection;
+use crate::qkdf;
+use crate::secrets;
+use crate::transport_params;
 
 fn local_tp_bytes(
     is_client: bool,
-    local_cid: &ConnectionId,
-    original_dcid: &ConnectionId,
-    retry_scid: Option<&ConnectionId>,
+    local_cid: &packet::ConnectionId,
+    original_dcid: &packet::ConnectionId,
+    retry_scid: Option<&packet::ConnectionId>,
     user_parameters: transport_params::Params,
 ) -> Result<Vec<u8>, errors::ConnectFailure> {
     let mut parameters = user_parameters;
@@ -42,11 +47,11 @@ where
         pool: &'a conn::tls::ClientPool,
     },
     Server {
-        peer_cid: ConnectionId,
+        peer_cid: packet::ConnectionId,
         shard: &'a shin::server::Shard<G, V, DOMAIN>,
     },
     ServerPooled {
-        peer_cid: ConnectionId,
+        peer_cid: packet::ConnectionId,
         pool: &'a shin::server::workspace::QuicPool<conn::handshake::Clock, V, DOMAIN, G>,
     },
 }
@@ -56,10 +61,10 @@ where
     G: shin::server::config::EarlyDataGuard,
     V: shin::server::config::ClientCertVerifier,
 {
-    initial_dcid: ConnectionId,
-    local_cid: ConnectionId,
-    original_dcid: ConnectionId,
-    retry_scid: Option<ConnectionId>,
+    initial_dcid: packet::ConnectionId,
+    local_cid: packet::ConnectionId,
+    original_dcid: packet::ConnectionId,
+    retry_scid: Option<packet::ConnectionId>,
     options: conn::config::Options,
     side: Side<'a, G, V, DOMAIN>,
 }
@@ -112,8 +117,8 @@ where
     V: shin::server::config::ClientCertVerifier,
 {
     pub(super) fn client(
-        initial_dcid: ConnectionId,
-        local_cid: ConnectionId,
+        initial_dcid: packet::ConnectionId,
+        local_cid: packet::ConnectionId,
         server_pubkey: [u8; 32],
         options: conn::config::Options,
     ) -> Self {
@@ -129,8 +134,8 @@ where
     }
 
     pub(super) fn client_pooled(
-        initial_dcid: ConnectionId,
-        local_cid: ConnectionId,
+        initial_dcid: packet::ConnectionId,
+        local_cid: packet::ConnectionId,
         pool: &'a conn::tls::ClientPool,
         options: conn::config::Options,
     ) -> Self {

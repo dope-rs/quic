@@ -1,7 +1,7 @@
-use std::mem::size_of;
-use std::ops::{Deref, DerefMut};
+use std::mem;
+use std::ops;
 
-use crate::stream::{ReceiveBuffer, Receiver};
+use crate::stream;
 
 use super::control;
 use super::streams::table;
@@ -78,7 +78,11 @@ impl ControlSchedule {
         }
     }
 
-    pub(super) fn activate<B: ReceiveBuffer>(&mut self, streams: &mut Map<B>, handle: Handle) {
+    pub(super) fn activate<B: stream::ReceiveBuffer>(
+        &mut self,
+        streams: &mut Map<B>,
+        handle: Handle,
+    ) {
         debug_assert!(handle.index() < CONTROL_END);
         let previous = self.tail.map_or(CONTROL_END, Handle::index);
         let Some((_, stream)) = streams.resolve_mut(handle) else {
@@ -104,7 +108,11 @@ impl ControlSchedule {
         self.len += 1;
     }
 
-    pub(super) fn deactivate<B: ReceiveBuffer>(&mut self, streams: &mut Map<B>, handle: Handle) {
+    pub(super) fn deactivate<B: stream::ReceiveBuffer>(
+        &mut self,
+        streams: &mut Map<B>,
+        handle: Handle,
+    ) {
         let Some((_, stream)) = streams.resolve_mut(handle) else {
             return;
         };
@@ -154,7 +162,7 @@ impl ControlSchedule {
         self.len == 0
     }
 
-    fn linked_handle<B: ReceiveBuffer>(streams: &Map<B>, index: u32) -> Option<Handle> {
+    fn linked_handle<B: stream::ReceiveBuffer>(streams: &Map<B>, index: u32) -> Option<Handle> {
         if index == CONTROL_END {
             return None;
         }
@@ -167,15 +175,15 @@ impl ControlSchedule {
     }
 }
 
-pub(super) struct State<B: ReceiveBuffer> {
-    stream: Receiver<B>,
+pub(super) struct State<B: stream::ReceiveBuffer> {
+    stream: stream::Receiver<B>,
     limit: u64,
     control_link: ControlLink,
     pub(super) max_stream_data: Option<control::OwnerKey<control::kind::MaxStreamData>>,
     pub(super) stop_sending: control::Signal<control::kind::StopSending>,
 }
 
-impl<B: ReceiveBuffer> table::Reusable for State<B> {
+impl<B: stream::ReceiveBuffer> table::Reusable for State<B> {
     type Init = u64;
 
     fn new(init: Self::Init) -> Self {
@@ -191,10 +199,10 @@ impl<B: ReceiveBuffer> table::Reusable for State<B> {
     }
 }
 
-impl<B: ReceiveBuffer> State<B> {
+impl<B: stream::ReceiveBuffer> State<B> {
     fn new(limit: u64) -> Self {
         Self {
-            stream: Receiver::default(),
+            stream: stream::Receiver::default(),
             limit,
             control_link: ControlLink::none(),
             max_stream_data: None,
@@ -244,19 +252,22 @@ impl<B: ReceiveBuffer> State<B> {
     }
 }
 
-impl<B: ReceiveBuffer> Deref for State<B> {
-    type Target = Receiver<B>;
+impl<B: stream::ReceiveBuffer> ops::Deref for State<B> {
+    type Target = stream::Receiver<B>;
 
     fn deref(&self) -> &Self::Target {
         &self.stream
     }
 }
 
-impl<B: ReceiveBuffer> DerefMut for State<B> {
+impl<B: stream::ReceiveBuffer> ops::DerefMut for State<B> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.stream
     }
 }
 
-const _: () = assert!(size_of::<State<Vec<u8>>>() == size_of::<Receiver>() + 4 * size_of::<u64>());
-const _: () = assert!(size_of::<ControlLink>() == size_of::<u64>());
+const _: () = assert!(
+    mem::size_of::<State<Vec<u8>>>()
+        == mem::size_of::<stream::Receiver>() + 4 * mem::size_of::<u64>()
+);
+const _: () = assert!(mem::size_of::<ControlLink>() == mem::size_of::<u64>());

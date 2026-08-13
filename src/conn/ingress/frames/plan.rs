@@ -1,18 +1,16 @@
-use crate::conn::receive_workspace::{
-    ParsedFrame, ReceiveAdmission, ReceiveWorkspace, StopFrameIndex, StreamFrameIndex,
-};
-use crate::conn::{Epoch, Error};
-use crate::frame::Frame;
-use crate::stream::ReceiveBuffer;
+use crate::conn;
+use crate::conn::receive_workspace;
+use crate::frame;
+use crate::stream;
 
 pub(super) struct Reservation {
     pub(super) admitted_bytes: usize,
     pub(super) event_slots: usize,
 }
 
-fn stop_frame_id(frame: &ParsedFrame) -> Option<u64> {
+fn stop_frame_id(frame: &receive_workspace::ParsedFrame) -> Option<u64> {
     match frame {
-        Frame::StopSending { stream_id, .. } => Some(stream_id.get()),
+        frame::Frame::StopSending { stream_id, .. } => Some(stream_id.get()),
         _ => None,
     }
 }
@@ -22,23 +20,22 @@ fn stop_frame_id(frame: &ParsedFrame) -> Option<u64> {
 /// The single workspace borrow prevents receive-lane reentrancy. Dropping the
 /// plan returns every bounded scratch structure to its empty reusable state.
 pub(super) struct Plan<'workspace> {
-    workspace: &'workspace mut ReceiveWorkspace,
+    workspace: &'workspace mut receive_workspace::ReceiveWorkspace,
     admitted_bytes: usize,
     datagram_slots: usize,
 }
 
 impl<'workspace> Plan<'workspace> {
-    pub(super) fn stream_frame_id(frame: &ParsedFrame) -> Option<u64> {
+    pub(super) fn stream_frame_id(frame: &receive_workspace::ParsedFrame) -> Option<u64> {
         match frame {
-            Frame::Stream { stream_id, .. } | Frame::ResetStream { stream_id, .. } => {
-                Some(stream_id.get())
-            }
+            frame::Frame::Stream { stream_id, .. }
+            | frame::Frame::ResetStream { stream_id, .. } => Some(stream_id.get()),
             _ => None,
         }
     }
 
     pub(super) fn begin(
-        workspace: &'workspace mut ReceiveWorkspace,
+        workspace: &'workspace mut receive_workspace::ReceiveWorkspace,
         datagram_slots: usize,
     ) -> Self {
         workspace.parsed_frames.clear();
@@ -57,39 +54,44 @@ impl<'workspace> Plan<'workspace> {
 
     pub(super) fn record(
         &mut self,
-        epoch: Epoch,
+        epoch: conn::Epoch,
         frame_index: usize,
-        frame: &ParsedFrame,
-    ) -> Result<(), Error> {
+        frame: &receive_workspace::ParsedFrame,
+    ) -> Result<(), conn::Error> {
         self.workspace.admissions.push(frame_index);
         self.workspace.payloads.push(frame_index);
         match frame {
-            Frame::Datagram { data, .. }
-                if epoch == Epoch::Application && self.datagram_slots != 0 =>
+            frame::Frame::Datagram { data, .. }
+                if epoch == conn::Epoch::Application && self.datagram_slots != 0 =>
             {
                 self.workspace
                     .admissions
-                    .mark(frame_index, ReceiveAdmission::Datagram);
+                    .mark(frame_index, receive_workspace::ReceiveAdmission::Datagram);
                 self.workspace
                     .payloads
                     .set_accepted(frame_index, data.len())
-                    .ok_or(Error::StreamBufferExceeded)?;
+                    .ok_or(conn::Error::StreamBufferExceeded)?;
                 self.admitted_bytes = self
                     .admitted_bytes
                     .checked_add(data.len())
-                    .ok_or(Error::StreamBufferExceeded)?;
+                    .ok_or(conn::Error::StreamBufferExceeded)?;
                 self.datagram_slots -= 1;
             }
-            Frame::Stream { .. } | Frame::ResetStream { .. } if epoch == Epoch::Application => {
-                let frame_index = StreamFrameIndex::new(frame_index).ok_or(Error::FrameDecode)?;
+            frame::Frame::Stream { .. } | frame::Frame::ResetStream { .. }
+                if epoch == conn::Epoch::Application =>
+            {
+                let frame_index =
+                    crate::conn::receive_workspace::StreamFrameIndex::new(frame_index)
+                        .ok_or(conn::Error::FrameDecode)?;
                 if !self.workspace.stream_frames.push(frame_index) {
-                    return Err(Error::FrameDecode);
+                    return Err(conn::Error::FrameDecode);
                 }
             }
-            Frame::StopSending { .. } if epoch == Epoch::Application => {
-                let frame_index = StopFrameIndex::new(frame_index).ok_or(Error::FrameDecode)?;
+            frame::Frame::StopSending { .. } if epoch == conn::Epoch::Application => {
+                let frame_index = crate::conn::receive_workspace::StopFrameIndex::new(frame_index)
+                    .ok_or(conn::Error::FrameDecode)?;
                 if !self.workspace.stop_frames.push(frame_index) {
-                    return Err(Error::FrameDecode);
+                    return Err(conn::Error::FrameDecode);
                 }
             }
             _ => {}
@@ -97,12 +99,12 @@ impl<'workspace> Plan<'workspace> {
         Ok(())
     }
 
-    pub(super) fn reserve<B: ReceiveBuffer>(
+    pub(super) fn reserve<B: stream::ReceiveBuffer>(
         &mut self,
         streams: &mut crate::conn::streams::State<B>,
         is_client: bool,
-    ) -> Result<Reservation, Error> {
-        let ReceiveWorkspace {
+    ) -> Result<Reservation, conn::Error> {
+        let receive_workspace::ReceiveWorkspace {
             parsed_frames,
             admissions,
             payloads,
@@ -135,7 +137,7 @@ impl<'workspace> Plan<'workspace> {
         let mut group_start = 0;
         while group_start < stream_frames.len() {
             let stream_id = Self::stream_frame_id(&parsed_frames[stream_frames[group_start].get()])
-                .ok_or(Error::FrameDecode)?;
+                .ok_or(conn::Error::FrameDecode)?;
             let group_end = stream_frames[group_start..]
                 .iter()
                 .position(|&frame_index| {
@@ -153,26 +155,26 @@ impl<'workspace> Plan<'workspace> {
             )?;
             admitted_bytes = admitted_bytes
                 .checked_add(impact.accepted_bytes)
-                .ok_or(Error::StreamBufferExceeded)?;
+                .ok_or(conn::Error::StreamBufferExceeded)?;
             receive_stream_slots = receive_stream_slots
                 .checked_add(impact.stream_slots)
-                .ok_or(Error::StreamBufferExceeded)?;
+                .ok_or(conn::Error::StreamBufferExceeded)?;
             receive_range_slots = receive_range_slots
                 .checked_add(impact.range_slots)
-                .ok_or(Error::StreamBufferExceeded)?;
+                .ok_or(conn::Error::StreamBufferExceeded)?;
             event_slots = event_slots
                 .checked_add(impact.event_slots)
-                .ok_or(Error::EventCapacity)?;
+                .ok_or(conn::Error::EventCapacity)?;
             flow_control_bytes = flow_control_bytes
                 .checked_add(impact.flow_control_bytes)
-                .ok_or(Error::FlowControl)?;
+                .ok_or(conn::Error::FlowControl)?;
             group_start = group_end;
         }
 
         group_start = 0;
         while group_start < stop_frames.len() {
             let stream_id = stop_frame_id(&parsed_frames[stop_frames[group_start].get()])
-                .ok_or(Error::FrameDecode)?;
+                .ok_or(conn::Error::FrameDecode)?;
             let group_end = stop_frames[group_start..]
                 .iter()
                 .position(|&frame_index| {
@@ -182,15 +184,15 @@ impl<'workspace> Plan<'workspace> {
             let impact = streams.plan_stop(stream_id, is_client)?;
             if impact.active {
                 for &frame_index in &stop_frames[group_start..group_end] {
-                    admissions.mark(frame_index.get(), ReceiveAdmission::Stop);
+                    admissions.mark(frame_index.get(), receive_workspace::ReceiveAdmission::Stop);
                 }
             }
             send_stream_slots = send_stream_slots
                 .checked_add(impact.stream_slots)
-                .ok_or(Error::StreamBufferExceeded)?;
+                .ok_or(conn::Error::StreamBufferExceeded)?;
             event_slots = event_slots
                 .checked_add(impact.event_slots)
-                .ok_or(Error::EventCapacity)?;
+                .ok_or(conn::Error::EventCapacity)?;
             group_start = group_end;
         }
 
@@ -198,7 +200,7 @@ impl<'workspace> Plan<'workspace> {
             || receive_range_slots > streams.receive.ranges.remaining_capacity()
             || send_stream_slots > streams.transmit.map.remaining_capacity()
         {
-            return Err(Error::StreamBufferExceeded);
+            return Err(conn::Error::StreamBufferExceeded);
         }
         if streams
             .receive
@@ -206,7 +208,7 @@ impl<'workspace> Plan<'workspace> {
             .checked_add(flow_control_bytes)
             .is_none_or(|total| total > streams.receive.local_max_data)
         {
-            return Err(Error::FlowControl);
+            return Err(conn::Error::FlowControl);
         }
         Ok(Reservation {
             admitted_bytes,
@@ -218,11 +220,11 @@ impl<'workspace> Plan<'workspace> {
         self.workspace.parsed_frames.len()
     }
 
-    pub(super) fn push_frame(&mut self, frame: ParsedFrame) {
+    pub(super) fn push_frame(&mut self, frame: receive_workspace::ParsedFrame) {
         self.workspace.parsed_frames.push(frame);
     }
 
-    pub(super) fn workspace(&mut self) -> &mut ReceiveWorkspace {
+    pub(super) fn workspace(&mut self) -> &mut receive_workspace::ReceiveWorkspace {
         self.workspace
     }
 }

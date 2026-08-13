@@ -1,13 +1,17 @@
-use std::collections::VecDeque;
-use std::time::Instant;
+use std::collections;
+use std::time;
 
-use crate::new_reno::NewReno;
-use crate::pacer::Pacer;
-use crate::pmtud::Pmtud;
-use crate::pn_space::PnSpace;
-use crate::rtt::RttTracker;
+use crate::new_reno;
+use crate::pacer;
+use crate::pmtud;
+use crate::pn_space;
+use crate::rtt;
 
-use super::{Epoch, State, control, datagram, journal, path};
+use crate::conn;
+use crate::conn::control;
+use crate::conn::datagram;
+use crate::conn::journal;
+use crate::conn::path;
 use control::Write as _;
 
 const HANDSHAKE_DONE: u8 = 1 << 0;
@@ -91,26 +95,26 @@ pub(super) struct Setup {
 
 pub(super) struct Egress {
     pub(super) derived_controls: DerivedControls,
-    pub(super) spaces: [PnSpace; 3],
-    pub(super) rtt: RttTracker,
+    pub(super) spaces: [pn_space::PnSpace; 3],
+    pub(super) rtt: rtt::RttTracker,
     pub(super) pto_count: u32,
-    pub(super) loss_timer: Option<Instant>,
+    pub(super) loss_timer: Option<time::Instant>,
     pub(super) pto_probe_allowance: u8,
-    pub(super) pto_probe_epoch: Option<Epoch>,
+    pub(super) pto_probe_epoch: Option<conn::Epoch>,
     pub(super) packet_journals: journal::Table,
-    pub(super) pending_datagrams: VecDeque<Vec<u8>>,
+    pub(super) pending_datagrams: collections::VecDeque<Vec<u8>>,
     pub(super) pending_close: Option<PendingClose>,
-    pub(super) cc: NewReno,
-    pub(super) pacer: Pacer,
-    pub(super) pmtud: Pmtud,
+    pub(super) cc: new_reno::NewReno,
+    pub(super) pacer: pacer::Pacer,
+    pub(super) pmtud: pmtud::Pmtud,
     pub(super) packet_ceiling: usize,
     pub(super) pmtud_probe_pn: Option<u64>,
     pub(super) datagram_congestion_control: datagram::CongestionControl,
     pub(super) pending_datagrams_capacity: usize,
-    pub(super) last_activity: Instant,
+    pub(super) last_activity: time::Instant,
     pub(super) amplification_received: u64,
     pub(super) amplification_sent: u64,
-    pub(super) state: State,
+    pub(super) state: conn::State,
     pub(super) sent_initial: bool,
     pub(super) handshake_confirmed: bool,
     pub(super) ack_eliciting_sent_since_last_receive: bool,
@@ -122,7 +126,7 @@ impl Egress {
         Self {
             derived_controls: DerivedControls::default(),
             spaces: Default::default(),
-            rtt: RttTracker::default(),
+            rtt: rtt::RttTracker::default(),
             pto_count: 0,
             loss_timer: None,
             pto_probe_allowance: 0,
@@ -132,19 +136,19 @@ impl Egress {
                 setup.control_journal_capacity,
                 setup.stream_journal_capacity,
             ),
-            pending_datagrams: VecDeque::new(),
+            pending_datagrams: collections::VecDeque::new(),
             pending_close: None,
-            cc: NewReno::default(),
-            pacer: Pacer::new(Instant::now()),
-            pmtud: Pmtud::new(setup.max_pmtu),
+            cc: new_reno::NewReno::default(),
+            pacer: pacer::Pacer::new(time::Instant::now()),
+            pmtud: pmtud::Pmtud::new(setup.max_pmtu),
             packet_ceiling: usize::try_from(setup.max_pmtu).unwrap_or(usize::MAX),
             pmtud_probe_pn: None,
             datagram_congestion_control: setup.datagram_congestion_control,
             pending_datagrams_capacity: setup.pending_datagrams_capacity,
-            last_activity: Instant::now(),
+            last_activity: time::Instant::now(),
             amplification_received: 0,
             amplification_sent: 0,
-            state: State::Handshaking,
+            state: conn::State::Handshaking,
             sent_initial: false,
             handshake_confirmed: false,
             ack_eliciting_sent_since_last_receive: false,

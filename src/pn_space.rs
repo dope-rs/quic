@@ -1,8 +1,8 @@
-use std::time::Instant;
+use std::time;
 
-use crate::frame::MAX_ADDITIONAL_ACK_RANGES;
+use crate::frame;
 
-pub(crate) const MAX_ACK_INTERVALS: usize = MAX_ADDITIONAL_ACK_RANGES + 1;
+pub(crate) const MAX_ACK_INTERVALS: usize = frame::MAX_ADDITIONAL_ACK_RANGES + 1;
 const RECEIVED_WINDOW_BITS: usize = MAX_ACK_INTERVALS * 2 - 1;
 const RECEIVED_WINDOW_WORDS: usize = RECEIVED_WINDOW_BITS.div_ceil(u64::BITS as usize);
 
@@ -219,14 +219,14 @@ impl ExactSizeIterator for GeneratedAckRanges<'_> {}
 pub struct PnSpace {
     pub next_pn: u64,
     pub largest_acked: Option<u64>,
-    pub time_of_last_ack_eliciting: Option<Instant>,
+    pub time_of_last_ack_eliciting: Option<time::Instant>,
     pub ack_eliciting_in_flight: usize,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct Receive {
     packets: ReceivedPackets,
-    pub(crate) largest_time: Option<Instant>,
+    pub(crate) largest_time: Option<time::Instant>,
     pub(crate) ack_eliciting: bool,
     pub(crate) ack_pending: bool,
 }
@@ -247,7 +247,7 @@ impl Receive {
         self.packets.admits(pn).then_some(Fresh(pn))
     }
 
-    pub(crate) fn commit(&mut self, Fresh(pn): Fresh, ack_eliciting: bool, now: Instant) {
+    pub(crate) fn commit(&mut self, Fresh(pn): Fresh, ack_eliciting: bool, now: time::Instant) {
         debug_assert!(self.packets.admits(pn));
         let previous_largest = self.packets.largest();
         self.packets.insert(pn);

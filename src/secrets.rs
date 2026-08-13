@@ -1,11 +1,9 @@
-use std::net::SocketAddr;
+use std::net;
 
 use ring::hmac;
-use ring::hmac::Context;
-use ring::hmac::Key;
-use subtle::ConstantTimeEq;
+use subtle::ConstantTimeEq as _;
 
-use crate::packet::{ConnectionId, ConnectionIdRef};
+use crate::packet;
 
 #[derive(Clone, Copy)]
 pub(crate) struct StatelessResetSecret(pub(crate) [u8; 32]);
@@ -18,8 +16,8 @@ impl From<[u8; 32]> for StatelessResetSecret {
 
 impl StatelessResetSecret {
     pub fn token_for(&self, cid: &[u8]) -> [u8; 16] {
-        let key = Key::new(hmac::HMAC_SHA256, &self.0);
-        let mut ctx = Context::with_key(&key);
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.0);
+        let mut ctx = hmac::Context::with_key(&key);
         ctx.update(b"qsrt");
         ctx.update(cid);
         let tag = ctx.sign();
@@ -42,15 +40,15 @@ impl RetryTokenSecret {
     const TAG_LEN: usize = 16;
     const FIXED_LEN: usize = 8 + 1 + Self::TAG_LEN;
 
-    pub const fn encoded_len(odcid: ConnectionIdRef<'_>) -> usize {
+    pub const fn encoded_len(odcid: packet::ConnectionIdRef<'_>) -> usize {
         Self::FIXED_LEN + odcid.len()
     }
 
     pub fn issue_into(
         &self,
         out: &mut Vec<u8>,
-        addr: &SocketAddr,
-        odcid: ConnectionIdRef<'_>,
+        addr: &net::SocketAddr,
+        odcid: packet::ConnectionIdRef<'_>,
         expiry_unix_secs: u64,
     ) {
         let (addr_bytes, addr_len) = Self::addr_bytes(addr);
@@ -64,10 +62,10 @@ impl RetryTokenSecret {
 
     pub fn validate(
         &self,
-        addr: &SocketAddr,
+        addr: &net::SocketAddr,
         token: &[u8],
         now_unix_secs: u64,
-    ) -> Option<ConnectionId> {
+    ) -> Option<packet::ConnectionId> {
         if token.len() < Self::FIXED_LEN {
             return None;
         }
@@ -76,7 +74,7 @@ impl RetryTokenSecret {
             return None;
         }
         let odcid_len = token[8] as usize;
-        if odcid_len > ConnectionId::MAX_LEN {
+        if odcid_len > packet::ConnectionId::MAX_LEN {
             return None;
         }
         if token.len() != Self::FIXED_LEN + odcid_len {
@@ -89,19 +87,19 @@ impl RetryTokenSecret {
         if !bool::from(provided_tag.ct_eq(&expected[..])) {
             return None;
         }
-        ConnectionId::new(odcid)
+        packet::ConnectionId::new(odcid)
     }
 
-    fn addr_bytes(addr: &SocketAddr) -> ([u8; 19], usize) {
+    fn addr_bytes(addr: &net::SocketAddr) -> ([u8; 19], usize) {
         let mut bytes = [0; 19];
         match addr {
-            SocketAddr::V4(a) => {
+            net::SocketAddr::V4(a) => {
                 bytes[0] = 4;
                 bytes[1..5].copy_from_slice(&a.ip().octets());
                 bytes[5..7].copy_from_slice(&a.port().to_be_bytes());
                 (bytes, 7)
             }
-            SocketAddr::V6(a) => {
+            net::SocketAddr::V6(a) => {
                 bytes[0] = 6;
                 bytes[1..17].copy_from_slice(&a.ip().octets());
                 bytes[17..19].copy_from_slice(&a.port().to_be_bytes());
@@ -111,8 +109,8 @@ impl RetryTokenSecret {
     }
 
     fn tag(&self, addr_bytes: &[u8], odcid: &[u8], expiry: u64) -> [u8; Self::TAG_LEN] {
-        let key = Key::new(hmac::HMAC_SHA256, &self.0);
-        let mut ctx = Context::with_key(&key);
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.0);
+        let mut ctx = hmac::Context::with_key(&key);
         ctx.update(b"qretrytok");
         ctx.update(addr_bytes);
         ctx.update(&expiry.to_be_bytes());

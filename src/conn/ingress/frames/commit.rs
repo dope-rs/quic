@@ -1,49 +1,50 @@
-use crate::conn::receive_workspace::ReceiveAdmission;
-use crate::conn::{
-    Connection, Epoch, Error, MAX_STREAM_COUNT, State, handshake, recovery, streams,
-};
-use crate::frame::Frame;
-use crate::frame::ack_ranges::Ranges;
-use crate::stream::ReceiveBuffer;
+use crate::conn;
+use crate::conn::handshake;
+use crate::conn::recovery;
+use crate::conn::streams;
 
-use super::plan::Plan;
-use super::source::Source;
-use super::{PacketCid, PacketDisposition, PacketMeta};
-use crate::conn::ingress::admitted_packet::AdmittedPacket;
+use crate::stream;
 
-pub(super) trait Commit<const DOMAIN: u8, B: ReceiveBuffer> {
+use crate::conn::ingress::admitted_packet;
+use crate::conn::ingress::frames;
+use crate::conn::ingress::frames::plan;
+use crate::conn::ingress::frames::source;
+
+pub(super) trait Commit<const DOMAIN: u8, B: stream::ReceiveBuffer> {
     fn process<R, S>(
         &mut self,
-        meta: PacketMeta,
-        packet_cid: Option<PacketCid<'_>>,
+        meta: frames::PacketMeta,
+        packet_cid: Option<frames::PacketCid<'_>>,
         body: &[u8],
         read: &mut R,
-        plan: &mut Plan<'_>,
+        plan: &mut plan::Plan<'_>,
         source: &mut S,
-    ) -> Result<PacketDisposition, Error>
+    ) -> Result<frames::PacketDisposition, conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
-        S: Source<B>;
+        S: source::Source<B>;
 }
 
-impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_, DOMAIN, B> {
+impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Commit<DOMAIN, B>
+    for admitted_packet::AdmittedPacket<'_, DOMAIN, B>
+{
     fn process<R, S>(
         &mut self,
-        meta: PacketMeta,
-        packet_cid: Option<PacketCid<'_>>,
+        meta: frames::PacketMeta,
+        packet_cid: Option<frames::PacketCid<'_>>,
         body: &[u8],
         read: &mut R,
-        plan: &mut Plan<'_>,
+        plan: &mut plan::Plan<'_>,
         source: &mut S,
-    ) -> Result<PacketDisposition, Error>
+    ) -> Result<frames::PacketDisposition, conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
-        S: Source<B>,
+        S: source::Source<B>,
     {
-        let PacketMeta { epoch, now, .. } = meta;
+        let frames::PacketMeta { epoch, now, .. } = meta;
         let result = (|| {
             let (connection, discarded_received) = self.state();
-            let Connection {
+            let crate::conn::session::Connection {
                 egress,
                 control,
                 handshake,
@@ -68,37 +69,40 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
             let parts = &mut workspace.parts;
             let mut event_permit = stream_events
                 .reserve(reservation.event_slots)
-                .ok_or(Error::EventCapacity)?;
+                .ok_or(conn::Error::EventCapacity)?;
             recv_crypto[epoch as usize].prepare(parsed_frames.iter().filter_map(|frame| {
-                let Frame::Crypto { offset, data } = frame else {
+                let crate::frame::Frame::Crypto { offset, data } = frame else {
                     return None;
                 };
                 Some((offset.get(), &body[data.clone()]))
             }))?;
             source.prepare(reservation.admitted_bytes, |output| {
                 for (frame_index, parsed) in parsed_frames.iter().enumerate() {
-                    if admissions.get(frame_index) != ReceiveAdmission::Datagram {
+                    if admissions.get(frame_index)
+                        != crate::conn::receive_workspace::ReceiveAdmission::Datagram
+                    {
                         continue;
                     }
-                    let Frame::Datagram { data, .. } = parsed else {
-                        return Err(Error::FrameDecode);
+                    let crate::frame::Frame::Datagram { data, .. } = parsed else {
+                        return Err(conn::Error::FrameDecode);
                     };
                     payloads
                         .set_start(frame_index, output.len())
-                        .ok_or(Error::StreamBufferExceeded)?;
+                        .ok_or(conn::Error::StreamBufferExceeded)?;
                     output
                         .try_extend(&body[data.clone()])
-                        .map_err(|_| Error::StreamBufferExceeded)?;
+                        .map_err(|_| conn::Error::StreamBufferExceeded)?;
                 }
                 let mut group_start = 0;
                 while group_start < stream_frames.len() {
-                    let stream_id =
-                        Plan::stream_frame_id(&parsed_frames[stream_frames[group_start].get()])
-                            .ok_or(Error::FrameDecode)?;
+                    let stream_id = plan::Plan::stream_frame_id(
+                        &parsed_frames[stream_frames[group_start].get()],
+                    )
+                    .ok_or(conn::Error::FrameDecode)?;
                     let group_end = stream_frames[group_start..]
                         .iter()
                         .position(|&frame_index| {
-                            Plan::stream_frame_id(&parsed_frames[frame_index.get()])
+                            plan::Plan::stream_frame_id(&parsed_frames[frame_index.get()])
                                 != Some(stream_id)
                         })
                         .map_or(stream_frames.len(), |offset| group_start + offset);
@@ -117,7 +121,10 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
             })?;
             for (frame_index, parsed) in parsed_frames.iter().enumerate() {
                 match (admissions.get(frame_index), parsed) {
-                    (ReceiveAdmission::Datagram, Frame::Datagram { data, .. }) => {
+                    (
+                        crate::conn::receive_workspace::ReceiveAdmission::Datagram,
+                        crate::frame::Frame::Datagram { data, .. },
+                    ) => {
                         let bytes = source.take_datagram(
                             data.clone(),
                             payloads.get(frame_index),
@@ -126,8 +133,8 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
                         incoming_datagrams.push_back(bytes);
                     }
                     (
-                        ReceiveAdmission::Stream,
-                        Frame::Stream {
+                        crate::conn::receive_workspace::ReceiveAdmission::Stream,
+                        crate::frame::Frame::Stream {
                             stream_id,
                             offset,
                             fin,
@@ -163,8 +170,8 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
                             .expect("the receive plan reserved every commit resource");
                     }
                     (
-                        ReceiveAdmission::StreamTransient,
-                        Frame::Stream {
+                        crate::conn::receive_workspace::ReceiveAdmission::StreamTransient,
+                        crate::frame::Frame::Stream {
                             stream_id,
                             offset,
                             fin,
@@ -192,8 +199,8 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
                             .expect("the receive plan reserved every transient stream resource");
                     }
                     (
-                        ReceiveAdmission::Reset,
-                        Frame::ResetStream {
+                        crate::conn::receive_workspace::ReceiveAdmission::Reset,
+                        crate::frame::Frame::ResetStream {
                             stream_id,
                             error_code,
                             final_size,
@@ -219,8 +226,8 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
                             .expect("the receive plan reserved every reset resource");
                     }
                     (
-                        ReceiveAdmission::Stop,
-                        Frame::StopSending {
+                        crate::conn::receive_workspace::ReceiveAdmission::Stop,
+                        crate::frame::Frame::StopSending {
                             stream_id,
                             error_code,
                         },
@@ -243,30 +250,35 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
                         );
                     }
                     (
-                        ReceiveAdmission::Drop,
-                        Frame::Datagram { .. }
-                        | Frame::Stream { .. }
-                        | Frame::ResetStream { .. }
-                        | Frame::StopSending { .. },
+                        crate::conn::receive_workspace::ReceiveAdmission::Drop,
+                        crate::frame::Frame::Datagram { .. }
+                        | crate::frame::Frame::Stream { .. }
+                        | crate::frame::Frame::ResetStream { .. }
+                        | crate::frame::Frame::StopSending { .. },
                     ) => {}
                     (
-                        ReceiveAdmission::StreamTransient,
-                        Frame::Datagram { .. }
-                        | Frame::ResetStream { .. }
-                        | Frame::StopSending { .. },
-                    ) => return Err(Error::FrameDecode),
+                        crate::conn::receive_workspace::ReceiveAdmission::StreamTransient,
+                        crate::frame::Frame::Datagram { .. }
+                        | crate::frame::Frame::ResetStream { .. }
+                        | crate::frame::Frame::StopSending { .. },
+                    ) => return Err(conn::Error::FrameDecode),
                     (_, parsed) => {
                         let shin_epoch = match epoch {
-                            Epoch::Initial => shin::connection::Epoch::Plaintext,
-                            Epoch::Handshake => shin::connection::Epoch::Handshake,
-                            Epoch::Application => shin::connection::Epoch::Application,
+                            crate::conn::Epoch::Initial => shin::connection::Epoch::Plaintext,
+                            crate::conn::Epoch::Handshake => shin::connection::Epoch::Handshake,
+                            crate::conn::Epoch::Application => shin::connection::Epoch::Application,
                         };
                         let frame = parsed.clone().map(
                             |range| &body[range],
-                            |ranges| Ranges::new(&body[ranges.bytes], ranges.count),
+                            |ranges| {
+                                crate::frame::ack_ranges::Ranges::new(
+                                    &body[ranges.bytes],
+                                    ranges.count,
+                                )
+                            },
                         );
                         match frame {
-                            Frame::Crypto { offset, data } => {
+                            crate::frame::Frame::Crypto { offset, data } => {
                                 recv_crypto[epoch as usize].accept(
                                     offset.get(),
                                     data,
@@ -296,13 +308,13 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
                                             .complete()
                                             .is_err()
                                         {
-                                            egress.state = State::Closed;
+                                            egress.state = crate::conn::State::Closed;
                                         }
                                         Ok(())
                                     },
                                 )?;
                             }
-                            Frame::Ack {
+                            crate::frame::Frame::Ack {
                                 largest,
                                 delay,
                                 first_range,
@@ -310,7 +322,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
                             } => {
                                 let largest = largest.get();
                                 if largest >= egress.spaces[epoch as usize].next_pn {
-                                    return Err(Error::ProtocolViolation);
+                                    return Err(conn::Error::ProtocolViolation);
                                 }
                                 let space = &mut egress.spaces[epoch as usize];
                                 space.largest_acked =
@@ -334,21 +346,23 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
                                     now,
                                 );
                             }
-                            Frame::HandshakeDone if epoch == Epoch::Application && is_client => {
+                            crate::frame::Frame::HandshakeDone
+                                if epoch == crate::conn::Epoch::Application && is_client =>
+                            {
                                 egress.handshake_confirmed = true;
                                 recovery::epochs::Transition::new(egress, handshake)
                                     .discard_initial();
-                                discarded_received.record(Epoch::Initial);
+                                discarded_received.record(crate::conn::Epoch::Initial);
                                 recovery::epochs::Transition::new(egress, handshake)
                                     .discard_handshake();
-                                discarded_received.record(Epoch::Handshake);
-                                recv_crypto[Epoch::Initial as usize].discard();
-                                recv_crypto[Epoch::Handshake as usize].discard();
+                                discarded_received.record(crate::conn::Epoch::Handshake);
+                                recv_crypto[crate::conn::Epoch::Initial as usize].discard();
+                                recv_crypto[crate::conn::Epoch::Handshake as usize].discard();
                             }
-                            Frame::ConnectionClose { .. } => {
-                                egress.state = State::Closed;
+                            crate::frame::Frame::ConnectionClose { .. } => {
+                                egress.state = crate::conn::State::Closed;
                             }
-                            Frame::NewConnectionId {
+                            crate::frame::Frame::NewConnectionId {
                                 sequence_number,
                                 retire_prior_to,
                                 connection_id,
@@ -362,7 +376,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
                                     control,
                                 )?;
                             }
-                            Frame::RetireConnectionId { sequence_number }
+                            crate::frame::Frame::RetireConnectionId { sequence_number }
                                 if packet_cid.is_some() =>
                             {
                                 let packet_cid = packet_cid
@@ -375,14 +389,17 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
                                 )?;
                                 egress.derived_controls.arm_new_connection_ids(issued);
                             }
-                            Frame::NewConnectionId { .. } | Frame::RetireConnectionId { .. } => {
-                                return Err(Error::ProtocolViolation);
+                            crate::frame::Frame::NewConnectionId { .. }
+                            | crate::frame::Frame::RetireConnectionId { .. } => {
+                                return Err(conn::Error::ProtocolViolation);
                             }
-                            Frame::PathChallenge { data } if epoch == Epoch::Application => {
+                            crate::frame::Frame::PathChallenge { data }
+                                if epoch == crate::conn::Epoch::Application =>
+                            {
                                 path.queue_response(data, control);
                             }
-                            Frame::MaxData { maximum_data }
-                                if epoch == Epoch::Application
+                            crate::frame::Frame::MaxData { maximum_data }
+                                if epoch == crate::conn::Epoch::Application
                                     && maximum_data.get()
                                         > stream_state.transmit.peer_data_credit.limit() =>
                             {
@@ -391,10 +408,10 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
                                     .peer_data_credit
                                     .raise(maximum_data.get(), control);
                             }
-                            Frame::MaxStreamData {
+                            crate::frame::Frame::MaxStreamData {
                                 stream_id,
                                 maximum_stream_data,
-                            } if epoch == Epoch::Application => {
+                            } if epoch == crate::conn::Epoch::Application => {
                                 let stream_id = stream_id.get();
                                 stream_state.validate_or_open_peer_reserved(
                                     stream_id,
@@ -409,9 +426,10 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
                                     control,
                                 );
                             }
-                            Frame::DataBlocked { .. } if epoch == Epoch::Application => {}
-                            Frame::StreamDataBlocked { stream_id, .. }
-                                if epoch == Epoch::Application =>
+                            crate::frame::Frame::DataBlocked { .. }
+                                if epoch == crate::conn::Epoch::Application => {}
+                            crate::frame::Frame::StreamDataBlocked { stream_id, .. }
+                                if epoch == crate::conn::Epoch::Application =>
                             {
                                 stream_state.validate_or_open_peer_reserved(
                                     stream_id.get(),
@@ -419,20 +437,23 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
                                     is_client,
                                 )?;
                             }
-                            Frame::MaxStreams {
+                            crate::frame::Frame::MaxStreams {
                                 is_uni,
                                 max_streams,
-                            } if epoch == Epoch::Application => {
+                            } if epoch == crate::conn::Epoch::Application => {
                                 let maximum = max_streams.get();
-                                if maximum > MAX_STREAM_COUNT {
-                                    return Err(Error::ProtocolViolation);
+                                if maximum > crate::conn::MAX_STREAM_COUNT {
+                                    return Err(conn::Error::ProtocolViolation);
                                 }
                                 let limit =
                                     &mut stream_state.local_initiated.peer_max[usize::from(is_uni)];
                                 *limit = (*limit).max(maximum);
                             }
-                            Frame::StreamsBlocked { .. } if epoch == Epoch::Application => {}
-                            Frame::PathResponse { data } if epoch == Epoch::Application => {
+                            crate::frame::Frame::StreamsBlocked { .. }
+                                if epoch == crate::conn::Epoch::Application => {}
+                            crate::frame::Frame::PathResponse { data }
+                                if epoch == crate::conn::Epoch::Application =>
+                            {
                                 path.record_response(data, control);
                             }
                             _ => {}
@@ -440,11 +461,13 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Commit<DOMAIN, B> for AdmittedPacket<'_
                     }
                 }
             }
-            Ok(PacketDisposition::Commit)
+            Ok(frames::PacketDisposition::Commit)
         })();
 
         match result {
-            Err(Error::EventCapacity | Error::StreamBufferExceeded) => Ok(PacketDisposition::Drop),
+            Err(conn::Error::EventCapacity | conn::Error::StreamBufferExceeded) => {
+                Ok(frames::PacketDisposition::Drop)
+            }
             result => result,
         }
     }

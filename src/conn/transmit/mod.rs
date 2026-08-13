@@ -1,6 +1,6 @@
 use std::time;
 
-use crate::stream::ReceiveBuffer;
+use crate::stream;
 use crate::{conn, pmtud};
 
 pub(super) mod builder;
@@ -13,11 +13,11 @@ use builder::application::terminal::BuildTerminal as _;
 use builder::application::zero_rtt::BuildZeroRtt as _;
 use eligibility::Eligibility as _;
 
-pub struct Emission<'a, const DOMAIN: u8, B: ReceiveBuffer = Vec<u8>> {
+pub struct Emission<'a, const DOMAIN: u8, B: stream::ReceiveBuffer = Vec<u8>> {
     connection: &'a mut conn::session::Connection<DOMAIN, B>,
 }
 
-impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Emission<'a, DOMAIN, B> {
+impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
     pub(in crate::conn) fn new(connection: &'a mut conn::session::Connection<DOMAIN, B>) -> Self {
         Self { connection }
     }
@@ -475,7 +475,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Emission<'a, DOMAIN, B> {
     }
 }
 
-pub(super) fn has_crypto<const DOMAIN: u8, B: ReceiveBuffer>(
+pub(super) fn has_crypto<const DOMAIN: u8, B: stream::ReceiveBuffer>(
     connection: &conn::session::Connection<DOMAIN, B>,
     epoch: conn::Epoch,
 ) -> bool {

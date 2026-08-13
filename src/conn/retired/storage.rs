@@ -1,6 +1,6 @@
 use std::marker;
 
-use super::{MAX_CHILDREN, MAX_KEYS, NONE};
+use crate::conn::retired;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Interval {
@@ -14,7 +14,7 @@ pub(super) struct Index<Tag> {
 }
 
 impl<Tag> Index<Tag> {
-    pub(super) const NONE: Self = Self::new(NONE);
+    pub(super) const NONE: Self = Self::new(retired::NONE);
 
     const fn new(raw: u32) -> Self {
         Self {
@@ -24,7 +24,7 @@ impl<Tag> Index<Tag> {
     }
 
     pub(super) const fn is_none(self) -> bool {
-        self.raw == NONE
+        self.raw == retired::NONE
     }
 
     pub(super) fn usize(self) -> usize {
@@ -41,8 +41,8 @@ impl<Tag> Clone for Index<Tag> {
 impl<Tag> Copy for Index<Tag> {}
 
 pub(super) struct Node<Tag> {
-    pub(super) keys: [Interval; MAX_KEYS],
-    pub(super) children: [Index<Tag>; MAX_CHILDREN],
+    pub(super) keys: [Interval; retired::MAX_KEYS],
+    pub(super) children: [Index<Tag>; retired::MAX_CHILDREN],
     pub(super) len: u8,
     pub(super) leaf: bool,
     pub(super) next_free: Index<Tag>,
@@ -51,8 +51,8 @@ pub(super) struct Node<Tag> {
 impl<Tag> Node<Tag> {
     fn new(leaf: bool) -> Self {
         Self {
-            keys: [Interval::default(); MAX_KEYS],
-            children: [Index::NONE; MAX_CHILDREN],
+            keys: [Interval::default(); retired::MAX_KEYS],
+            children: [Index::NONE; retired::MAX_CHILDREN],
             len: 0,
             leaf,
             next_free: Index::NONE,

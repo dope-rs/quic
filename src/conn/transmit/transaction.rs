@@ -1,21 +1,26 @@
-use std::time::Instant;
+use std::time;
 
-use crate::conn::{Connection, Epoch, State, commit, control, delivery, journal, send, streams};
-use crate::rtt::INITIAL_RTT;
-use crate::stream::ReceiveBuffer;
+use crate::conn::commit;
+use crate::conn::control;
+use crate::conn::delivery;
+use crate::conn::journal;
+use crate::conn::send;
+use crate::conn::streams;
 
-pub(super) struct Transaction<'a, const DOMAIN: u8, B: ReceiveBuffer> {
-    connection: &'a mut Connection<DOMAIN, B>,
+use crate::stream;
+
+pub(super) struct Transaction<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> {
+    connection: &'a mut crate::conn::session::Connection<DOMAIN, B>,
 }
 
-impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Transaction<'a, DOMAIN, B> {
-    pub(super) fn new(connection: &'a mut Connection<DOMAIN, B>) -> Self {
+impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> {
+    pub(super) fn new(connection: &'a mut crate::conn::session::Connection<DOMAIN, B>) -> Self {
         Self { connection }
     }
 
-    pub(super) fn datagram(&mut self, commit: &commit::Datagram, now: Instant) -> bool {
+    pub(super) fn datagram(&mut self, commit: &commit::Datagram, now: time::Instant) -> bool {
         if commit.in_flight {
-            let mut packet = commit::Packet::new(Epoch::Application, commit.pn);
+            let mut packet = commit::Packet::new(crate::conn::Epoch::Application, commit.pn);
             packet.bytes = commit.bytes;
             packet.ack_eliciting = commit.datagram;
             packet.in_flight = true;
@@ -24,10 +29,10 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Transaction<'a, DOMAIN, B> {
             return self.packet(&packet, now);
         }
 
-        self.connection.egress.spaces[Epoch::Application as usize].next_pn =
+        self.connection.egress.spaces[crate::conn::Epoch::Application as usize].next_pn =
             commit.pn.saturating_add(1);
         if commit.ack_included {
-            self.connection.received[Epoch::Application as usize].ack_pending = false;
+            self.connection.received[crate::conn::Epoch::Application as usize].ack_pending = false;
         }
         if commit.datagram {
             self.connection.egress.pending_datagrams.pop_front();
@@ -44,7 +49,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Transaction<'a, DOMAIN, B> {
         true
     }
 
-    pub(super) fn packet(&mut self, commit: &commit::Packet, now: Instant) -> bool {
+    pub(super) fn packet(&mut self, commit: &commit::Packet, now: time::Instant) -> bool {
         let epoch = commit.epoch;
         let pn = commit.pn;
         let tracked = commit.in_flight
@@ -74,14 +79,14 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Transaction<'a, DOMAIN, B> {
                 delivery.record,
                 delivery.tracked,
             ) else {
-                self.connection.egress.state = State::Closed;
+                self.connection.egress.state = crate::conn::State::Closed;
                 return false;
             };
             journal.crypto = Some(handle);
         }
         let journal_key = if tracked {
             let Some(key) = self.connection.egress.packet_journals.insert(journal) else {
-                self.connection.egress.state = State::Closed;
+                self.connection.egress.state = crate::conn::State::Closed;
                 return false;
             };
             Some(key)
@@ -98,7 +103,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Transaction<'a, DOMAIN, B> {
                     .deliveries
                     .add_carrier(handle)
                 {
-                    self.connection.egress.state = State::Closed;
+                    self.connection.egress.state = crate::conn::State::Closed;
                     return false;
                 }
                 handle
@@ -122,7 +127,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Transaction<'a, DOMAIN, B> {
                     let streams::table::Entry::Occupied(mut occupied) =
                         streams_send.entry(send::Id::new(record.stream_id))
                     else {
-                        self.connection.egress.state = State::Closed;
+                        self.connection.egress.state = crate::conn::State::Closed;
                         return false;
                     };
                     let send_handle = occupied.handle();
@@ -136,7 +141,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Transaction<'a, DOMAIN, B> {
                     let Some(handle) =
                         stream_deliveries.insert(send_handle, &mut entry.delivery_group, record)
                     else {
-                        self.connection.egress.state = State::Closed;
+                        self.connection.egress.state = crate::conn::State::Closed;
                         return false;
                     };
                     (handle, send_handle, deactivate)
@@ -147,7 +152,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Transaction<'a, DOMAIN, B> {
                 handle
             };
             let Some(key) = journal_key else {
-                self.connection.egress.state = State::Closed;
+                self.connection.egress.state = crate::conn::State::Closed;
                 return false;
             };
             if !self
@@ -156,7 +161,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Transaction<'a, DOMAIN, B> {
                 .packet_journals
                 .push_stream(key, handle)
             {
-                self.connection.egress.state = State::Closed;
+                self.connection.egress.state = crate::conn::State::Closed;
                 return false;
             }
         }
@@ -168,7 +173,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Transaction<'a, DOMAIN, B> {
                 delivery.handle,
             );
             let Some(handle) = handle else {
-                self.connection.egress.state = State::Closed;
+                self.connection.egress.state = crate::conn::State::Closed;
                 return false;
             };
             if let delivery::Control::NewConnectionId(_) = record
@@ -180,7 +185,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Transaction<'a, DOMAIN, B> {
                 self.connection.path.challenge_sent(data);
             }
             let Some(key) = journal_key else {
-                self.connection.egress.state = State::Closed;
+                self.connection.egress.state = crate::conn::State::Closed;
                 return false;
             };
             if !self
@@ -189,7 +194,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Transaction<'a, DOMAIN, B> {
                 .packet_journals
                 .push_control(key, handle)
             {
-                self.connection.egress.state = State::Closed;
+                self.connection.egress.state = crate::conn::State::Closed;
                 return false;
             }
         }
@@ -216,7 +221,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Transaction<'a, DOMAIN, B> {
                 .egress
                 .rtt
                 .smoothed_rtt
-                .unwrap_or(INITIAL_RTT);
+                .unwrap_or(crate::rtt::INITIAL_RTT);
             self.connection.egress.pacer.packet_sent(
                 bytes,
                 now,
@@ -241,7 +246,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Transaction<'a, DOMAIN, B> {
         }
         if commit.close {
             self.connection.egress.pending_close = None;
-            self.connection.egress.state = State::Closed;
+            self.connection.egress.state = crate::conn::State::Closed;
         }
         true
     }

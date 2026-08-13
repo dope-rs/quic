@@ -1,32 +1,35 @@
-use std::time::Instant;
+use std::time;
 
-use crate::conn::{Connection, Epoch, State, datagram, packet, recovery};
-use crate::stream::ReceiveBuffer;
+use crate::conn;
+use crate::conn::datagram;
+use crate::conn::packet;
+use crate::conn::recovery;
+use crate::stream;
 
-use super::Emission;
+use crate::conn::transmit;
 
 pub(super) trait Eligibility {
     fn has_initial_crypto(&self) -> bool;
     fn has_handshake_crypto(&self) -> bool;
-    fn allows_emit_for(&self, cargo: packet::Cargo, now: Instant) -> bool;
+    fn allows_emit_for(&self, cargo: packet::Cargo, now: time::Instant) -> bool;
 }
 
-impl<const DOMAIN: u8, B: ReceiveBuffer> Eligibility for Emission<'_, DOMAIN, B> {
+impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility for transmit::Emission<'_, DOMAIN, B> {
     fn has_initial_crypto(&self) -> bool {
         self.connection
             .handshake
             .crypto()
-            .has_sendable(Epoch::Initial)
+            .has_sendable(conn::Epoch::Initial)
     }
 
     fn has_handshake_crypto(&self) -> bool {
         self.connection
             .handshake
             .crypto()
-            .has_sendable(Epoch::Handshake)
+            .has_sendable(conn::Epoch::Handshake)
     }
 
-    fn allows_emit_for(&self, cargo: packet::Cargo, now: Instant) -> bool {
+    fn allows_emit_for(&self, cargo: packet::Cargo, now: time::Instant) -> bool {
         if !anti_amplification_allows(self.connection) {
             return false;
         }
@@ -47,37 +50,49 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Eligibility for Emission<'_, DOMAIN, B>
     }
 }
 
-pub(crate) fn has_pending_output<const DOMAIN: u8, B: ReceiveBuffer>(
-    connection: &Connection<DOMAIN, B>,
+pub(crate) fn has_pending_output<const DOMAIN: u8, B: stream::ReceiveBuffer>(
+    connection: &crate::conn::session::Connection<DOMAIN, B>,
 ) -> bool {
-    if connection.egress.state == State::Closed {
+    if connection.egress.state == crate::conn::State::Closed {
         return false;
     }
     if connection.egress.pto_probe_allowance != 0 {
         return true;
     }
-    if connection.handshake.write_key(Epoch::Initial).is_some()
-        && (super::has_crypto(connection, Epoch::Initial)
-            || connection.received[Epoch::Initial as usize].ack_pending)
+    if connection
+        .handshake
+        .write_key(conn::Epoch::Initial)
+        .is_some()
+        && (super::has_crypto(connection, conn::Epoch::Initial)
+            || connection.received[conn::Epoch::Initial as usize].ack_pending)
     {
         return true;
     }
     if connection.handshake.zero_rtt_write_key().is_some()
-        && connection.handshake.write_key(Epoch::Application).is_none()
+        && connection
+            .handshake
+            .write_key(conn::Epoch::Application)
+            .is_none()
         && !connection.streams.transmit.schedule.is_empty()
     {
         return true;
     }
-    if connection.handshake.write_key(Epoch::Handshake).is_some()
-        && (super::has_crypto(connection, Epoch::Handshake)
-            || connection.received[Epoch::Handshake as usize].ack_pending)
+    if connection
+        .handshake
+        .write_key(conn::Epoch::Handshake)
+        .is_some()
+        && (super::has_crypto(connection, conn::Epoch::Handshake)
+            || connection.received[conn::Epoch::Handshake as usize].ack_pending)
     {
         return true;
     }
-    connection.handshake.write_key(Epoch::Application).is_some()
+    connection
+        .handshake
+        .write_key(conn::Epoch::Application)
+        .is_some()
         && (connection.egress.pending_close.is_some()
             || connection.control.overflowed()
-            || connection.received[Epoch::Application as usize].ack_pending
+            || connection.received[conn::Epoch::Application as usize].ack_pending
             || !connection.egress.pending_datagrams.is_empty()
             || connection.egress.derived_controls.is_pending()
             || connection.path.controls_pending()
@@ -86,14 +101,14 @@ pub(crate) fn has_pending_output<const DOMAIN: u8, B: ReceiveBuffer>(
             || connection
                 .handshake
                 .crypto()
-                .has_sendable(Epoch::Application)
+                .has_sendable(conn::Epoch::Application)
             || connection.streams.transmit.deliveries.has_retransmit()
             || !connection.streams.transmit.schedule.is_empty()
             || connection.egress.pmtud.next_probe().is_some())
 }
 
-fn has_sendable_stream<const DOMAIN: u8, B: ReceiveBuffer>(
-    connection: &Connection<DOMAIN, B>,
+fn has_sendable_stream<const DOMAIN: u8, B: stream::ReceiveBuffer>(
+    connection: &crate::conn::session::Connection<DOMAIN, B>,
 ) -> bool {
     if connection.streams.transmit.deliveries.has_retransmit() {
         return true;
@@ -137,23 +152,35 @@ fn has_sendable_stream<const DOMAIN: u8, B: ReceiveBuffer>(
         })
 }
 
-fn has_sendable_output<const DOMAIN: u8, B: ReceiveBuffer>(
-    connection: &Connection<DOMAIN, B>,
+fn has_sendable_output<const DOMAIN: u8, B: stream::ReceiveBuffer>(
+    connection: &crate::conn::session::Connection<DOMAIN, B>,
 ) -> bool {
     connection.egress.pto_probe_allowance != 0
-        || (connection.handshake.write_key(Epoch::Initial).is_some()
-            && (super::has_crypto(connection, Epoch::Initial)
-                || connection.received[Epoch::Initial as usize].ack_pending))
+        || (connection
+            .handshake
+            .write_key(conn::Epoch::Initial)
+            .is_some()
+            && (super::has_crypto(connection, conn::Epoch::Initial)
+                || connection.received[conn::Epoch::Initial as usize].ack_pending))
         || (connection.handshake.zero_rtt_write_key().is_some()
-            && connection.handshake.write_key(Epoch::Application).is_none()
+            && connection
+                .handshake
+                .write_key(conn::Epoch::Application)
+                .is_none()
             && has_sendable_stream(connection))
-        || (connection.handshake.write_key(Epoch::Handshake).is_some()
-            && (super::has_crypto(connection, Epoch::Handshake)
-                || connection.received[Epoch::Handshake as usize].ack_pending))
-        || (connection.handshake.write_key(Epoch::Application).is_some()
+        || (connection
+            .handshake
+            .write_key(conn::Epoch::Handshake)
+            .is_some()
+            && (super::has_crypto(connection, conn::Epoch::Handshake)
+                || connection.received[conn::Epoch::Handshake as usize].ack_pending))
+        || (connection
+            .handshake
+            .write_key(conn::Epoch::Application)
+            .is_some()
             && (connection.egress.pending_close.is_some()
                 || connection.control.overflowed()
-                || connection.received[Epoch::Application as usize].ack_pending
+                || connection.received[conn::Epoch::Application as usize].ack_pending
                 || !connection.egress.pending_datagrams.is_empty()
                 || connection
                     .egress
@@ -168,15 +195,15 @@ fn has_sendable_output<const DOMAIN: u8, B: ReceiveBuffer>(
                 || connection
                     .handshake
                     .crypto()
-                    .has_sendable(Epoch::Application)
+                    .has_sendable(conn::Epoch::Application)
                 || has_sendable_stream(connection)
                 || connection.egress.pmtud.next_probe().is_some()))
 }
 
-pub(crate) fn send_deadline<const DOMAIN: u8, B: ReceiveBuffer>(
-    connection: &Connection<DOMAIN, B>,
-    now: Instant,
-) -> Option<Instant> {
+pub(crate) fn send_deadline<const DOMAIN: u8, B: stream::ReceiveBuffer>(
+    connection: &crate::conn::session::Connection<DOMAIN, B>,
+    now: time::Instant,
+) -> Option<time::Instant> {
     if !has_pending_output(connection) {
         return None;
     }
@@ -197,14 +224,14 @@ pub(crate) fn send_deadline<const DOMAIN: u8, B: ReceiveBuffer>(
     Some(connection.egress.pacer.next_release_time().max(now))
 }
 
-pub(super) fn anti_amplification_allows<const DOMAIN: u8, B: ReceiveBuffer>(
-    connection: &Connection<DOMAIN, B>,
+pub(super) fn anti_amplification_allows<const DOMAIN: u8, B: stream::ReceiveBuffer>(
+    connection: &crate::conn::session::Connection<DOMAIN, B>,
 ) -> bool {
     connection.egress.peer_address_validated || anti_amplification_remaining(connection) != 0
 }
 
-fn anti_amplification_remaining<const DOMAIN: u8, B: ReceiveBuffer>(
-    connection: &Connection<DOMAIN, B>,
+fn anti_amplification_remaining<const DOMAIN: u8, B: stream::ReceiveBuffer>(
+    connection: &crate::conn::session::Connection<DOMAIN, B>,
 ) -> u64 {
     if connection.egress.peer_address_validated {
         return u64::MAX;
@@ -216,8 +243,8 @@ fn anti_amplification_remaining<const DOMAIN: u8, B: ReceiveBuffer>(
         .saturating_sub(connection.egress.amplification_sent)
 }
 
-pub(super) fn emission_ceiling<const DOMAIN: u8, B: ReceiveBuffer>(
-    connection: &Connection<DOMAIN, B>,
+pub(super) fn emission_ceiling<const DOMAIN: u8, B: stream::ReceiveBuffer>(
+    connection: &crate::conn::session::Connection<DOMAIN, B>,
     requested: usize,
 ) -> Option<usize> {
     let remaining = usize::try_from(anti_amplification_remaining(connection)).unwrap_or(usize::MAX);

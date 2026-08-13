@@ -1,10 +1,10 @@
 use std::time;
 
-use crate::stream::ReceiveBuffer;
+use crate::stream;
 use crate::{conn, transport_params};
 
 /// A read-only view of a connection for the lifetime of its borrow.
-pub struct View<'conn, const DOMAIN: u8, B: ReceiveBuffer = Vec<u8>> {
+pub struct View<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer = Vec<u8>> {
     connection: &'conn conn::session::Connection<DOMAIN, B>,
 }
 
@@ -24,7 +24,7 @@ impl<'conn> LocalCids<'conn> {
     }
 }
 
-impl<'conn, const DOMAIN: u8, B: ReceiveBuffer> View<'conn, DOMAIN, B> {
+impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> View<'conn, DOMAIN, B> {
     pub(in crate::conn) fn new(connection: &'conn conn::session::Connection<DOMAIN, B>) -> Self {
         Self { connection }
     }

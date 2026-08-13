@@ -4,29 +4,27 @@ mod retained;
 
 pub(crate) use retained::Retained;
 
-use std::time::Instant;
+use std::time;
 
-use crate::packet::{LongType, ParsedLong, RetryRef, ShortHeader};
-use crate::packet_protection::PacketProtection;
-use crate::qkdf::{InitialSecrets, PacketKeys};
+use crate::packet;
 
-use super::{
-    Connection, Epoch, Error, MIN_INITIAL_LEN, ReceiveWorkspace, State, handshake, transmit,
-};
-use crate::stream::ReceiveBuffer;
-use frames::ProcessFrames;
-use transmit::builder::crypto::Crypto;
+use crate::conn;
+use crate::conn::handshake;
+use crate::conn::ingress::frames::ProcessFrames as _;
+use crate::conn::transmit;
+use crate::conn::transmit::builder::crypto::Crypto as _;
+use crate::stream;
 
-pub(crate) struct Ingress<'a, const DOMAIN: u8, B: ReceiveBuffer> {
-    connection: &'a mut Connection<DOMAIN, B>,
-    workspace: &'a mut ReceiveWorkspace,
+pub(crate) struct Ingress<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> {
+    connection: &'a mut crate::conn::session::Connection<DOMAIN, B>,
+    workspace: &'a mut conn::ReceiveWorkspace,
     routed_local_cid: Option<crate::conn::path::LocalCidKey>,
 }
 
-impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
+impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Ingress<'a, DOMAIN, B> {
     pub(crate) fn new(
-        connection: &'a mut Connection<DOMAIN, B>,
-        workspace: &'a mut ReceiveWorkspace,
+        connection: &'a mut crate::conn::session::Connection<DOMAIN, B>,
+        workspace: &'a mut conn::ReceiveWorkspace,
     ) -> Self {
         Self {
             connection,
@@ -36,8 +34,8 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
     }
 
     pub(crate) fn routed(
-        connection: &'a mut Connection<DOMAIN, B>,
-        workspace: &'a mut ReceiveWorkspace,
+        connection: &'a mut crate::conn::session::Connection<DOMAIN, B>,
+        workspace: &'a mut conn::ReceiveWorkspace,
         routed_local_cid: Option<crate::conn::path::LocalCidKey>,
     ) -> Self {
         Self {
@@ -47,25 +45,29 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
         }
     }
 
-    pub(crate) fn recv_client(&mut self, wire: &mut [u8], now: Instant) -> Result<(), Error> {
+    pub(crate) fn recv_client(
+        &mut self,
+        wire: &mut [u8],
+        now: time::Instant,
+    ) -> Result<(), conn::Error> {
         self.recv_wire(wire, now, &mut handshake::ClientReader)
     }
 
     pub(crate) fn recv_client_pooled(
         &mut self,
         wire: &mut [u8],
-        now: Instant,
+        now: time::Instant,
         tls: &mut handshake::ClientTls<'_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), conn::Error> {
         self.recv_wire(wire, now, &mut handshake::PooledClientReader::new(tls))
     }
 
     pub(crate) fn recv_server<G, V>(
         &mut self,
         wire: &mut [u8],
-        now: Instant,
+        now: time::Instant,
         server: &mut shin::server::QuicConnection<handshake::Clock, DOMAIN, G, V>,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         G: shin::server::config::EarlyDataGuard,
         V: shin::server::config::ClientCertVerifier,
@@ -76,9 +78,9 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
     pub(crate) fn recv_server_pooled<G, V>(
         &mut self,
         wire: &mut [u8],
-        now: Instant,
+        now: time::Instant,
         server: &mut shin::server::QuicPooledConnection<'_, handshake::Clock, DOMAIN, V, G>,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         G: shin::server::config::EarlyDataGuard,
         V: shin::server::config::ClientCertVerifier,
@@ -86,11 +88,20 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
         self.recv_wire(wire, now, &mut handshake::PooledServerReader::new(server))
     }
 
-    pub(crate) fn recv_finished(&mut self, wire: &mut [u8], now: Instant) -> Result<(), Error> {
+    pub(crate) fn recv_finished(
+        &mut self,
+        wire: &mut [u8],
+        now: time::Instant,
+    ) -> Result<(), conn::Error> {
         self.recv_wire(wire, now, &mut handshake::FinishedReader)
     }
 
-    fn recv_wire<R>(&mut self, wire: &mut [u8], now: Instant, read: &mut R) -> Result<(), Error>
+    fn recv_wire<R>(
+        &mut self,
+        wire: &mut [u8],
+        now: time::Instant,
+        read: &mut R,
+    ) -> Result<(), conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
     {
@@ -106,7 +117,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
         }
         let mut rest = wire;
         while !rest.is_empty() {
-            let first = *rest.first().ok_or(Error::HeaderDecode)?;
+            let first = *rest.first().ok_or(conn::Error::HeaderDecode)?;
             if first & 0x80 == 0 {
                 if first & 0x40 == 0 {
                     break;
@@ -118,14 +129,16 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
                 self.recv_retry(rest)?;
                 break;
             }
-            let parsed = ParsedLong::parse(rest).map_err(|_| Error::HeaderDecode)?;
+            let parsed = packet::ParsedLong::parse(rest).map_err(|_| conn::Error::HeaderDecode)?;
             let kind = parsed.kind();
-            let (packet, tail) = parsed.split_first().map_err(|_| Error::HeaderDecode)?;
+            let (packet, tail) = parsed
+                .split_first()
+                .map_err(|_| conn::Error::HeaderDecode)?;
             match kind {
-                LongType::Initial => self.recv_initial(packet, now, read)?,
-                LongType::ZeroRtt => self.recv_zero_rtt(packet, now, read)?,
-                LongType::Handshake => self.recv_handshake(packet, now, read)?,
-                LongType::Retry => return Err(Error::HeaderDecode),
+                crate::packet::LongType::Initial => self.recv_initial(packet, now, read)?,
+                crate::packet::LongType::ZeroRtt => self.recv_zero_rtt(packet, now, read)?,
+                crate::packet::LongType::Handshake => self.recv_handshake(packet, now, read)?,
+                crate::packet::LongType::Retry => return Err(conn::Error::HeaderDecode),
             }
             rest = tail;
         }
@@ -134,23 +147,23 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
 
     fn recv_zero_rtt<R>(
         &mut self,
-        packet: ParsedLong<&mut [u8]>,
-        now: Instant,
+        packet: packet::ParsedLong<&mut [u8]>,
+        now: time::Instant,
         read: &mut R,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
     {
         let Some(zr) = self.connection.handshake.zero_rtt_read_key() else {
             return Ok(());
         };
-        let expected = self.connection.received[Epoch::Application as usize].expected_pn();
+        let expected = self.connection.received[conn::Epoch::Application as usize].expected_pn();
         let packet = packet
             .decrypt(zr, expected)
-            .map_err(|_| Error::PacketDecrypt)?;
+            .map_err(|_| conn::Error::PacketDecrypt)?;
         let mut source = frames::Copied::<B>::new();
         self.process_packet_body(
-            frames::PacketMeta::new(Epoch::Application, packet.packet_number(), now),
+            frames::PacketMeta::new(conn::Epoch::Application, packet.packet_number(), now),
             None,
             packet.body(),
             read,
@@ -158,20 +171,20 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
         )
     }
 
-    fn recv_retry(&mut self, wire: &[u8]) -> Result<(), Error> {
+    fn recv_retry(&mut self, wire: &[u8]) -> Result<(), conn::Error> {
         if !self.connection.is_client || self.connection.path.retry_processed() {
             return Ok(());
         }
         if self
             .connection
             .handshake
-            .read_key(Epoch::Handshake)
+            .read_key(conn::Epoch::Handshake)
             .is_some()
             || self.connection.path.peer_first_scid.is_some()
         {
             return Ok(());
         }
-        let retry = RetryRef::decode(wire).map_err(|_| Error::HeaderDecode)?;
+        let retry = crate::packet::RetryRef::decode(wire).map_err(|_| conn::Error::HeaderDecode)?;
         let original_dcid = self.connection.path.original_dcid;
         let local_cid = self.connection.path.local_cid_id();
         let Some((peer_cid, token_len)) = retry
@@ -180,7 +193,7 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
                 local_cid.as_ref_id(),
                 &mut self.connection.path.retry_token,
             )
-            .map_err(|_| Error::Tls)?
+            .map_err(|_| conn::Error::Tls)?
             .map(|verified| {
                 (
                     verified.source_connection_id().into_owned(),
@@ -205,25 +218,26 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
             .connection
             .handshake
             .crypto()
-            .bytes(Epoch::Initial)
+            .bytes(conn::Epoch::Initial)
             .len();
-        if active_ceiling < MIN_INITIAL_LEN
+        if active_ceiling < crate::conn::MIN_INITIAL_LEN
             || client_hello_len == 0
             || transmit::builder::Builder::<'_, DOMAIN, B>::crypto_data_limit(0, payload_limit) == 0
         {
-            self.connection.egress.state = State::Closed;
-            return Err(Error::PacketCeiling);
+            self.connection.egress.state = crate::conn::State::Closed;
+            return Err(conn::Error::PacketCeiling);
         }
-        let new_secrets = InitialSecrets::from_dcid(peer_cid.as_slice()).map_err(|_| Error::Tls)?;
+        let new_secrets = crate::qkdf::InitialSecrets::from_dcid(peer_cid.as_slice())
+            .map_err(|_| conn::Error::Tls)?;
         super::recovery::epochs::Epochs::new(self.connection).retry_initial();
-        let initial_write = PacketProtection::aes_128(
-            &PacketKeys::aes_128(&new_secrets.client).map_err(|_| Error::Tls)?,
+        let initial_write = crate::packet_protection::PacketProtection::aes_128(
+            &crate::qkdf::PacketKeys::aes_128(&new_secrets.client).map_err(|_| conn::Error::Tls)?,
         )
-        .map_err(|_| Error::Tls)?;
-        let initial_read = PacketProtection::aes_128(
-            &PacketKeys::aes_128(&new_secrets.server).map_err(|_| Error::Tls)?,
+        .map_err(|_| conn::Error::Tls)?;
+        let initial_read = crate::packet_protection::PacketProtection::aes_128(
+            &crate::qkdf::PacketKeys::aes_128(&new_secrets.server).map_err(|_| conn::Error::Tls)?,
         )
-        .map_err(|_| Error::Tls)?;
+        .map_err(|_| conn::Error::Tls)?;
         self.connection
             .handshake
             .replace_initial_keys(initial_read, initial_write);
@@ -242,26 +256,26 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
 
     fn recv_initial<R>(
         &mut self,
-        packet: ParsedLong<&mut [u8]>,
-        now: Instant,
+        packet: packet::ParsedLong<&mut [u8]>,
+        now: time::Instant,
         read: &mut R,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
     {
-        let Some(initial_r) = self.connection.handshake.read_key(Epoch::Initial) else {
+        let Some(initial_r) = self.connection.handshake.read_key(conn::Epoch::Initial) else {
             return Ok(());
         };
         if self.connection.is_client && self.connection.path.peer_first_scid.is_none() {
             self.connection.path.set_first_peer_cid(packet.scid());
         }
-        let expected = self.connection.received[Epoch::Initial as usize].expected_pn();
+        let expected = self.connection.received[conn::Epoch::Initial as usize].expected_pn();
         let packet = packet
             .decrypt(initial_r, expected)
-            .map_err(|_| Error::PacketDecrypt)?;
+            .map_err(|_| conn::Error::PacketDecrypt)?;
         let mut source = frames::Copied::<B>::new();
         self.process_packet_body(
-            frames::PacketMeta::new(Epoch::Initial, packet.packet_number(), now),
+            frames::PacketMeta::new(conn::Epoch::Initial, packet.packet_number(), now),
             None,
             packet.body(),
             read,
@@ -271,24 +285,24 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
 
     fn recv_handshake<R>(
         &mut self,
-        packet: ParsedLong<&mut [u8]>,
-        now: Instant,
+        packet: packet::ParsedLong<&mut [u8]>,
+        now: time::Instant,
         read: &mut R,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
     {
-        let Some(hr) = self.connection.handshake.read_key(Epoch::Handshake) else {
+        let Some(hr) = self.connection.handshake.read_key(conn::Epoch::Handshake) else {
             return Ok(());
         };
-        let expected = self.connection.received[Epoch::Handshake as usize].expected_pn();
+        let expected = self.connection.received[conn::Epoch::Handshake as usize].expected_pn();
         let packet = packet
             .decrypt(hr, expected)
-            .map_err(|_| Error::PacketDecrypt)?;
+            .map_err(|_| conn::Error::PacketDecrypt)?;
         self.connection.egress.peer_address_validated = true;
         let mut source = frames::Copied::<B>::new();
         self.process_packet_body(
-            frames::PacketMeta::new(Epoch::Handshake, packet.packet_number(), now),
+            frames::PacketMeta::new(conn::Epoch::Handshake, packet.packet_number(), now),
             None,
             packet.body(),
             read,
@@ -296,25 +310,31 @@ impl<'a, const DOMAIN: u8, B: ReceiveBuffer> Ingress<'a, DOMAIN, B> {
         )
     }
 
-    fn recv_one_rtt<R>(&mut self, wire: &mut [u8], now: Instant, read: &mut R) -> Result<(), Error>
+    fn recv_one_rtt<R>(
+        &mut self,
+        wire: &mut [u8],
+        now: time::Instant,
+        read: &mut R,
+    ) -> Result<(), conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
     {
-        let Some(ar) = self.connection.handshake.read_key(Epoch::Application) else {
+        let Some(ar) = self.connection.handshake.read_key(conn::Epoch::Application) else {
             return Ok(());
         };
-        let pn_offset = ShortHeader::pn_offset_for(self.connection.path.local_cid().len());
-        let expected = self.connection.received[Epoch::Application as usize].expected_pn();
+        let pn_offset =
+            crate::packet::ShortHeader::pn_offset_for(self.connection.path.local_cid().len());
+        let expected = self.connection.received[conn::Epoch::Application as usize].expected_pn();
         let (pn, body) = ar
             .decrypt_short_in_place(wire, pn_offset, expected)
-            .map_err(|_| Error::PacketDecrypt)?;
+            .map_err(|_| conn::Error::PacketDecrypt)?;
         let mut source = frames::Copied::<B>::new();
         let packet_cid = frames::PacketCid {
             routed: self.routed_local_cid,
             bytes: &wire[1..pn_offset],
         };
         self.process_packet_body(
-            frames::PacketMeta::new(Epoch::Application, pn, now),
+            frames::PacketMeta::new(conn::Epoch::Application, pn, now),
             Some(packet_cid),
             &wire[body],
             read,

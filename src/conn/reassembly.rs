@@ -1,9 +1,9 @@
-use super::Error;
-use crate::range_buffer::MAX_RANGES;
+use crate::conn;
+use crate::range_buffer;
 
 const MAX_CRYPTO_BUFFERED: usize = 64 * 1024;
 const SPAN_BYTES: usize = size_of::<u64>();
-const WORKSPACE_BYTES: usize = MAX_CRYPTO_BUFFERED + MAX_RANGES * SPAN_BYTES;
+const WORKSPACE_BYTES: usize = MAX_CRYPTO_BUFFERED + range_buffer::MAX_RANGES * SPAN_BYTES;
 
 #[derive(Clone, Copy)]
 struct Span {
@@ -29,26 +29,30 @@ impl Crypto {
     pub(super) fn prepare<'a>(
         &mut self,
         frames: impl IntoIterator<Item = (u64, &'a [u8])>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), conn::Error> {
         if self.fragmented.is_some() {
             return Ok(());
         }
         let mut next = self.next;
         for (offset, data) in frames {
             let end = offset
-                .checked_add(u64::try_from(data.len()).map_err(|_| Error::CryptoBufferExceeded)?)
-                .ok_or(Error::CryptoBufferExceeded)?;
+                .checked_add(
+                    u64::try_from(data.len()).map_err(|_| conn::Error::CryptoBufferExceeded)?,
+                )
+                .ok_or(conn::Error::CryptoBufferExceeded)?;
             if data.is_empty() || end <= next {
                 continue;
             }
             let skip = usize::try_from(next.saturating_sub(offset))
-                .map_err(|_| Error::CryptoBufferExceeded)?;
+                .map_err(|_| conn::Error::CryptoBufferExceeded)?;
             let offset = offset.max(next);
-            let input = data.get(skip..).ok_or(Error::CryptoBufferExceeded)?;
+            let input = data.get(skip..).ok_or(conn::Error::CryptoBufferExceeded)?;
             let consumed = Self::complete_prefix(next, offset, input)?;
             next = next
-                .checked_add(u64::try_from(consumed).map_err(|_| Error::CryptoBufferExceeded)?)
-                .ok_or(Error::CryptoBufferExceeded)?;
+                .checked_add(
+                    u64::try_from(consumed).map_err(|_| conn::Error::CryptoBufferExceeded)?,
+                )
+                .ok_or(conn::Error::CryptoBufferExceeded)?;
             if consumed != input.len() {
                 self.fragmented = Some(Fragmented::new(self.next)?);
                 break;
@@ -61,45 +65,48 @@ impl Crypto {
         &mut self,
         offset: u64,
         data: &[u8],
-        mut consume: impl for<'message> FnMut(&'message [u8]) -> Result<(), Error>,
-    ) -> Result<(), Error> {
+        mut consume: impl for<'message> FnMut(&'message [u8]) -> Result<(), conn::Error>,
+    ) -> Result<(), conn::Error> {
         let end = offset
-            .checked_add(u64::try_from(data.len()).map_err(|_| Error::CryptoBufferExceeded)?)
-            .ok_or(Error::CryptoBufferExceeded)?;
+            .checked_add(u64::try_from(data.len()).map_err(|_| conn::Error::CryptoBufferExceeded)?)
+            .ok_or(conn::Error::CryptoBufferExceeded)?;
         if data.is_empty() || end <= self.next {
             return Ok(());
         }
         let skip = usize::try_from(self.next.saturating_sub(offset))
-            .map_err(|_| Error::CryptoBufferExceeded)?;
+            .map_err(|_| conn::Error::CryptoBufferExceeded)?;
         let offset = offset.max(self.next);
-        let input = data.get(skip..).ok_or(Error::CryptoBufferExceeded)?;
+        let input = data.get(skip..).ok_or(conn::Error::CryptoBufferExceeded)?;
 
         if self.fragmented.as_ref().is_none_or(Fragmented::is_empty) {
             let consumed = Self::consume_borrowed(self.next, offset, input, &mut consume)?;
             self.next = self
                 .next
-                .checked_add(u64::try_from(consumed).map_err(|_| Error::CryptoBufferExceeded)?)
-                .ok_or(Error::CryptoBufferExceeded)?;
+                .checked_add(
+                    u64::try_from(consumed).map_err(|_| conn::Error::CryptoBufferExceeded)?,
+                )
+                .ok_or(conn::Error::CryptoBufferExceeded)?;
             if consumed == input.len() {
                 if let Some(fragmented) = &mut self.fragmented {
                     fragmented.reset(self.next);
                 }
                 return Ok(());
             }
-            let consumed_u64 = u64::try_from(consumed).map_err(|_| Error::CryptoBufferExceeded)?;
+            let consumed_u64 =
+                u64::try_from(consumed).map_err(|_| conn::Error::CryptoBufferExceeded)?;
             self.fragmented
                 .as_mut()
-                .ok_or(Error::CryptoBufferExceeded)?
+                .ok_or(conn::Error::CryptoBufferExceeded)?
                 .buffer(
                     offset
                         .checked_add(consumed_u64)
-                        .ok_or(Error::CryptoBufferExceeded)?,
+                        .ok_or(conn::Error::CryptoBufferExceeded)?,
                     &input[consumed..],
                 )?;
         } else {
             self.fragmented
                 .as_mut()
-                .ok_or(Error::CryptoBufferExceeded)?
+                .ok_or(conn::Error::CryptoBufferExceeded)?
                 .buffer(offset, input)?;
         }
         self.consume_buffered(&mut consume)
@@ -110,7 +117,7 @@ impl Crypto {
         self.fragmented = None;
     }
 
-    fn complete_prefix(next: u64, offset: u64, input: &[u8]) -> Result<usize, Error> {
+    fn complete_prefix(next: u64, offset: u64, input: &[u8]) -> Result<usize, conn::Error> {
         if offset != next {
             return Ok(0);
         }
@@ -122,7 +129,7 @@ impl Crypto {
             }
             consumed = consumed
                 .checked_add(total)
-                .ok_or(Error::CryptoBufferExceeded)?;
+                .ok_or(conn::Error::CryptoBufferExceeded)?;
         }
         Ok(consumed)
     }
@@ -131,39 +138,39 @@ impl Crypto {
         next: u64,
         offset: u64,
         input: &[u8],
-        consume: &mut impl for<'message> FnMut(&'message [u8]) -> Result<(), Error>,
-    ) -> Result<usize, Error> {
+        consume: &mut impl for<'message> FnMut(&'message [u8]) -> Result<(), conn::Error>,
+    ) -> Result<usize, conn::Error> {
         let consumed = Self::complete_prefix(next, offset, input)?;
         let mut start = 0;
         while start < consumed {
             let total = Self::message_len(&input[start..])?;
             let end = start
                 .checked_add(total)
-                .ok_or(Error::CryptoBufferExceeded)?;
+                .ok_or(conn::Error::CryptoBufferExceeded)?;
             consume(&input[start..end])?;
             start = end;
         }
         Ok(consumed)
     }
 
-    fn message_len(bytes: &[u8]) -> Result<usize, Error> {
+    fn message_len(bytes: &[u8]) -> Result<usize, conn::Error> {
         let total = shin::wire::handshake::encoded_message_len(bytes)
-            .map_err(|_| Error::CryptoBufferExceeded)?;
+            .map_err(|_| conn::Error::CryptoBufferExceeded)?;
         if total > MAX_CRYPTO_BUFFERED {
-            return Err(Error::CryptoBufferExceeded);
+            return Err(conn::Error::CryptoBufferExceeded);
         }
         Ok(total)
     }
 
     fn consume_buffered(
         &mut self,
-        consume: &mut impl for<'message> FnMut(&'message [u8]) -> Result<(), Error>,
-    ) -> Result<(), Error> {
+        consume: &mut impl for<'message> FnMut(&'message [u8]) -> Result<(), conn::Error>,
+    ) -> Result<(), conn::Error> {
         loop {
             let fragmented = self
                 .fragmented
                 .as_mut()
-                .ok_or(Error::CryptoBufferExceeded)?;
+                .ok_or(conn::Error::CryptoBufferExceeded)?;
             let start = fragmented.position(self.next)?;
             let Some(covered) = fragmented.first() else {
                 fragmented.reset(self.next);
@@ -175,26 +182,27 @@ impl Crypto {
             let total = Self::message_len(fragmented.bytes(start, covered.end as usize))?;
             let end = start
                 .checked_add(total)
-                .ok_or(Error::CryptoBufferExceeded)?;
+                .ok_or(conn::Error::CryptoBufferExceeded)?;
             if end > covered.end as usize {
                 return Ok(());
             }
             consume(fragmented.bytes(start, end))?;
             self.next = self
                 .next
-                .checked_add(u64::try_from(total).map_err(|_| Error::CryptoBufferExceeded)?)
-                .ok_or(Error::CryptoBufferExceeded)?;
-            fragmented.consume_prefix(u32::try_from(end).map_err(|_| Error::CryptoBufferExceeded)?);
+                .checked_add(u64::try_from(total).map_err(|_| conn::Error::CryptoBufferExceeded)?)
+                .ok_or(conn::Error::CryptoBufferExceeded)?;
+            fragmented
+                .consume_prefix(u32::try_from(end).map_err(|_| conn::Error::CryptoBufferExceeded)?);
         }
     }
 }
 
 impl Fragmented {
-    fn new(base: u64) -> Result<Self, Error> {
+    fn new(base: u64) -> Result<Self, conn::Error> {
         let mut storage = Vec::new();
         storage
             .try_reserve_exact(WORKSPACE_BYTES)
-            .map_err(|_| Error::CryptoBufferExceeded)?;
+            .map_err(|_| conn::Error::CryptoBufferExceeded)?;
         storage.resize(WORKSPACE_BYTES, 0);
         Ok(Self {
             base,
@@ -216,13 +224,13 @@ impl Fragmented {
         self.ranges == 0
     }
 
-    fn position(&self, offset: u64) -> Result<usize, Error> {
+    fn position(&self, offset: u64) -> Result<usize, conn::Error> {
         usize::try_from(
             offset
                 .checked_sub(self.base)
-                .ok_or(Error::CryptoBufferExceeded)?,
+                .ok_or(conn::Error::CryptoBufferExceeded)?,
         )
-        .map_err(|_| Error::CryptoBufferExceeded)
+        .map_err(|_| conn::Error::CryptoBufferExceeded)
     }
 
     fn bytes(&self, start: usize, end: usize) -> &[u8] {
@@ -251,7 +259,7 @@ impl Fragmented {
         (!self.is_empty()).then(|| self.span(0))
     }
 
-    fn buffer(&mut self, offset: u64, input: &[u8]) -> Result<(), Error> {
+    fn buffer(&mut self, offset: u64, input: &[u8]) -> Result<(), conn::Error> {
         if input.is_empty() {
             return Ok(());
         }
@@ -259,10 +267,10 @@ impl Fragmented {
         let end = start
             .checked_add(input.len())
             .filter(|&end| end <= MAX_CRYPTO_BUFFERED)
-            .ok_or(Error::CryptoBufferExceeded)?;
+            .ok_or(conn::Error::CryptoBufferExceeded)?;
         let inserted = Span {
-            start: u32::try_from(start).map_err(|_| Error::CryptoBufferExceeded)?,
-            end: u32::try_from(end).map_err(|_| Error::CryptoBufferExceeded)?,
+            start: u32::try_from(start).map_err(|_| conn::Error::CryptoBufferExceeded)?,
+            end: u32::try_from(end).map_err(|_| conn::Error::CryptoBufferExceeded)?,
         };
         self.copy_uncovered(inserted, input);
         self.merge(inserted)
@@ -312,7 +320,7 @@ impl Fragmented {
         self.storage[part.start as usize..part.end as usize].copy_from_slice(&input[source]);
     }
 
-    fn merge(&mut self, inserted: Span) -> Result<(), Error> {
+    fn merge(&mut self, inserted: Span) -> Result<(), conn::Error> {
         let len = self.len();
         let mut first = 0;
         while first < len && self.span(first).end < inserted.start {
@@ -327,8 +335,8 @@ impl Fragmented {
             after += 1;
         }
         if first == after {
-            if len == MAX_RANGES {
-                return Err(Error::CryptoBufferExceeded);
+            if len == range_buffer::MAX_RANGES {
+                return Err(conn::Error::CryptoBufferExceeded);
             }
             for index in (first..len).rev() {
                 self.set_span(index + 1, self.span(index));
@@ -344,7 +352,7 @@ impl Fragmented {
             for index in after..len {
                 self.set_span(index - removed, self.span(index));
             }
-            self.ranges -= u16::try_from(removed).map_err(|_| Error::CryptoBufferExceeded)?;
+            self.ranges -= u16::try_from(removed).map_err(|_| conn::Error::CryptoBufferExceeded)?;
         }
         Ok(())
     }

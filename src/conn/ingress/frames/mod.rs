@@ -1,19 +1,18 @@
-use std::time::Instant;
+use std::time;
 
-use crate::conn::receive_workspace::ParsedAckRanges;
-use crate::conn::{Epoch, Error, MAX_FRAMES_PER_PACKET, handshake};
-use crate::frame::{Frame, TYPE_PADDING};
-use crate::stream::ReceiveBuffer;
+use crate::conn;
+use crate::conn::handshake;
 
-use super::Ingress;
-use super::admitted_packet::AdmittedPacket;
+use crate::stream;
+
+use crate::conn::ingress;
 
 mod commit;
 mod plan;
 mod source;
 
 use commit::Commit as _;
-use source::Source;
+
 pub(super) use source::{Copied, Retained};
 
 #[derive(Clone, Copy)]
@@ -24,13 +23,13 @@ pub(super) struct PacketCid<'a> {
 
 #[derive(Clone, Copy)]
 pub(super) struct PacketMeta {
-    pub(super) epoch: Epoch,
+    pub(super) epoch: conn::Epoch,
     pub(super) pn: u64,
-    pub(super) now: Instant,
+    pub(super) now: time::Instant,
 }
 
 impl PacketMeta {
-    pub(super) const fn new(epoch: Epoch, pn: u64, now: Instant) -> Self {
+    pub(super) const fn new(epoch: conn::Epoch, pn: u64, now: time::Instant) -> Self {
         Self { epoch, pn, now }
     }
 }
@@ -40,7 +39,7 @@ pub(super) enum PacketDisposition {
     Drop,
 }
 
-pub(super) trait ProcessFrames<const DOMAIN: u8, B: ReceiveBuffer> {
+pub(super) trait ProcessFrames<const DOMAIN: u8, B: stream::ReceiveBuffer> {
     fn process_packet_body<R, S>(
         &mut self,
         meta: PacketMeta,
@@ -48,13 +47,15 @@ pub(super) trait ProcessFrames<const DOMAIN: u8, B: ReceiveBuffer> {
         body: &[u8],
         read: &mut R,
         source: &mut S,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
-        S: Source<B>;
+        S: source::Source<B>;
 }
 
-impl<const DOMAIN: u8, B: ReceiveBuffer> ProcessFrames<DOMAIN, B> for Ingress<'_, DOMAIN, B> {
+impl<const DOMAIN: u8, B: stream::ReceiveBuffer> ProcessFrames<DOMAIN, B>
+    for ingress::Ingress<'_, DOMAIN, B>
+{
     fn process_packet_body<R, S>(
         &mut self,
         meta: PacketMeta,
@@ -62,12 +63,16 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> ProcessFrames<DOMAIN, B> for Ingress<'_
         body: &[u8],
         read: &mut R,
         source: &mut S,
-    ) -> Result<(), Error>
+    ) -> Result<(), conn::Error>
     where
         R: handshake::Reader<DOMAIN>,
-        S: Source<B>,
+        S: source::Source<B>,
     {
-        let Some(mut packet) = AdmittedPacket::begin(self.connection, meta.epoch, meta.pn) else {
+        let Some(mut packet) = crate::conn::ingress::admitted_packet::AdmittedPacket::begin(
+            self.connection,
+            meta.epoch,
+            meta.pn,
+        ) else {
             return Ok(());
         };
         let datagram_slots = {
@@ -84,15 +89,15 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> ProcessFrames<DOMAIN, B> for Ingress<'_
         let mut parse_error = None;
         let mut plan_error = None;
         while position < body.len() {
-            if body[position] == TYPE_PADDING {
+            if body[position] == crate::frame::TYPE_PADDING {
                 position += body[position..]
                     .iter()
-                    .take_while(|&&byte| byte == TYPE_PADDING)
+                    .take_while(|&&byte| byte == crate::frame::TYPE_PADDING)
                     .count();
                 continue;
             }
-            if plan.frame_len() == MAX_FRAMES_PER_PACKET {
-                parse_error = Some(Error::FrameDecode);
+            if plan.frame_len() == crate::conn::MAX_FRAMES_PER_PACKET {
+                parse_error = Some(conn::Error::FrameDecode);
                 break;
             }
             let decoded = crate::frame::decode::Decoder::new(
@@ -103,7 +108,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> ProcessFrames<DOMAIN, B> for Ingress<'_
                 },
                 |ranges: &[u8], count| {
                     let start = ranges.as_ptr() as usize - body_start;
-                    ParsedAckRanges {
+                    crate::conn::receive_workspace::ParsedAckRanges {
                         bytes: start..start + ranges.len(),
                         count,
                     }
@@ -113,17 +118,19 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> ProcessFrames<DOMAIN, B> for Ingress<'_
             let (frame, consumed) = match decoded {
                 Ok(decoded) => decoded,
                 Err(_) => {
-                    parse_error = Some(Error::FrameDecode);
+                    parse_error = Some(conn::Error::FrameDecode);
                     break;
                 }
             };
             if consumed == 0 {
-                parse_error = Some(Error::FrameDecode);
+                parse_error = Some(conn::Error::FrameDecode);
                 break;
             }
             if !matches!(
                 &frame,
-                Frame::Ack { .. } | Frame::Padding | Frame::ConnectionClose { .. }
+                crate::frame::Frame::Ack { .. }
+                    | crate::frame::Frame::Padding
+                    | crate::frame::Frame::ConnectionClose { .. }
             ) {
                 ack_eliciting = true;
             }
@@ -140,7 +147,9 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> ProcessFrames<DOMAIN, B> for Ingress<'_
         }
 
         let result = match plan_error {
-            Some(Error::EventCapacity | Error::StreamBufferExceeded) => Ok(PacketDisposition::Drop),
+            Some(conn::Error::EventCapacity | conn::Error::StreamBufferExceeded) => {
+                Ok(PacketDisposition::Drop)
+            }
             Some(error) => Err(error),
             None => packet.process(meta, packet_cid, body, read, &mut plan, source),
         };

@@ -1,4 +1,5 @@
-use std::{marker, num::NonZeroU64};
+use std::marker;
+use std::num;
 
 const NONE: u32 = u32::MAX;
 const FREE_STREAM_ID: u64 = u64::MAX;
@@ -62,7 +63,7 @@ impl<Side> Position<Side> {
 }
 
 #[repr(transparent)]
-pub(in crate::conn) struct Handle<Side>(NonZeroU64, marker::PhantomData<fn() -> Side>);
+pub(in crate::conn) struct Handle<Side>(num::NonZeroU64, marker::PhantomData<fn() -> Side>);
 
 impl<Side> Handle<Side> {
     pub(in crate::conn) fn new(index: u32, generation: u32) -> Self {
@@ -72,18 +73,18 @@ impl<Side> Handle<Side> {
             .expect("validated stream-state index fits its handle");
         let raw = (u64::from(generation) << 32) | u64::from(encoded_index);
         Self(
-            NonZeroU64::new(raw).expect("encoded stream-state index is nonzero"),
+            num::NonZeroU64::new(raw).expect("encoded stream-state index is nonzero"),
             marker::PhantomData,
         )
     }
 
-    pub(in crate::conn) fn from_raw(raw: NonZeroU64) -> Self {
+    pub(in crate::conn) fn from_raw(raw: num::NonZeroU64) -> Self {
         debug_assert_ne!(raw.get() as u32, 0);
         debug_assert!(raw.get() >> 63 == 0);
         Self(raw, marker::PhantomData)
     }
 
-    pub(in crate::conn) const fn raw(self) -> NonZeroU64 {
+    pub(in crate::conn) const fn raw(self) -> num::NonZeroU64 {
         self.0
     }
 

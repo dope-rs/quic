@@ -1,14 +1,12 @@
-use std::num::NonZeroU64;
+use std::num;
 
-use o3::collections::fixed::array::CopyInline;
-use subtle::{Choice, ConstantTimeEq};
+use o3::collections::fixed::array;
+use subtle::ConstantTimeEq as _;
 
-use crate::packet::ConnectionId;
-use crate::secrets::StatelessResetSecret;
+use crate::packet;
 
-use super::{
-    Error, MAX_ACTIVE_CONNECTION_IDS, MAX_PATH_TOKENS, MAX_PENDING_RETIRE_CONNECTION_IDS, control,
-};
+use crate::conn;
+use crate::conn::control;
 use crate::conn::control::Write as _;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -31,12 +29,12 @@ impl StatelessResetToken {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
-pub(crate) struct LocalCidKey(NonZeroU64);
+pub(crate) struct LocalCidKey(num::NonZeroU64);
 
 impl LocalCidKey {
     fn new(slot: usize, generation: u32) -> Option<Self> {
         let slot = u32::try_from(slot).ok()?.checked_add(1)?;
-        NonZeroU64::new((u64::from(generation) << 32) | u64::from(slot)).map(Self)
+        num::NonZeroU64::new((u64::from(generation) << 32) | u64::from(slot)).map(Self)
     }
 
     pub(crate) const fn slot(self) -> usize {
@@ -50,16 +48,19 @@ impl LocalCidKey {
 
 #[derive(Clone, Copy)]
 pub(crate) enum RouteUpdate {
-    Add { key: LocalCidKey, cid: ConnectionId },
+    Add {
+        key: LocalCidKey,
+        cid: packet::ConnectionId,
+    },
     Remove(LocalCidKey),
 }
 
-pub(crate) const MAX_ROUTE_UPDATES: usize = MAX_ACTIVE_CONNECTION_IDS * 2;
-pub(crate) type RouteUpdates = CopyInline<RouteUpdate, MAX_ROUTE_UPDATES>;
+pub(crate) const MAX_ROUTE_UPDATES: usize = conn::MAX_ACTIVE_CONNECTION_IDS * 2;
+pub(crate) type RouteUpdates = array::CopyInline<RouteUpdate, MAX_ROUTE_UPDATES>;
 
 struct LocalCid {
     sequence: u64,
-    id: ConnectionId,
+    id: packet::ConnectionId,
     reset_token: [u8; 16],
     control: Option<control::OwnerKey<control::kind::NewConnectionId>>,
 }
@@ -78,8 +79,8 @@ struct LocalCidSet {
 }
 
 impl LocalCidSet {
-    fn new(initial: ConnectionId) -> Self {
-        let mut slots = Vec::with_capacity(MAX_ACTIVE_CONNECTION_IDS);
+    fn new(initial: packet::ConnectionId) -> Self {
+        let mut slots = Vec::with_capacity(conn::MAX_ACTIVE_CONNECTION_IDS);
         slots.push(LocalCidSlot {
             generation: 0,
             cid: Some(LocalCid {
@@ -121,7 +122,7 @@ impl LocalCidSet {
     fn insert(&mut self, cid: LocalCid) -> Option<LocalCidKey> {
         let index = match self.slots.iter().position(|slot| slot.cid.is_none()) {
             Some(index) => index,
-            None if self.slots.len() < MAX_ACTIVE_CONNECTION_IDS => {
+            None if self.slots.len() < conn::MAX_ACTIVE_CONNECTION_IDS => {
                 self.slots.push(LocalCidSlot {
                     generation: 0,
                     cid: None,
@@ -156,12 +157,12 @@ impl LocalCidSet {
 #[derive(Clone, Copy)]
 struct PeerCid {
     sequence: u64,
-    id: ConnectionId,
+    id: packet::ConnectionId,
     reset_token: Option<StatelessResetToken>,
 }
 
 impl PeerCid {
-    fn matches(&self, id: ConnectionId, reset_token: Option<StatelessResetToken>) -> bool {
+    fn matches(&self, id: packet::ConnectionId, reset_token: Option<StatelessResetToken>) -> bool {
         self.id == id && self.reset_token == reset_token
     }
 }
@@ -201,7 +202,7 @@ impl PathState {
     }
 
     fn add_challenge(&mut self) {
-        self.add(Self::CHALLENGE_SHIFT, MAX_PATH_TOKENS);
+        self.add(Self::CHALLENGE_SHIFT, conn::MAX_PATH_TOKENS);
     }
 
     fn materialize_challenge(&mut self) {
@@ -213,7 +214,7 @@ impl PathState {
     }
 
     fn add_response(&mut self) {
-        self.add(Self::RESPONSE_SHIFT, MAX_PATH_TOKENS);
+        self.add(Self::RESPONSE_SHIFT, conn::MAX_PATH_TOKENS);
     }
 
     fn materialize_response(&mut self) {
@@ -225,7 +226,10 @@ impl PathState {
     }
 
     fn add_retirement(&mut self) {
-        self.add(Self::RETIREMENT_SHIFT, MAX_PENDING_RETIRE_CONNECTION_IDS);
+        self.add(
+            Self::RETIREMENT_SHIFT,
+            conn::MAX_PENDING_RETIRE_CONNECTION_IDS,
+        );
     }
 
     fn materialize_retirement(&mut self) {
@@ -267,12 +271,12 @@ pub(super) struct Path {
     active_peer_cid: PeerCid,
     spare_peer_cids: Vec<PeerCid>,
     peer_retire_prior_to: u64,
-    initial_local_cid: ConnectionId,
+    initial_local_cid: packet::ConnectionId,
     local_cids: LocalCidSet,
     route_updates: Box<RouteUpdates>,
     routing_enabled: bool,
-    pub(super) original_dcid: ConnectionId,
-    pub(super) peer_first_scid: Option<ConnectionId>,
+    pub(super) original_dcid: packet::ConnectionId,
+    pub(super) peer_first_scid: Option<packet::ConnectionId>,
     pub(super) cid_prefix: Option<u8>,
     pub(super) stateless_reset_secret: Option<[u8; 32]>,
     challenges: Vec<Challenge>,
@@ -292,10 +296,10 @@ pub(super) struct Path {
 
 impl Path {
     pub(super) fn new(
-        local_cid: ConnectionId,
-        original_dcid: ConnectionId,
-        peer_cid: ConnectionId,
-        peer_first_scid: Option<ConnectionId>,
+        local_cid: packet::ConnectionId,
+        original_dcid: packet::ConnectionId,
+        peer_cid: packet::ConnectionId,
+        peer_first_scid: Option<packet::ConnectionId>,
         cid_prefix: Option<u8>,
         stateless_reset_secret: Option<[u8; 32]>,
         local_active_connection_id_limit: u64,
@@ -306,7 +310,7 @@ impl Path {
                 id: peer_cid,
                 reset_token: None,
             },
-            spare_peer_cids: Vec::with_capacity(MAX_ACTIVE_CONNECTION_IDS - 1),
+            spare_peer_cids: Vec::with_capacity(conn::MAX_ACTIVE_CONNECTION_IDS - 1),
             peer_retire_prior_to: 0,
             initial_local_cid: local_cid,
             local_cids: LocalCidSet::new(local_cid),
@@ -316,10 +320,10 @@ impl Path {
             peer_first_scid,
             cid_prefix,
             stateless_reset_secret,
-            challenges: Vec::with_capacity(MAX_PATH_TOKENS),
-            validated_tokens: Vec::with_capacity(MAX_PATH_TOKENS),
-            response_controls: Vec::with_capacity(MAX_PATH_TOKENS),
-            retirements: Vec::with_capacity(MAX_PENDING_RETIRE_CONNECTION_IDS),
+            challenges: Vec::with_capacity(conn::MAX_PATH_TOKENS),
+            validated_tokens: Vec::with_capacity(conn::MAX_PATH_TOKENS),
+            response_controls: Vec::with_capacity(conn::MAX_PATH_TOKENS),
+            retirements: Vec::with_capacity(conn::MAX_PENDING_RETIRE_CONNECTION_IDS),
             local_active_connection_id_limit,
             state: PathState::new(),
             retry_token: Vec::new(),
@@ -327,7 +331,7 @@ impl Path {
     }
 
     pub(super) fn matches_reset(&self, candidate: StatelessResetToken) -> bool {
-        let mut matched = Choice::from(0);
+        let mut matched = subtle::Choice::from(0);
         for known in self.peer_reset_tokens() {
             matched |= candidate.0[..].ct_eq(&known.0[..]);
         }
@@ -353,11 +357,11 @@ impl Path {
     }
 
     #[inline(always)]
-    pub(super) const fn local_cid_id(&self) -> ConnectionId {
+    pub(super) const fn local_cid_id(&self) -> packet::ConnectionId {
         self.initial_local_cid
     }
 
-    pub(crate) fn enable_cid_routing(&mut self) -> (LocalCidKey, ConnectionId) {
+    pub(crate) fn enable_cid_routing(&mut self) -> (LocalCidKey, packet::ConnectionId) {
         self.routing_enabled = true;
         (
             self.local_cids
@@ -399,12 +403,12 @@ impl Path {
             .map(|cid| (cid.sequence, cid.id.as_slice()))
     }
 
-    pub(super) fn set_initial_peer_cid(&mut self, connection_id: ConnectionId) {
+    pub(super) fn set_initial_peer_cid(&mut self, connection_id: packet::ConnectionId) {
         debug_assert_eq!(self.active_peer_cid.sequence, 0);
         self.active_peer_cid.id = connection_id;
     }
 
-    pub(super) fn set_first_peer_cid(&mut self, id: ConnectionId) {
+    pub(super) fn set_first_peer_cid(&mut self, id: packet::ConnectionId) {
         debug_assert_eq!(self.active_peer_cid.sequence, 0);
         self.active_peer_cid.id = id;
         self.peer_first_scid = Some(id);
@@ -431,7 +435,7 @@ impl Path {
         self.state.mark_retry_processed();
     }
 
-    fn derive_cid(&self, sequence: u64) -> ConnectionId {
+    fn derive_cid(&self, sequence: u64) -> packet::ConnectionId {
         let initial = self.initial_local_cid.as_slice();
         let mut bytes = [0; crate::packet::MAX_CONNECTION_ID_LEN];
         bytes[..initial.len()].copy_from_slice(initial);
@@ -447,7 +451,8 @@ impl Path {
         {
             bytes[0] = prefix;
         }
-        ConnectionId::new(&bytes[..initial.len()]).expect("a derived CID retains its fixed length")
+        packet::ConnectionId::new(&bytes[..initial.len()])
+            .expect("a derived CID retains its fixed length")
     }
 
     pub(super) fn accept_peer_cid(
@@ -457,12 +462,12 @@ impl Path {
         connection_id: &[u8],
         reset_token: [u8; 16],
         control: &control::Pending,
-    ) -> Result<(), Error> {
+    ) -> Result<(), conn::Error> {
         if connection_id.is_empty() || retire_prior_to > sequence {
-            return Err(Error::ProtocolViolation);
+            return Err(conn::Error::ProtocolViolation);
         }
-        let Some(connection_id) = ConnectionId::new(connection_id) else {
-            return Err(Error::ProtocolViolation);
+        let Some(connection_id) = packet::ConnectionId::new(connection_id) else {
+            return Err(conn::Error::ProtocolViolation);
         };
         let reset_token = StatelessResetToken::new(reset_token);
         let known = if self.active_peer_cid.sequence == sequence {
@@ -475,7 +480,7 @@ impl Path {
         if let Some(existing) = known
             && !existing.matches(connection_id, reset_token)
         {
-            return Err(Error::ProtocolViolation);
+            return Err(conn::Error::ProtocolViolation);
         }
         let known = known.is_some();
         let retire_prior_to = self.peer_retire_prior_to.max(retire_prior_to);
@@ -488,7 +493,7 @@ impl Path {
             index += 1;
             keep
         });
-        let mut retiring = [0; MAX_ACTIVE_CONNECTION_IDS + 1];
+        let mut retiring = [0; conn::MAX_ACTIVE_CONNECTION_IDS + 1];
         let mut retirement_count = 0;
         {
             let mut record_retirement = |sequence| {
@@ -519,10 +524,10 @@ impl Path {
         let admit = !known && sequence >= retire_prior_to;
         let final_count = retained + usize::from(admit);
         if final_count == 0
-            || final_count > MAX_ACTIVE_CONNECTION_IDS
+            || final_count > conn::MAX_ACTIVE_CONNECTION_IDS
             || final_count as u64 > self.local_active_connection_id_limit
         {
-            return Err(Error::ConnectionIdLimit);
+            return Err(conn::Error::ConnectionIdLimit);
         }
 
         let additional = retiring[..retirement_count]
@@ -534,8 +539,10 @@ impl Path {
                     .any(|(sequence, _)| sequence == *candidate)
             })
             .count();
-        if self.retirements.len().saturating_add(additional) > MAX_PENDING_RETIRE_CONNECTION_IDS {
-            return Err(Error::ConnectionIdLimit);
+        if self.retirements.len().saturating_add(additional)
+            > conn::MAX_PENDING_RETIRE_CONNECTION_IDS
+        {
+            return Err(conn::Error::ConnectionIdLimit);
         }
         self.peer_retire_prior_to = retire_prior_to;
         let mut incoming = admit.then_some(PeerCid {
@@ -565,7 +572,7 @@ impl Path {
             };
         }
         if let Some(incoming) = incoming {
-            debug_assert!(self.spare_peer_cids.len() < MAX_ACTIVE_CONNECTION_IDS - 1);
+            debug_assert!(self.spare_peer_cids.len() < conn::MAX_ACTIVE_CONNECTION_IDS - 1);
             self.spare_peer_cids.push(incoming);
         }
         for &retired in &retiring[..retirement_count] {
@@ -590,7 +597,7 @@ impl Path {
         {
             return;
         }
-        if self.challenges.len() == MAX_PATH_TOKENS {
+        if self.challenges.len() == conn::MAX_PATH_TOKENS {
             return;
         }
         self.challenges.push(Challenge {
@@ -673,7 +680,7 @@ impl Path {
             .position(|(candidate, _)| *candidate == data);
         let index = match index {
             Some(index) => index,
-            None if self.response_controls.len() == MAX_PATH_TOKENS => return,
+            None if self.response_controls.len() == conn::MAX_PATH_TOKENS => return,
             None => {
                 self.response_controls.push((data, None));
                 self.state.add_response();
@@ -702,7 +709,7 @@ impl Path {
         if self.validated_tokens.contains(&token) {
             return;
         }
-        if self.validated_tokens.len() == MAX_PATH_TOKENS {
+        if self.validated_tokens.len() == conn::MAX_PATH_TOKENS {
             self.validated_tokens.swap_remove(0);
         }
         self.validated_tokens.push(token);
@@ -716,7 +723,7 @@ impl Path {
         if self.initial_local_cid.as_slice().is_empty() || self.stateless_reset_secret.is_none() {
             return 0;
         }
-        self.local_cids.target = limit.min(MAX_ACTIVE_CONNECTION_IDS as u64) as u8;
+        self.local_cids.target = limit.min(conn::MAX_ACTIVE_CONNECTION_IDS as u64) as u8;
         let mut issued = 0;
         while self.local_cids.active < self.local_cids.target && self.issue_local_cid() {
             issued += 1;
@@ -745,7 +752,7 @@ impl Path {
         let Some(secret) = self.stateless_reset_secret else {
             return false;
         };
-        let reset_token = StatelessResetSecret(secret).token_for(id.as_slice());
+        let reset_token = crate::secrets::StatelessResetSecret(secret).token_for(id.as_slice());
         let Some(key) = self.local_cids.insert(LocalCid {
             sequence,
             id,
@@ -787,20 +794,20 @@ impl Path {
         routed: Option<LocalCidKey>,
         packet_dcid: &[u8],
         control: &mut C,
-    ) -> Result<usize, Error> {
+    ) -> Result<usize, conn::Error> {
         if self.initial_local_cid.as_slice().is_empty() || sequence > self.local_cids.largest_sent {
-            return Err(Error::ProtocolViolation);
+            return Err(conn::Error::ProtocolViolation);
         }
         let Some((key, cid)) = self.local_cids.find_sequence(sequence) else {
             return Ok(0);
         };
         if routed == Some(key) || cid.id.as_slice() == packet_dcid {
-            return Err(Error::ProtocolViolation);
+            return Err(conn::Error::ProtocolViolation);
         }
         let mut retired = self
             .local_cids
             .remove(key)
-            .ok_or(Error::ConnectionIdLimit)?;
+            .ok_or(conn::Error::ConnectionIdLimit)?;
         control.remove_control(&mut retired.control);
         self.queue_route_update(RouteUpdate::Remove(key));
         let mut issued = 0;
@@ -812,6 +819,6 @@ impl Path {
 }
 
 const _: () = assert!(std::mem::size_of::<PathState>() == 4);
-const _: () = assert!(std::mem::size_of::<ConnectionId>() == 21);
+const _: () = assert!(std::mem::size_of::<packet::ConnectionId>() == 21);
 const _: () = assert!(std::mem::size_of::<LocalCidKey>() == 8);
 const _: () = assert!(std::mem::size_of::<PeerCid>() == 48);

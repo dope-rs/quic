@@ -1,12 +1,9 @@
-use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::cell;
+use std::collections;
 use std::fmt;
-use std::rc::Rc;
+use std::rc;
 
-use crate::clock::WallClock;
-use crate::conn::server::ReplayGuard;
-use shin::server::ReplayDomain;
-use shin::server::config::EarlyDataGuard;
+use shin::server::config;
 
 const REPLAY_WINDOW_MS: u64 = 7_200_000;
 const MAX_REPLAY_CAPACITY: usize = 65_536;
@@ -32,8 +29,8 @@ impl std::error::Error for ReplayCacheError {}
 
 #[derive(Debug)]
 struct State {
-    seen: HashMap<Vec<u8>, u64>,
-    expiry: VecDeque<(u64, Vec<u8>)>,
+    seen: collections::HashMap<Vec<u8>, u64>,
+    expiry: collections::VecDeque<(u64, Vec<u8>)>,
     capacity: usize,
 }
 
@@ -42,8 +39,8 @@ struct State {
 /// ticket domain; the type remains `!Send` for thread-per-core runtimes.
 #[derive(Clone, Debug)]
 pub struct ReplayCache {
-    state: Rc<RefCell<State>>,
-    domain: ReplayDomain,
+    state: rc::Rc<cell::RefCell<State>>,
+    domain: shin::server::ReplayDomain,
 }
 
 impl ReplayCache {
@@ -59,11 +56,11 @@ impl ReplayCache {
     }
 
     fn from_capacity(capacity: usize) -> Result<Self, ReplayCacheError> {
-        let domain = ReplayDomain::random().map_err(|_| ReplayCacheError::Entropy)?;
+        let domain = shin::server::ReplayDomain::random().map_err(|_| ReplayCacheError::Entropy)?;
         Ok(Self {
-            state: Rc::new(RefCell::new(State {
-                seen: HashMap::new(),
-                expiry: VecDeque::new(),
+            state: rc::Rc::new(cell::RefCell::new(State {
+                seen: collections::HashMap::new(),
+                expiry: collections::VecDeque::new(),
                 capacity,
             })),
             domain,
@@ -100,16 +97,16 @@ impl State {
     }
 }
 
-impl ReplayGuard for ReplayCache {
-    fn replay_domain(&self) -> Option<ReplayDomain> {
+impl crate::conn::server::ReplayGuard for ReplayCache {
+    fn replay_domain(&self) -> Option<shin::server::ReplayDomain> {
         Some(self.domain.clone())
     }
 }
 
-impl EarlyDataGuard for ReplayCache {
+impl config::EarlyDataGuard for ReplayCache {
     fn register(&self, token: &[u8]) -> bool {
         self.state
             .borrow_mut()
-            .register(token, WallClock::now_millis())
+            .register(token, crate::clock::WallClock::now_millis())
     }
 }

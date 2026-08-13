@@ -1,4 +1,4 @@
-use o3::num::bounded::U64;
+use o3::num::bounded;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -11,7 +11,7 @@ impl_error!(Error {
     Self::Underflow => "truncated QUIC variable-length integer",
 });
 
-type Value = U64<0, { (1u64 << 62) - 1 }>;
+type Value = bounded::U64<0, { (1u64 << 62) - 1 }>;
 
 /// A QUIC variable-length integer with its minimal wire width cached in-band.
 #[repr(transparent)]

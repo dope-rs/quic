@@ -1,4 +1,4 @@
-use crate::conn::streams::table::Position;
+use crate::conn::streams::table;
 use crate::conn::{recv, send, stream};
 
 const NONE: u32 = u32::MAX;
@@ -81,7 +81,7 @@ impl Permit<'_> {
     pub(super) fn push_readable(
         &mut self,
         handle: recv::Handle,
-        position: &mut Position<recv::Side>,
+        position: &mut table::Position<recv::Side>,
         stream_id: u64,
     ) {
         if !position.is_none() {
@@ -113,7 +113,7 @@ impl Permit<'_> {
 
     pub(super) fn push_reset(
         &mut self,
-        readable: &mut Position<recv::Side>,
+        readable: &mut table::Position<recv::Side>,
         stream_id: u64,
         error_code: u64,
     ) {
@@ -175,7 +175,7 @@ impl Events {
         })
     }
 
-    pub(super) fn cancel<Side>(&mut self, position: &mut Position<Side>) {
+    pub(super) fn cancel<Side>(&mut self, position: &mut table::Position<Side>) {
         if !position.is_none() {
             self.remove(position.get());
             position.clear();

@@ -1,4 +1,4 @@
-use crate::stream::ReceiveBuffer;
+use crate::stream;
 use crate::{conn, errors, new_reno};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -9,11 +9,11 @@ pub enum CongestionControl {
 }
 
 /// Exclusive access to a connection's unreliable-datagram queues.
-pub struct Datagrams<'conn, const DOMAIN: u8, B: ReceiveBuffer = Vec<u8>> {
+pub struct Datagrams<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer = Vec<u8>> {
     connection: &'conn mut conn::session::Connection<DOMAIN, B>,
 }
 
-impl<'conn, const DOMAIN: u8, B: ReceiveBuffer> Datagrams<'conn, DOMAIN, B> {
+impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Datagrams<'conn, DOMAIN, B> {
     pub(in crate::conn) fn new(
         connection: &'conn mut conn::session::Connection<DOMAIN, B>,
     ) -> Self {
@@ -60,7 +60,7 @@ impl<'conn, const DOMAIN: u8, B: ReceiveBuffer> Datagrams<'conn, DOMAIN, B> {
     }
 
     pub fn recv_owned(&mut self) -> Option<Vec<u8>> {
-        self.recv().map(ReceiveBuffer::into_vec)
+        self.recv().map(stream::ReceiveBuffer::into_vec)
     }
 
     pub(crate) fn has_received(&self) -> bool {

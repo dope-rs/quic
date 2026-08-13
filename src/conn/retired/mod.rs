@@ -3,7 +3,6 @@ mod storage;
 pub(super) mod streams;
 
 use remove::Remove as _;
-use storage::{Index, Interval, Storage};
 
 // With at most 65,536 intervals, a degree-8 B-tree has at most six levels.
 // Each level searches at most 15 packed keys and every mutation touches only
@@ -23,16 +22,16 @@ pub(super) struct Full;
 /// A fixed-allocation B-tree. Node indices never escape an exclusive borrow,
 /// so reuse needs neither pointer identity nor runtime generation checks.
 struct Tree<Tag> {
-    pool: Storage<Tag>,
-    root: Index<Tag>,
+    pool: storage::Storage<Tag>,
+    root: storage::Index<Tag>,
     len: usize,
     capacity: usize,
 }
 
 struct Location<Tag> {
-    node: Index<Tag>,
+    node: storage::Index<Tag>,
     slot: usize,
-    value: Interval,
+    value: storage::Interval,
 }
 
 impl<Tag> Clone for Location<Tag> {
@@ -52,11 +51,11 @@ struct Neighbors<'tree, Tag> {
 }
 
 impl<Tag> Neighbors<'_, Tag> {
-    fn left(&self) -> Option<Interval> {
+    fn left(&self) -> Option<storage::Interval> {
         self.left.map(|location| location.value)
     }
 
-    fn right(&self) -> Option<Interval> {
+    fn right(&self) -> Option<storage::Interval> {
         self.right.map(|location| location.value)
     }
 
@@ -75,7 +74,7 @@ impl<Tag> Neighbors<'_, Tag> {
         assert!(self.tree.remove(location.value.start));
     }
 
-    fn insert(self, range: Interval) -> Result<(), Full> {
+    fn insert(self, range: storage::Interval) -> Result<(), Full> {
         self.tree.insert(range)
     }
 }
@@ -91,9 +90,9 @@ impl<Tag> Tree<Tag> {
         } else {
             1 + capacity.saturating_sub(1) / (MIN_DEGREE - 1)
         };
-        let mut pool = Storage::with_capacity(node_capacity);
+        let mut pool = storage::Storage::with_capacity(node_capacity);
         let root = if capacity == 0 {
-            Index::NONE
+            storage::Index::NONE
         } else {
             pool.allocate(true)
                 .expect("non-empty B-tree plan has a root")
@@ -111,7 +110,7 @@ impl<Tag> Tree<Tag> {
             .is_some_and(|range| range.start <= index && index < range.end)
     }
 
-    fn first(&self) -> Option<Interval> {
+    fn first(&self) -> Option<storage::Interval> {
         if self.len == 0 {
             return None;
         }
@@ -125,7 +124,7 @@ impl<Tag> Tree<Tag> {
         }
     }
 
-    fn predecessor(&self, start: u64) -> Option<Interval> {
+    fn predecessor(&self, start: u64) -> Option<storage::Interval> {
         if self.root.is_none() {
             return None;
         }
@@ -179,7 +178,7 @@ impl<Tag> Tree<Tag> {
         }
     }
 
-    fn position(&self, start: u64) -> Option<(Index<Tag>, usize)> {
+    fn position(&self, start: u64) -> Option<(storage::Index<Tag>, usize)> {
         if self.root.is_none() {
             return None;
         }
@@ -197,7 +196,7 @@ impl<Tag> Tree<Tag> {
         }
     }
 
-    fn insert(&mut self, range: Interval) -> Result<(), Full> {
+    fn insert(&mut self, range: storage::Interval) -> Result<(), Full> {
         if self.len == self.capacity || self.root.is_none() {
             return Err(Full);
         }
@@ -217,7 +216,11 @@ impl<Tag> Tree<Tag> {
         Ok(())
     }
 
-    fn insert_non_full(&mut self, index: Index<Tag>, range: Interval) -> Result<(), Full> {
+    fn insert_non_full(
+        &mut self,
+        index: storage::Index<Tag>,
+        range: storage::Interval,
+    ) -> Result<(), Full> {
         let len = self.pool.get(index).len();
         if self.pool.get(index).leaf {
             let at = self.pool.get(index).keys[..len]
@@ -242,7 +245,7 @@ impl<Tag> Tree<Tag> {
         self.insert_non_full(child, range)
     }
 
-    fn split_child(&mut self, parent: Index<Tag>, at: usize) -> Result<(), Full> {
+    fn split_child(&mut self, parent: storage::Index<Tag>, at: usize) -> Result<(), Full> {
         let child = self.pool.get(parent).children[at];
         let leaf = self.pool.get(child).leaf;
         let sibling = self.pool.allocate(leaf).ok_or(Full)?;

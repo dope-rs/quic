@@ -1,5 +1,5 @@
-use crate::stream::ReceiveBuffer;
-use crate::{conn, stream};
+use crate::conn;
+use crate::stream;
 use conn::streams::events::Events as _;
 use conn::streams::receive::Receive as _;
 use conn::streams::transmit::Transmit as _;
@@ -41,11 +41,11 @@ pub enum Event {
 }
 
 /// Immutable stream state for the lifetime of the connection borrow.
-pub struct View<'conn, const DOMAIN: u8, B: ReceiveBuffer = Vec<u8>> {
+pub struct View<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer = Vec<u8>> {
     connection: &'conn conn::session::Connection<DOMAIN, B>,
 }
 
-impl<'conn, const DOMAIN: u8, B: ReceiveBuffer> View<'conn, DOMAIN, B> {
+impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> View<'conn, DOMAIN, B> {
     pub(in crate::conn) fn new(connection: &'conn conn::session::Connection<DOMAIN, B>) -> Self {
         Self { connection }
     }
@@ -72,11 +72,11 @@ impl<'conn, const DOMAIN: u8, B: ReceiveBuffer> View<'conn, DOMAIN, B> {
 }
 
 /// Exclusive access to a connection's stream event queue.
-pub struct Events<'conn, const DOMAIN: u8, B: ReceiveBuffer = Vec<u8>> {
+pub struct Events<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer = Vec<u8>> {
     connection: &'conn mut conn::session::Connection<DOMAIN, B>,
 }
 
-impl<'conn, const DOMAIN: u8, B: ReceiveBuffer> Events<'conn, DOMAIN, B> {
+impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Events<'conn, DOMAIN, B> {
     pub(in crate::conn) fn new(
         connection: &'conn mut conn::session::Connection<DOMAIN, B>,
     ) -> Self {
@@ -89,11 +89,11 @@ impl<'conn, const DOMAIN: u8, B: ReceiveBuffer> Events<'conn, DOMAIN, B> {
 }
 
 /// Exclusive access to a connection's stream state for the lifetime of the borrow.
-pub struct Streams<'conn, const DOMAIN: u8, B: ReceiveBuffer = Vec<u8>> {
+pub struct Streams<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer = Vec<u8>> {
     connection: &'conn mut conn::session::Connection<DOMAIN, B>,
 }
 
-impl<'conn, const DOMAIN: u8, B: ReceiveBuffer> Streams<'conn, DOMAIN, B> {
+impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Streams<'conn, DOMAIN, B> {
     pub(in crate::conn) fn new(
         connection: &'conn mut conn::session::Connection<DOMAIN, B>,
     ) -> Self {

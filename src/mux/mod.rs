@@ -10,71 +10,70 @@ pub mod setup;
 use drive::OutputOps as _;
 use routing::{DeadlineOps as _, SlotOps as _};
 
-use std::marker::PhantomData;
-use std::net::SocketAddr;
-use std::num::{NonZeroU16, NonZeroU32};
-use std::ops::{Deref, DerefMut};
-use std::pin::Pin;
-use std::time::Instant;
+use std::marker;
+use std::net;
+use std::num;
+use std::ops;
+use std::pin;
+use std::time;
 
 use dope::{core::driver::schedule, manifold::datagram};
-use shin::server::{QuicConnection, Shard};
+use shin::server;
 
-use crate::conn::config::Validated;
-use crate::conn::path::StatelessResetToken;
-use crate::conn::session::Connection;
-use crate::conn::{self, Error, Handle, MAX_ACTIVE_CONNECTION_IDS};
-use crate::stream::ReceiveBuffer;
-use std::array::from_fn;
+use crate::conn;
+use crate::conn::config;
+use crate::conn::path;
+use crate::conn::session;
+use crate::stream;
 
-pub trait Handler<const DOMAIN: u8, B: ReceiveBuffer = Vec<u8>> {
+pub trait Handler<const DOMAIN: u8, B: stream::ReceiveBuffer = Vec<u8>> {
     /// Protocol state owned by one connection slot.
     type Connection;
 
     /// Creates the slot-local state before the first connection event is delivered.
     fn create_connection(
         &mut self,
-        conn: &mut Connection<DOMAIN, B>,
-        handle: Handle,
+        conn: &mut session::Connection<DOMAIN, B>,
+        handle: conn::Handle,
     ) -> Self::Connection;
     fn established(
         &mut self,
         _connection: &mut Self::Connection,
-        _conn: &mut Connection<DOMAIN, B>,
-        _handle: Handle,
+        _conn: &mut session::Connection<DOMAIN, B>,
+        _handle: conn::Handle,
     ) {
     }
     fn datagram(
         &mut self,
         _connection: &mut Self::Connection,
-        _conn: &mut Connection<DOMAIN, B>,
-        _handle: Handle,
+        _conn: &mut session::Connection<DOMAIN, B>,
+        _handle: conn::Handle,
         _data: B,
     ) {
     }
     fn stream_event(
         &mut self,
         _connection: &mut Self::Connection,
-        _conn: &mut Connection<DOMAIN, B>,
-        _handle: Handle,
+        _conn: &mut session::Connection<DOMAIN, B>,
+        _handle: conn::Handle,
         _event: conn::stream::Event,
     ) {
     }
     fn early_stream_event(
         &mut self,
         connection: &mut Self::Connection,
-        conn: &mut Connection<DOMAIN, B>,
-        handle: Handle,
+        conn: &mut session::Connection<DOMAIN, B>,
+        handle: conn::Handle,
         event: conn::stream::Event,
     ) {
         self.stream_event(connection, conn, handle, event);
     }
-    fn close(&mut self, _connection: Self::Connection, _handle: Handle) {}
-    fn packet_error(&mut self, _from: SocketAddr, _err: &Error, _len: usize) {}
+    fn close(&mut self, _connection: Self::Connection, _handle: conn::Handle) {}
+    fn packet_error(&mut self, _from: net::SocketAddr, _err: &conn::Error, _len: usize) {}
 }
 
 type ServerSession<P, const DOMAIN: u8> = Box<
-    QuicConnection<
+    server::QuicConnection<
         fn() -> u64,
         DOMAIN,
         <P as conn::server::Policy>::Guard,
@@ -96,11 +95,11 @@ enum TlsSession<'tls, P: conn::server::Policy, const DOMAIN: u8> {
     ),
 }
 
-struct Slot<'tls, C, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer> {
-    conn: Connection<DOMAIN, B>,
+struct Slot<'tls, C, P: conn::server::Policy, const DOMAIN: u8, B: stream::ReceiveBuffer> {
+    conn: session::Connection<DOMAIN, B>,
     tls: Option<TlsSession<'tls, P, DOMAIN>>,
     connection: C,
-    peer_addr: SocketAddr,
+    peer_addr: net::SocketAddr,
     notified_established: bool,
     max_packet_bytes: usize,
     first_flush: bool,
@@ -109,17 +108,17 @@ struct Slot<'tls, C, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer
 
 struct Identifiers {
     cids: [CidRecord; MAX_CIDS_PER_CONN],
-    reset_tokens: [Option<StatelessResetToken>; MAX_ACTIVE_CONNECTION_IDS],
+    reset_tokens: [Option<path::StatelessResetToken>; conn::MAX_ACTIVE_CONNECTION_IDS],
 }
 
-impl<'tls, C, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
+impl<'tls, C, P: conn::server::Policy, const DOMAIN: u8, B: stream::ReceiveBuffer>
     Slot<'tls, C, P, DOMAIN, B>
 {
     fn new(
-        conn: Connection<DOMAIN, B>,
+        conn: session::Connection<DOMAIN, B>,
         tls: Option<TlsSession<'tls, P, DOMAIN>>,
         connection: C,
-        peer_addr: SocketAddr,
+        peer_addr: net::SocketAddr,
         max_packet_bytes: usize,
     ) -> Self {
         Self {
@@ -131,14 +130,14 @@ impl<'tls, C, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
             max_packet_bytes,
             first_flush: true,
             identifiers: Identifiers {
-                cids: from_fn(|_| CidRecord::default()),
-                reset_tokens: [None; MAX_ACTIVE_CONNECTION_IDS],
+                cids: std::array::from_fn(|_| CidRecord::default()),
+                reset_tokens: [None; conn::MAX_ACTIVE_CONNECTION_IDS],
             },
         }
     }
 }
 
-struct Entry<'tls, C, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer> {
+struct Entry<'tls, C, P: conn::server::Policy, const DOMAIN: u8, B: stream::ReceiveBuffer> {
     slot: Option<Slot<'tls, C, P, DOMAIN, B>>,
     generation: u32,
     used: bool,
@@ -148,7 +147,7 @@ struct Entry<'tls, C, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffe
     reap: QueueLinks,
 }
 
-impl<'tls, C, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
+impl<'tls, C, P: conn::server::Policy, const DOMAIN: u8, B: stream::ReceiveBuffer>
     Entry<'tls, C, P, DOMAIN, B>
 {
     fn slot(&self) -> Option<&Slot<'tls, C, P, DOMAIN, B>> {
@@ -173,7 +172,7 @@ impl<'tls, C, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CidLink(NonZeroU32);
+struct CidLink(num::NonZeroU32);
 
 impl CidLink {
     fn new(index: usize, ordinal: usize) -> Option<Self> {
@@ -182,7 +181,7 @@ impl CidLink {
         if index >= MAX_CONNECTIONS as u32 || ordinal >= 16 {
             return None;
         }
-        NonZeroU32::new(((index << 4) | ordinal) + 1).map(Self)
+        num::NonZeroU32::new(((index << 4) | ordinal) + 1).map(Self)
     }
 
     fn index(self) -> usize {
@@ -208,7 +207,7 @@ const _: () = assert!(std::mem::size_of::<CidRecord>() <= 40);
 
 #[derive(Clone, Copy)]
 struct RoutedCid {
-    handle: Handle,
+    handle: conn::Handle,
     local: Option<crate::conn::path::LocalCidKey>,
 }
 
@@ -296,13 +295,13 @@ pub(crate) enum FlushRound {
 }
 
 pub enum Outgoing {
-    Plain(SocketAddr, Vec<u8>),
-    Suffix(SocketAddr, datagram::OwnedSuffix),
-    Batch(SocketAddr, Vec<u8>, NonZeroU16),
+    Plain(net::SocketAddr, Vec<u8>),
+    Suffix(net::SocketAddr, datagram::OwnedSuffix),
+    Batch(net::SocketAddr, Vec<u8>, num::NonZeroU16),
 }
 
 impl Outgoing {
-    pub fn addr(&self) -> SocketAddr {
+    pub fn addr(&self) -> net::SocketAddr {
         match *self {
             Self::Plain(a, _) | Self::Suffix(a, _) | Self::Batch(a, _, _) => a,
         }
@@ -345,15 +344,15 @@ impl Outgoing {
 }
 
 struct ServerRuntime<'tls, P: conn::server::Policy, const DOMAIN: u8> {
-    config: Validated,
+    config: config::Validated,
     shard: ServerShard<'tls, P, DOMAIN>,
-    _policy: PhantomData<fn() -> P>,
+    _policy: marker::PhantomData<fn() -> P>,
 }
 
 enum ServerShard<'tls, P: conn::server::Policy, const DOMAIN: u8> {
-    Owned(Shard<P::Guard, P::Verifier, DOMAIN>),
+    Owned(server::Shard<P::Guard, P::Verifier, DOMAIN>),
     Pooled {
-        shard: &'tls Shard<P::Guard, P::Verifier, DOMAIN>,
+        shard: &'tls server::Shard<P::Guard, P::Verifier, DOMAIN>,
         pool: &'tls shin::server::workspace::QuicPool<
             conn::handshake::Clock,
             P::Verifier,
@@ -364,17 +363,17 @@ enum ServerShard<'tls, P: conn::server::Policy, const DOMAIN: u8> {
 }
 
 impl<'tls, P: conn::server::Policy, const DOMAIN: u8> ServerRuntime<'tls, P, DOMAIN> {
-    fn new(config: Validated, shard: Shard<P::Guard, P::Verifier, DOMAIN>) -> Self {
+    fn new(config: config::Validated, shard: server::Shard<P::Guard, P::Verifier, DOMAIN>) -> Self {
         Self {
             config,
             shard: ServerShard::Owned(shard),
-            _policy: PhantomData,
+            _policy: marker::PhantomData,
         }
     }
 
     fn pooled(
-        config: Validated,
-        shard: &'tls Shard<P::Guard, P::Verifier, DOMAIN>,
+        config: config::Validated,
+        shard: &'tls server::Shard<P::Guard, P::Verifier, DOMAIN>,
         pool: &'tls shin::server::workspace::QuicPool<
             conn::handshake::Clock,
             P::Verifier,
@@ -385,11 +384,11 @@ impl<'tls, P: conn::server::Policy, const DOMAIN: u8> ServerRuntime<'tls, P, DOM
         Self {
             config,
             shard: ServerShard::Pooled { shard, pool },
-            _policy: PhantomData,
+            _policy: marker::PhantomData,
         }
     }
 
-    fn shard(&self) -> &Shard<P::Guard, P::Verifier, DOMAIN> {
+    fn shard(&self) -> &server::Shard<P::Guard, P::Verifier, DOMAIN> {
         match &self.shard {
             ServerShard::Owned(shard) => shard,
             ServerShard::Pooled { shard, .. } => shard,
@@ -402,7 +401,7 @@ pub struct Router<
     H: Handler<DOMAIN, B>,
     P: conn::server::Policy = conn::server::Standard,
     const DOMAIN: u8 = 0,
-    B: ReceiveBuffer = Vec<u8>,
+    B: stream::ReceiveBuffer = Vec<u8>,
 > {
     registry: routing::registry::Registry<'tls, H::Connection, P, DOMAIN, B>,
     outgoing: output::Storage,
@@ -419,8 +418,13 @@ pub type Mux<H, P = conn::server::Standard, const DOMAIN: u8 = 0, B = Vec<u8>> =
 pub type PooledRouter<'tls, H, P = conn::server::Standard, const DOMAIN: u8 = 0, B = Vec<u8>> =
     Router<'tls, H, P, DOMAIN, B>;
 
-impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    Router<'tls, H, P, DOMAIN, B>
+impl<
+    'tls,
+    H: Handler<DOMAIN, B>,
+    P: conn::server::Policy,
+    const DOMAIN: u8,
+    B: stream::ReceiveBuffer,
+> Router<'tls, H, P, DOMAIN, B>
 {
     pub fn configuration(&mut self) -> configuration::Control<'_, 'tls, H, P, DOMAIN, B> {
         configuration::Control::new(self)
@@ -455,7 +459,7 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
             && self.registry.indexes.reset.len() == 0
     }
 
-    pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
+    pub fn next_deadline(&self, now: time::Instant) -> Option<time::Instant> {
         if self.queues.notify.len != 0
             || self.queues.reap.len != 0
             || (self.queues.flush.len != 0 && self.has_outgoing_room())
@@ -465,7 +469,7 @@ impl<'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: 
         self.deadline_peek().map(|(_, deadline)| deadline)
     }
 
-    pub fn conn(&self, handle: Handle) -> Option<&Connection<DOMAIN, B>> {
+    pub fn conn(&self, handle: conn::Handle) -> Option<&session::Connection<DOMAIN, B>> {
         let index = self.handle_index(handle)?;
         self.registry.entries[index].slot().map(|slot| &slot.conn)
     }
@@ -487,16 +491,16 @@ pub struct ConnectionMut<
     H: Handler<DOMAIN, B>,
     P: conn::server::Policy = conn::server::Standard,
     const DOMAIN: u8 = 0,
-    B: ReceiveBuffer = Vec<u8>,
+    B: stream::ReceiveBuffer = Vec<u8>,
 > {
     mux: &'mux mut Router<'tls, H, P, DOMAIN, B>,
-    handle: Handle,
+    handle: conn::Handle,
 }
 
-impl<H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer> Deref
-    for ConnectionMut<'_, '_, H, P, DOMAIN, B>
+impl<H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: stream::ReceiveBuffer>
+    ops::Deref for ConnectionMut<'_, '_, H, P, DOMAIN, B>
 {
-    type Target = Connection<DOMAIN, B>;
+    type Target = session::Connection<DOMAIN, B>;
 
     fn deref(&self) -> &Self::Target {
         let index = self
@@ -510,8 +514,8 @@ impl<H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: Receiv
     }
 }
 
-impl<H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer> DerefMut
-    for ConnectionMut<'_, '_, H, P, DOMAIN, B>
+impl<H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: stream::ReceiveBuffer>
+    ops::DerefMut for ConnectionMut<'_, '_, H, P, DOMAIN, B>
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         let index = self
@@ -525,8 +529,8 @@ impl<H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: Receiv
     }
 }
 
-impl<H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer> Drop
-    for ConnectionMut<'_, '_, H, P, DOMAIN, B>
+impl<H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: stream::ReceiveBuffer>
+    Drop for ConnectionMut<'_, '_, H, P, DOMAIN, B>
 {
     fn drop(&mut self) {
         self.mux.finish_connection_mut(self.handle);
@@ -547,10 +551,10 @@ where
 {
     fn packet<'turn>(
         &mut self,
-        addr: SocketAddr,
+        addr: net::SocketAddr,
         packet: datagram::packet::Packet<'turn, 'd>,
-        socket: Pin<&'turn mut datagram::Socket<'d, ID>>,
-        now: Instant,
+        socket: pin::Pin<&'turn mut datagram::Socket<'d, ID>>,
+        now: time::Instant,
     ) {
         let len = packet.as_ref().len();
         let received = B::receive_packet(self, addr, packet, socket, now);

@@ -1,8 +1,8 @@
-use std::time::Duration;
+use std::time;
 
-pub(crate) const GRANULARITY: Duration = Duration::from_millis(1);
+pub(crate) const GRANULARITY: time::Duration = time::Duration::from_millis(1);
 
-pub(crate) const INITIAL_RTT: Duration = Duration::from_millis(333);
+pub(crate) const INITIAL_RTT: time::Duration = time::Duration::from_millis(333);
 
 pub(crate) const PACKET_THRESHOLD: u64 = 3;
 
@@ -11,14 +11,14 @@ pub(crate) const TIME_THRESHOLD_DENOMINATOR: u32 = 8;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct RttTracker {
-    pub(crate) latest_rtt: Option<Duration>,
-    pub(crate) min_rtt: Option<Duration>,
-    pub(crate) smoothed_rtt: Option<Duration>,
-    pub(crate) rttvar: Duration,
+    pub(crate) latest_rtt: Option<time::Duration>,
+    pub(crate) min_rtt: Option<time::Duration>,
+    pub(crate) smoothed_rtt: Option<time::Duration>,
+    pub(crate) rttvar: time::Duration,
 }
 
 impl RttTracker {
-    pub fn update(&mut self, sample: Duration, ack_delay: Duration) {
+    pub fn update(&mut self, sample: time::Duration, ack_delay: time::Duration) {
         self.latest_rtt = Some(sample);
 
         let prev_min = self.min_rtt;
@@ -51,7 +51,7 @@ impl RttTracker {
         }
     }
 
-    pub fn pto_period(&self, max_ack_delay: Duration) -> Duration {
+    pub fn pto_period(&self, max_ack_delay: time::Duration) -> time::Duration {
         let smoothed = self.smoothed_rtt.unwrap_or(INITIAL_RTT);
         let rttvar_scaled = if 4 * self.rttvar > GRANULARITY {
             4 * self.rttvar
@@ -61,7 +61,7 @@ impl RttTracker {
         smoothed + rttvar_scaled + max_ack_delay
     }
 
-    pub fn loss_delay(&self) -> Duration {
+    pub fn loss_delay(&self) -> time::Duration {
         let smoothed = self.smoothed_rtt.unwrap_or(INITIAL_RTT);
         let latest = self.latest_rtt.unwrap_or(smoothed);
         let max_rtt = if smoothed > latest { smoothed } else { latest };

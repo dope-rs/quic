@@ -1,71 +1,77 @@
-use std::net::SocketAddr;
-use std::time::Instant;
+use std::net;
+use std::time;
 
-use crate::conn::{self, Error, Handle};
-use crate::pmtud::BASE_PMTU;
-use crate::stream::{ReceiveBuffer, RecvBuffer};
-use crate::{ConnectFailure, SendFailure};
+use crate::conn;
+use crate::pmtud;
+use crate::stream;
+
 use dope::manifold::datagram;
 
 use super::drive::{DriveOps as _, QueueOps as _};
 use super::routing::reset::ResetOps as _;
 use super::routing::{AcceptOps as _, CidOps as _, DeadlineOps as _, SlotOps as _};
-use super::{ConnectionMut, Entry, Handler, QueueKind, RetryGate, Router, TlsSession};
-use crate::packet::ConnectionId;
+use crate::mux;
+use crate::packet;
 
-pub struct Io<'a, 'tls, H, P, const DOMAIN: u8, B: ReceiveBuffer = Vec<u8>>
+pub struct Io<'a, 'tls, H, P, const DOMAIN: u8, B: stream::ReceiveBuffer = Vec<u8>>
 where
-    H: Handler<DOMAIN, B>,
+    H: mux::Handler<DOMAIN, B>,
     P: conn::server::Policy,
 {
-    mux: &'a mut Router<'tls, H, P, DOMAIN, B>,
+    mux: &'a mut mux::Router<'tls, H, P, DOMAIN, B>,
 }
 
-impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    Io<'a, 'tls, H, P, DOMAIN, B>
+impl<
+    'a,
+    'tls,
+    H: mux::Handler<DOMAIN, B>,
+    P: conn::server::Policy,
+    const DOMAIN: u8,
+    B: stream::ReceiveBuffer,
+> Io<'a, 'tls, H, P, DOMAIN, B>
 {
-    pub(super) fn new(mux: &'a mut Router<'tls, H, P, DOMAIN, B>) -> Self {
+    pub(super) fn new(mux: &'a mut mux::Router<'tls, H, P, DOMAIN, B>) -> Self {
         Self { mux }
     }
 
     pub fn connect(
         &mut self,
-        peer_addr: SocketAddr,
+        peer_addr: net::SocketAddr,
         server_pubkey: [u8; 32],
         client_config: conn::config::Options,
         initial_dcid: Vec<u8>,
-        now: Instant,
-    ) -> Result<Handle, ConnectFailure> {
-        let initial_dcid =
-            ConnectionId::try_from(initial_dcid).map_err(|_| ConnectFailure::InvalidConfig)?;
+        now: time::Instant,
+    ) -> Result<conn::Handle, crate::ConnectFailure> {
+        let initial_dcid = packet::ConnectionId::try_from(initial_dcid)
+            .map_err(|_| crate::ConnectFailure::InvalidConfig)?;
         self.connect_id(peer_addr, server_pubkey, client_config, initial_dcid, now)
     }
 
     pub(crate) fn connect_id(
         &mut self,
-        peer_addr: SocketAddr,
+        peer_addr: net::SocketAddr,
         server_pubkey: [u8; 32],
         client_config: conn::config::Options,
-        initial_dcid: ConnectionId,
-        now: Instant,
-    ) -> Result<Handle, ConnectFailure> {
+        initial_dcid: packet::ConnectionId,
+        now: time::Instant,
+    ) -> Result<conn::Handle, crate::ConnectFailure> {
         self.mux.sync_dirty_connection();
         if self.mux.lifecycle.shutting_down {
-            return Err(ConnectFailure::Closed);
+            return Err(crate::ConnectFailure::Closed);
         }
         if self.mux.registry.active_conns >= self.mux.registry.max_conns {
-            return Err(ConnectFailure::Capacity);
+            return Err(crate::ConnectFailure::Capacity);
         }
         client_config.validate()?;
         let max_packet_bytes =
             super::setup::connection_ceiling(&client_config, self.mux.outgoing.bytes_capacity);
-        if max_packet_bytes < BASE_PMTU as usize {
-            return Err(ConnectFailure::InvalidConfig);
+        if max_packet_bytes < pmtud::BASE_PMTU as usize {
+            return Err(crate::ConnectFailure::InvalidConfig);
         }
         let local_cid = self
             .mux
             .gen_cid(client_config.cid_prefix)
-            .ok_or(ConnectFailure::Capacity)?;
+            .ok_or(crate::ConnectFailure::Capacity)?;
         let conn = conn::setup::Client::<DOMAIN>::connect_buffer::<B>(
             initial_dcid,
             local_cid,
@@ -75,19 +81,19 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
         let handle = self
             .mux
             .insert_connection(conn, None, peer_addr, max_packet_bytes)
-            .ok_or(ConnectFailure::Capacity)?;
+            .ok_or(crate::ConnectFailure::Capacity)?;
         let index = self
             .mux
             .handle_index(handle)
-            .ok_or(ConnectFailure::Capacity)?;
+            .ok_or(crate::ConnectFailure::Capacity)?;
         let (key, local_cid) = self.mux.registry.entries[index]
             .slot_mut()
-            .ok_or(ConnectFailure::Capacity)?
+            .ok_or(crate::ConnectFailure::Capacity)?
             .conn
             .enable_cid_routing();
         if !self.mux.register_local_cid(handle, key, local_cid) {
             self.mux.remove_slot(handle);
-            return Err(ConnectFailure::Capacity);
+            return Err(crate::ConnectFailure::Capacity);
         }
         self.mux.schedule_flush(handle);
         self.mux.refresh_deadline(handle, now);
@@ -98,42 +104,42 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
     /// resulting slot cannot outlive `pool` through the Mux's `'tls` lifetime.
     pub fn connect_pooled(
         &mut self,
-        peer_addr: SocketAddr,
+        peer_addr: net::SocketAddr,
         pool: &'tls conn::tls::ClientPool,
         client_config: conn::config::Options,
         initial_dcid: Vec<u8>,
-        now: Instant,
-    ) -> Result<Handle, ConnectFailure> {
-        let initial_dcid =
-            ConnectionId::try_from(initial_dcid).map_err(|_| ConnectFailure::InvalidConfig)?;
+        now: time::Instant,
+    ) -> Result<conn::Handle, crate::ConnectFailure> {
+        let initial_dcid = packet::ConnectionId::try_from(initial_dcid)
+            .map_err(|_| crate::ConnectFailure::InvalidConfig)?;
         self.connect_pooled_id(peer_addr, pool, client_config, initial_dcid, now)
     }
 
     pub(crate) fn connect_pooled_id(
         &mut self,
-        peer_addr: SocketAddr,
+        peer_addr: net::SocketAddr,
         pool: &'tls conn::tls::ClientPool,
         client_config: conn::config::Options,
-        initial_dcid: ConnectionId,
-        now: Instant,
-    ) -> Result<Handle, ConnectFailure> {
+        initial_dcid: packet::ConnectionId,
+        now: time::Instant,
+    ) -> Result<conn::Handle, crate::ConnectFailure> {
         self.mux.sync_dirty_connection();
         if self.mux.lifecycle.shutting_down {
-            return Err(ConnectFailure::Closed);
+            return Err(crate::ConnectFailure::Closed);
         }
         if self.mux.registry.active_conns >= self.mux.registry.max_conns {
-            return Err(ConnectFailure::Capacity);
+            return Err(crate::ConnectFailure::Capacity);
         }
         client_config.validate()?;
         let max_packet_bytes =
             super::setup::connection_ceiling(&client_config, self.mux.outgoing.bytes_capacity);
-        if max_packet_bytes < BASE_PMTU as usize {
-            return Err(ConnectFailure::InvalidConfig);
+        if max_packet_bytes < pmtud::BASE_PMTU as usize {
+            return Err(crate::ConnectFailure::InvalidConfig);
         }
         let local_cid = self
             .mux
             .gen_cid(client_config.cid_prefix)
-            .ok_or(ConnectFailure::Capacity)?;
+            .ok_or(crate::ConnectFailure::Capacity)?;
         let pooled = conn::setup::Client::<DOMAIN>::connect_pooled_buffer::<B>(
             initial_dcid,
             local_cid,
@@ -145,23 +151,23 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
             .mux
             .insert_connection(
                 connection,
-                Some(TlsSession::Client(tls)),
+                Some(mux::TlsSession::Client(tls)),
                 peer_addr,
                 max_packet_bytes,
             )
-            .ok_or(ConnectFailure::Capacity)?;
+            .ok_or(crate::ConnectFailure::Capacity)?;
         let index = self
             .mux
             .handle_index(handle)
-            .ok_or(ConnectFailure::Capacity)?;
+            .ok_or(crate::ConnectFailure::Capacity)?;
         let (key, local_cid) = self.mux.registry.entries[index]
             .slot_mut()
-            .ok_or(ConnectFailure::Capacity)?
+            .ok_or(crate::ConnectFailure::Capacity)?
             .conn
             .enable_cid_routing();
         if !self.mux.register_local_cid(handle, key, local_cid) {
             self.mux.remove_slot(handle);
-            return Err(ConnectFailure::Capacity);
+            return Err(crate::ConnectFailure::Capacity);
         }
         self.mux.schedule_flush(handle);
         self.mux.refresh_deadline(handle, now);
@@ -171,7 +177,12 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
     /// Receives and decrypts one datagram in place.
     ///
     /// The contents of `data` are unspecified after this call.
-    pub fn recv(&mut self, from: SocketAddr, data: &mut [u8], now: Instant) -> Result<(), Error> {
+    pub fn recv(
+        &mut self,
+        from: net::SocketAddr,
+        data: &mut [u8],
+        now: time::Instant,
+    ) -> Result<(), conn::Error> {
         self.mux.sync_dirty_connection();
         if self.mux.lifecycle.shutting_down {
             return Ok(());
@@ -184,14 +195,14 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
                     return Ok(());
                 }
                 match self.mux.maybe_handle_retry_gating(from, data)? {
-                    RetryGate::Accept(retry_odcid) => {
+                    mux::RetryGate::Accept(retry_odcid) => {
                         let handle = self.mux.try_accept(from, data, retry_odcid)?;
                         super::RoutedCid {
                             handle,
                             local: None,
                         }
                     }
-                    RetryGate::IssuedRetry | RetryGate::Drop => return Ok(()),
+                    mux::RetryGate::IssuedRetry | mux::RetryGate::Drop => return Ok(()),
                 }
             }
             None => {
@@ -203,26 +214,29 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
             }
         };
         let handle = routed.handle;
-        let index = self.mux.handle_index(handle).ok_or(Error::HeaderDecode)?;
+        let index = self
+            .mux
+            .handle_index(handle)
+            .ok_or(conn::Error::HeaderDecode)?;
         let (received, routes) = {
             let (registry, workspace) = (&mut self.mux.registry, &mut self.mux.receive_workspace);
             let slot = registry.entries[index]
                 .slot_mut()
-                .ok_or(Error::HeaderDecode)?;
+                .ok_or(conn::Error::HeaderDecode)?;
             let received = match (slot.conn.is_client(), slot.tls.as_mut()) {
                 (true, None) => {
                     conn::ingress::Ingress::routed(&mut slot.conn, workspace, routed.local)
                         .recv_client(data, now)
                 }
-                (true, Some(TlsSession::Client(tls))) => {
+                (true, Some(mux::TlsSession::Client(tls))) => {
                     conn::ingress::Ingress::routed(&mut slot.conn, workspace, routed.local)
                         .recv_client_pooled(data, now, tls)
                 }
-                (false, Some(TlsSession::OwnedServer(tls))) => {
+                (false, Some(mux::TlsSession::OwnedServer(tls))) => {
                     conn::ingress::Ingress::routed(&mut slot.conn, workspace, routed.local)
                         .recv_server(data, now, tls)
                 }
-                (false, Some(TlsSession::Server(tls))) => {
+                (false, Some(mux::TlsSession::Server(tls))) => {
                     conn::ingress::Ingress::routed(&mut slot.conn, workspace, routed.local)
                         .recv_server_pooled(data, now, tls)
                 }
@@ -230,24 +244,22 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
                     conn::ingress::Ingress::routed(&mut slot.conn, workspace, routed.local)
                         .recv_finished(data, now)
                 }
-                _ => Err(Error::HeaderDecode),
+                _ => Err(conn::Error::HeaderDecode),
             };
-            if slot
-                .tls
-                .as_ref()
-                .is_some_and(|tls| matches!(tls, TlsSession::Server(server) if server.is_done()))
-            {
+            if slot.tls.as_ref().is_some_and(
+                |tls| matches!(tls, mux::TlsSession::Server(server) if server.is_done()),
+            ) {
                 slot.tls = None;
             }
             (received, slot.conn.take_cid_route_updates())
         };
         if !self.mux.sync_reset_tokens(handle) {
             self.mux.remove_slot(handle);
-            return Err(Error::ConnectionIdLimit);
+            return Err(conn::Error::ConnectionIdLimit);
         }
         if !self.mux.apply_cid_routes(handle, routes.as_slice()) {
             self.mux.remove_slot(handle);
-            return Err(Error::HeaderDecode);
+            return Err(conn::Error::HeaderDecode);
         }
         received?;
         self.mux.schedule_notify(handle);
@@ -256,21 +268,24 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
         Ok(())
     }
 
-    pub fn conn_mut(self, handle: Handle) -> Option<ConnectionMut<'a, 'tls, H, P, DOMAIN, B>> {
+    pub fn conn_mut(
+        self,
+        handle: conn::Handle,
+    ) -> Option<mux::ConnectionMut<'a, 'tls, H, P, DOMAIN, B>> {
         self.mux.sync_dirty_connection();
         if self.mux.lifecycle.shutting_down {
             return None;
         }
         let index = self.mux.handle_index(handle)?;
-        self.mux.queue_push_back(QueueKind::Reap, index);
+        self.mux.queue_push_back(crate::mux::QueueKind::Reap, index);
         self.mux.registry.dirty_connection = Some(handle);
-        Some(ConnectionMut {
+        Some(mux::ConnectionMut {
             mux: self.mux,
             handle,
         })
     }
 
-    pub fn flush(&mut self, handle: Handle, now: Instant) {
+    pub fn flush(&mut self, handle: conn::Handle, now: time::Instant) {
         if self.mux.lifecycle.shutting_down {
             return;
         }
@@ -280,44 +295,44 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
 
     pub fn try_send_datagram(
         &mut self,
-        handle: Handle,
+        handle: conn::Handle,
         data: Vec<u8>,
-        now: Instant,
+        now: time::Instant,
     ) -> Result<(), crate::SendFailure<Vec<u8>>> {
         if self.mux.lifecycle.shutting_down {
-            return Err(SendFailure::Closed(data));
+            return Err(crate::SendFailure::Closed(data));
         }
         let result = match self
             .mux
             .handle_index(handle)
             .and_then(|index| self.mux.registry.entries.get_mut(index))
-            .and_then(Entry::slot_mut)
+            .and_then(crate::mux::Entry::slot_mut)
         {
             Some(slot) => slot.conn.datagrams().try_send(data),
-            None => Err(SendFailure::Closed(data)),
+            None => Err(crate::SendFailure::Closed(data)),
         };
         self.mux.schedule_flush(handle);
         self.mux.refresh_deadline(handle, now);
         result
     }
 
-    pub fn close(&mut self, handle: Handle) {
+    pub fn close(&mut self, handle: conn::Handle) {
         self.mux.remove_slot(handle);
     }
 }
 
-impl<'a, 'tls, 'd, H, P, const DOMAIN: u8> Io<'a, 'tls, H, P, DOMAIN, RecvBuffer<'d>>
+impl<'a, 'tls, 'd, H, P, const DOMAIN: u8> Io<'a, 'tls, H, P, DOMAIN, stream::RecvBuffer<'d>>
 where
-    H: Handler<DOMAIN, RecvBuffer<'d>>,
+    H: mux::Handler<DOMAIN, stream::RecvBuffer<'d>>,
     P: conn::server::Policy,
 {
     pub fn recv_packet<'turn>(
         &mut self,
-        from: SocketAddr,
+        from: net::SocketAddr,
         mut packet: datagram::packet::Packet<'turn, 'd>,
         retainer: datagram::packet::Retainer<'_, 'd>,
-        now: Instant,
-    ) -> Result<(), Error> {
+        now: time::Instant,
+    ) -> Result<(), conn::Error> {
         self.mux.sync_dirty_connection();
         if self.mux.lifecycle.shutting_down {
             return Ok(());
@@ -330,14 +345,14 @@ where
                     return Ok(());
                 }
                 match self.mux.maybe_handle_retry_gating(from, packet.as_mut())? {
-                    RetryGate::Accept(retry_odcid) => {
+                    mux::RetryGate::Accept(retry_odcid) => {
                         let handle = self.mux.try_accept(from, packet.as_mut(), retry_odcid)?;
                         super::RoutedCid {
                             handle,
                             local: None,
                         }
                     }
-                    RetryGate::IssuedRetry | RetryGate::Drop => return Ok(()),
+                    mux::RetryGate::IssuedRetry | mux::RetryGate::Drop => return Ok(()),
                 }
             }
             None => {
@@ -349,26 +364,29 @@ where
             }
         };
         let handle = routed.handle;
-        let index = self.mux.handle_index(handle).ok_or(Error::HeaderDecode)?;
+        let index = self
+            .mux
+            .handle_index(handle)
+            .ok_or(conn::Error::HeaderDecode)?;
         let (received, routes) = {
             let (registry, workspace) = (&mut self.mux.registry, &mut self.mux.receive_workspace);
             let slot = registry.entries[index]
                 .slot_mut()
-                .ok_or(Error::HeaderDecode)?;
+                .ok_or(conn::Error::HeaderDecode)?;
             let received = match (slot.conn.is_client(), slot.tls.as_mut()) {
                 (true, None) => {
                     conn::ingress::Retained::routed(&mut slot.conn, workspace, routed.local)
                         .recv_client_datagram(packet, retainer, now)
                 }
-                (true, Some(TlsSession::Client(tls))) => {
+                (true, Some(mux::TlsSession::Client(tls))) => {
                     conn::ingress::Retained::routed(&mut slot.conn, workspace, routed.local)
                         .recv_client_pooled_datagram(packet, retainer, now, tls)
                 }
-                (false, Some(TlsSession::OwnedServer(tls))) => {
+                (false, Some(mux::TlsSession::OwnedServer(tls))) => {
                     conn::ingress::Retained::routed(&mut slot.conn, workspace, routed.local)
                         .recv_server_datagram(packet, retainer, now, tls)
                 }
-                (false, Some(TlsSession::Server(tls))) => {
+                (false, Some(mux::TlsSession::Server(tls))) => {
                     conn::ingress::Retained::routed(&mut slot.conn, workspace, routed.local)
                         .recv_server_pooled_datagram(packet, retainer, now, tls)
                 }
@@ -376,24 +394,22 @@ where
                     conn::ingress::Retained::routed(&mut slot.conn, workspace, routed.local)
                         .recv_finished_datagram(packet, retainer, now)
                 }
-                _ => Err(Error::HeaderDecode),
+                _ => Err(conn::Error::HeaderDecode),
             };
-            if slot
-                .tls
-                .as_ref()
-                .is_some_and(|tls| matches!(tls, TlsSession::Server(server) if server.is_done()))
-            {
+            if slot.tls.as_ref().is_some_and(
+                |tls| matches!(tls, mux::TlsSession::Server(server) if server.is_done()),
+            ) {
                 slot.tls = None;
             }
             (received, slot.conn.take_cid_route_updates())
         };
         if !self.mux.sync_reset_tokens(handle) {
             self.mux.remove_slot(handle);
-            return Err(Error::ConnectionIdLimit);
+            return Err(conn::Error::ConnectionIdLimit);
         }
         if !self.mux.apply_cid_routes(handle, routes.as_slice()) {
             self.mux.remove_slot(handle);
-            return Err(Error::HeaderDecode);
+            return Err(conn::Error::HeaderDecode);
         }
         received?;
         self.mux.schedule_notify(handle);

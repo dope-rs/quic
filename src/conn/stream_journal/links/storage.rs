@@ -1,7 +1,7 @@
-use crate::conn::delivery::{self, Handle};
+use crate::conn::delivery;
 use crate::conn::send;
-use crate::conn::stream_journal::journal::Journal;
-use crate::conn::stream_journal::{Chain, Group, GroupId, GroupNodes, Membership, NONE};
+use crate::conn::stream_journal;
+use crate::conn::stream_journal::journal;
 
 use super::groups::GroupOps as _;
 use super::nodes::NodeOps as _;
@@ -10,24 +10,24 @@ pub(in crate::conn::stream_journal) trait StorageOps {
     fn ensure_group(
         &mut self,
         send_handle: send::Handle,
-        owner: &mut Option<GroupId>,
-    ) -> Option<GroupId>;
+        owner: &mut Option<stream_journal::GroupId>,
+    ) -> Option<stream_journal::GroupId>;
     fn take_node(&mut self) -> Option<u32>;
     fn reclaim_one(&mut self) -> bool;
-    fn validate_node(&self, handle: Handle<delivery::Stream>) -> Option<u32>;
-    fn handle_at(&self, index: u32) -> Option<Handle<delivery::Stream>>;
-    fn group(&self, id: GroupId) -> Option<&Group>;
+    fn validate_node(&self, handle: delivery::Handle<delivery::Stream>) -> Option<u32>;
+    fn handle_at(&self, index: u32) -> Option<delivery::Handle<delivery::Stream>>;
+    fn group(&self, id: stream_journal::GroupId) -> Option<&stream_journal::Group>;
     fn discard_node(&mut self, index: u32, active: bool);
     fn release_node(&mut self, index: u32);
     fn release_group(&mut self, index: u32);
 }
 
-impl StorageOps for Journal {
+impl StorageOps for journal::Journal {
     fn ensure_group(
         &mut self,
         send_handle: send::Handle,
-        owner: &mut Option<GroupId>,
-    ) -> Option<GroupId> {
+        owner: &mut Option<stream_journal::GroupId>,
+    ) -> Option<stream_journal::GroupId> {
         if let Some(id) = *owner
             && self
                 .group(id)
@@ -41,20 +41,20 @@ impl StorageOps for Journal {
             None if self.reclaim_one() => self.storage.groups.take()?,
             None => return None,
         };
-        let id = GroupId::new(index, generation);
+        let id = stream_journal::GroupId::new(index, generation);
         let slot = &mut self.storage.groups[index as usize];
-        slot.value = Some(Group {
+        slot.value = Some(stream_journal::Group {
             owner: send_handle,
             active: true,
             len: 0,
-            nodes: GroupNodes {
-                all: Chain::EMPTY,
-                retry: Chain::EMPTY,
-                inflight: Chain::EMPTY,
+            nodes: crate::conn::stream_journal::GroupNodes {
+                all: crate::conn::stream_journal::Chain::EMPTY,
+                retry: crate::conn::stream_journal::Chain::EMPTY,
+                inflight: crate::conn::stream_journal::Chain::EMPTY,
             },
-            retry: Membership::DETACHED,
-            reclaim: Membership::DETACHED,
-            probe: Membership::DETACHED,
+            retry: crate::conn::stream_journal::Membership::DETACHED,
+            reclaim: crate::conn::stream_journal::Membership::DETACHED,
+            probe: crate::conn::stream_journal::Membership::DETACHED,
         });
         *owner = Some(id);
         Some(id)
@@ -70,7 +70,7 @@ impl StorageOps for Journal {
 
     fn reclaim_one(&mut self) -> bool {
         let group_index = self.queues.reclaim.head;
-        if group_index == NONE {
+        if group_index == crate::conn::stream_journal::NONE {
             return false;
         }
         let node_index = self.storage.groups[group_index as usize]
@@ -80,12 +80,12 @@ impl StorageOps for Journal {
             .nodes
             .all
             .head;
-        debug_assert_ne!(node_index, NONE);
+        debug_assert_ne!(node_index, crate::conn::stream_journal::NONE);
         self.discard_node(node_index, false);
         true
     }
 
-    fn validate_node(&self, handle: Handle<delivery::Stream>) -> Option<u32> {
+    fn validate_node(&self, handle: delivery::Handle<delivery::Stream>) -> Option<u32> {
         let index = u32::try_from(handle.index()).ok()?;
         let slot = self.storage.nodes.get(index as usize)?;
         (slot.generation == handle.generation()
@@ -93,14 +93,14 @@ impl StorageOps for Journal {
         .then_some(index)
     }
 
-    fn handle_at(&self, index: u32) -> Option<Handle<delivery::Stream>> {
-        Handle::new(
+    fn handle_at(&self, index: u32) -> Option<delivery::Handle<delivery::Stream>> {
+        delivery::Handle::new(
             index as usize,
             self.storage.nodes.get(index as usize)?.generation,
         )
     }
 
-    fn group(&self, id: GroupId) -> Option<&Group> {
+    fn group(&self, id: stream_journal::GroupId) -> Option<&stream_journal::Group> {
         let slot = self.storage.groups.get(id.index() as usize)?;
         (slot.generation == id.generation())
             .then_some(slot.value.as_ref())

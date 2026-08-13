@@ -1,28 +1,24 @@
-use std::ops::{Deref, DerefMut};
-use std::time::Instant;
+use std::ops;
+use std::time;
 
-use shin::crypto::ticket::Keys;
-use shin::server::{
-    self, PreparedShard, ReplayDomain, Shard,
-    config::{
-        ClientAuth, ClientAuthVerifier, ClientCertVerifier, EarlyDataGuard, NoClientAuth, NoGuard,
-    },
-};
+use shin::crypto::ticket;
+use shin::server;
+use shin::server::config;
 
-use super::Error;
-use crate::packet::ConnectionId;
+use crate::conn;
+use crate::packet;
 
 /// Replay protection owned by one server lane.
 ///
 /// A guard that returns a domain must share one atomic replay store with every
 /// clone that returns the same domain. This binds ticket authority to the
 /// actual replay store instead of to an individual QUIC connection.
-pub trait ReplayGuard: EarlyDataGuard {
-    fn replay_domain(&self) -> Option<ReplayDomain>;
+pub trait ReplayGuard: config::EarlyDataGuard {
+    fn replay_domain(&self) -> Option<server::ReplayDomain>;
 }
 
-impl ReplayGuard for NoGuard {
-    fn replay_domain(&self) -> Option<ReplayDomain> {
+impl ReplayGuard for config::NoGuard {
+    fn replay_domain(&self) -> Option<server::ReplayDomain> {
         None
     }
 }
@@ -30,31 +26,31 @@ impl ReplayGuard for NoGuard {
 fn build_standard_shard<const DOMAIN: u8, G: ReplayGuard>(
     config: server::config::Config,
     guard: G,
-) -> Result<Shard<G, NoClientAuth, DOMAIN>, shin::connection::Error> {
+) -> Result<server::Shard<G, config::NoClientAuth, DOMAIN>, shin::connection::Error> {
     let prepared = match guard.replay_domain() {
         Some(domain) => {
-            PreparedShard::with_early_data_guard_in_replay_domain(config, domain, guard)
+            server::PreparedShard::with_early_data_guard_in_replay_domain(config, domain, guard)
         }
-        None => PreparedShard::with_early_data_guard(config, guard),
+        None => server::PreparedShard::with_early_data_guard(config, guard),
     }?;
     Ok(prepared.bind_domain::<DOMAIN>())
 }
 
 /// Connection IDs required to construct one server-side QUIC connection.
 pub struct Ids {
-    pub(super) initial_dcid: ConnectionId,
-    pub(super) local_cid: ConnectionId,
-    pub(super) peer_cid: ConnectionId,
-    pub(super) tp_original_dcid: ConnectionId,
-    pub(super) retry_scid: Option<ConnectionId>,
+    pub(super) initial_dcid: packet::ConnectionId,
+    pub(super) local_cid: packet::ConnectionId,
+    pub(super) peer_cid: packet::ConnectionId,
+    pub(super) tp_original_dcid: packet::ConnectionId,
+    pub(super) retry_scid: Option<packet::ConnectionId>,
 }
 
 impl Ids {
     /// Creates IDs for a connection accepted directly from its first Initial.
     pub fn initial(
-        initial_dcid: ConnectionId,
-        local_cid: ConnectionId,
-        peer_cid: ConnectionId,
+        initial_dcid: packet::ConnectionId,
+        local_cid: packet::ConnectionId,
+        peer_cid: packet::ConnectionId,
     ) -> Self {
         Self {
             initial_dcid,
@@ -67,11 +63,11 @@ impl Ids {
 
     /// Creates IDs for a connection accepted after a validated Retry.
     pub fn retry(
-        initial_dcid: ConnectionId,
-        local_cid: ConnectionId,
-        peer_cid: ConnectionId,
-        original_dcid: ConnectionId,
-        retry_scid: ConnectionId,
+        initial_dcid: packet::ConnectionId,
+        local_cid: packet::ConnectionId,
+        peer_cid: packet::ConnectionId,
+        original_dcid: packet::ConnectionId,
+        retry_scid: packet::ConnectionId,
     ) -> Self {
         Self {
             initial_dcid,
@@ -86,7 +82,7 @@ impl Ids {
 mod boundary;
 
 pub trait Policy: boundary::Boundary + 'static {
-    type Guard: EarlyDataGuard + 'static;
+    type Guard: config::EarlyDataGuard + 'static;
     type Verifier: server::config::ClientCertVerifier + 'static;
 
     /// Lane-owned input consumed when constructing this concrete policy.
@@ -96,10 +92,10 @@ pub trait Policy: boundary::Boundary + 'static {
     fn build<const DOMAIN: u8>(
         config: server::config::Config,
         setup: Self::Setup,
-    ) -> Result<Shard<Self::Guard, Self::Verifier, DOMAIN>, shin::connection::Error>;
+    ) -> Result<server::Shard<Self::Guard, Self::Verifier, DOMAIN>, shin::connection::Error>;
 }
 
-pub struct Standard<G = NoGuard>(core::marker::PhantomData<fn() -> G>);
+pub struct Standard<G = config::NoGuard>(core::marker::PhantomData<fn() -> G>);
 
 impl<G> boundary::Boundary for Standard<G> {}
 
@@ -108,13 +104,13 @@ where
     G: ReplayGuard + 'static,
 {
     type Guard = G;
-    type Verifier = NoClientAuth;
+    type Verifier = config::NoClientAuth;
     type Setup = G;
 
     fn build<const DOMAIN: u8>(
         config: server::config::Config,
         guard: G,
-    ) -> Result<Shard<G, NoClientAuth, DOMAIN>, shin::connection::Error> {
+    ) -> Result<server::Shard<G, config::NoClientAuth, DOMAIN>, shin::connection::Error> {
         build_standard_shard::<DOMAIN, G>(config, guard)
     }
 }
@@ -126,30 +122,31 @@ impl<G, V> boundary::Boundary for Mutual<G, V> {}
 impl<G, V> Policy for Mutual<G, V>
 where
     G: ReplayGuard + 'static,
-    V: ClientCertVerifier + 'static,
+    V: config::ClientCertVerifier + 'static,
 {
     type Guard = G;
-    type Verifier = ClientAuthVerifier<V>;
+    type Verifier = config::ClientAuthVerifier<V>;
     type Setup = Authentication<V, G>;
 
     fn build<const DOMAIN: u8>(
         config: server::config::Config,
         authentication: Authentication<V, G>,
-    ) -> Result<Shard<G, ClientAuthVerifier<V>, DOMAIN>, shin::connection::Error> {
+    ) -> Result<server::Shard<G, config::ClientAuthVerifier<V>, DOMAIN>, shin::connection::Error>
+    {
         authentication.build_shard::<DOMAIN>(config)
     }
 }
 
-pub struct Authentication<V, G = NoGuard> {
+pub struct Authentication<V, G = config::NoGuard> {
     guard: G,
-    mode: ClientAuth,
+    mode: config::ClientAuth,
     verifier: V,
 }
 
 impl<V> Authentication<V> {
-    pub fn new(mode: ClientAuth, verifier: V) -> Self {
+    pub fn new(mode: config::ClientAuth, verifier: V) -> Self {
         Self {
-            guard: NoGuard,
+            guard: config::NoGuard,
             mode,
             verifier,
         }
@@ -157,7 +154,7 @@ impl<V> Authentication<V> {
 }
 
 impl<V, G> Authentication<V, G> {
-    pub fn with_early_data_guard(guard: G, mode: ClientAuth, verifier: V) -> Self {
+    pub fn with_early_data_guard(guard: G, mode: config::ClientAuth, verifier: V) -> Self {
         Self {
             guard,
             mode,
@@ -166,47 +163,50 @@ impl<V, G> Authentication<V, G> {
     }
 }
 
-impl<V: ClientCertVerifier, G: ReplayGuard> Authentication<V, G> {
+impl<V: config::ClientCertVerifier, G: ReplayGuard> Authentication<V, G> {
     fn build_shard<const DOMAIN: u8>(
         self,
         config: server::config::Config,
-    ) -> Result<Shard<G, ClientAuthVerifier<V>, DOMAIN>, shin::connection::Error> {
+    ) -> Result<server::Shard<G, config::ClientAuthVerifier<V>, DOMAIN>, shin::connection::Error>
+    {
         let (guard, mode, verifier) = self.into_parts();
         let prepared = match guard.replay_domain() {
-            Some(domain) => PreparedShard::with_early_data_guard_and_client_auth_in_replay_domain(
-                config, domain, guard, mode, verifier,
-            ),
-            None => {
-                PreparedShard::with_early_data_guard_and_client_auth(config, guard, mode, verifier)
+            Some(domain) => {
+                server::PreparedShard::with_early_data_guard_and_client_auth_in_replay_domain(
+                    config, domain, guard, mode, verifier,
+                )
             }
+            None => server::PreparedShard::with_early_data_guard_and_client_auth(
+                config, guard, mode, verifier,
+            ),
         }?;
         Ok(prepared.bind_domain::<DOMAIN>())
     }
 
-    fn into_parts(self) -> (G, ClientAuth, V) {
+    fn into_parts(self) -> (G, config::ClientAuth, V) {
         (self.guard, self.mode, self.verifier)
     }
 }
 
 pub struct Connection<
-    G: EarlyDataGuard = NoGuard,
-    V: ClientCertVerifier = NoClientAuth,
+    G: config::EarlyDataGuard = config::NoGuard,
+    V: config::ClientCertVerifier = config::NoClientAuth,
     const DOMAIN: u8 = 0,
 > {
-    conn: super::Connection<DOMAIN>,
+    conn: crate::conn::session::Connection<DOMAIN>,
     tls: Box<server::QuicConnection<super::handshake::Clock, DOMAIN, G, V>>,
-    shard: Shard<G, V, DOMAIN>,
+    shard: server::Shard<G, V, DOMAIN>,
 }
 
 impl<G, V, const DOMAIN: u8> Connection<G, V, DOMAIN>
 where
-    G: EarlyDataGuard,
-    V: ClientCertVerifier,
+    G: config::EarlyDataGuard,
+    V: config::ClientCertVerifier,
 {
     pub(super) fn new(
-        conn: super::Connection<DOMAIN>,
+        conn: crate::conn::session::Connection<DOMAIN>,
         tls: Box<server::QuicConnection<super::handshake::Clock, DOMAIN, G, V>>,
-        shard: Shard<G, V, DOMAIN>,
+        shard: server::Shard<G, V, DOMAIN>,
     ) -> Self {
         Self { conn, tls, shard }
     }
@@ -218,8 +218,8 @@ where
         &mut self,
         workspace: &mut super::ReceiveWorkspace,
         wire: &mut [u8],
-        now: Instant,
-    ) -> Result<(), Error> {
+        now: time::Instant,
+    ) -> Result<(), conn::Error> {
         super::ingress::Ingress::new(&mut self.conn, workspace).recv_server(
             wire,
             now,
@@ -227,27 +227,27 @@ where
         )
     }
 
-    pub fn replace_ticket_keys(&mut self, keys: Option<Keys>) {
+    pub fn replace_ticket_keys(&mut self, keys: Option<ticket::Keys>) {
         self.shard.replace_ticket_keys(keys);
     }
 }
 
-impl<G, V, const DOMAIN: u8> Deref for Connection<G, V, DOMAIN>
+impl<G, V, const DOMAIN: u8> ops::Deref for Connection<G, V, DOMAIN>
 where
-    G: EarlyDataGuard,
-    V: ClientCertVerifier,
+    G: config::EarlyDataGuard,
+    V: config::ClientCertVerifier,
 {
-    type Target = super::Connection<DOMAIN>;
+    type Target = crate::conn::session::Connection<DOMAIN>;
 
     fn deref(&self) -> &Self::Target {
         &self.conn
     }
 }
 
-impl<G, V, const DOMAIN: u8> DerefMut for Connection<G, V, DOMAIN>
+impl<G, V, const DOMAIN: u8> ops::DerefMut for Connection<G, V, DOMAIN>
 where
-    G: EarlyDataGuard,
-    V: ClientCertVerifier,
+    G: config::EarlyDataGuard,
+    V: config::ClientCertVerifier,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.conn

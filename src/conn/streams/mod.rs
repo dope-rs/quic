@@ -3,11 +3,15 @@ pub(super) mod receive;
 pub(super) mod table;
 pub(super) mod transmit;
 
-use super::{
-    STREAM_SCHEDULE_CAPACITY, control, event_queue, peer, recv, retired, send, stream_journal,
-};
-use crate::stream::ReceiveBuffer;
-use std::ops::{Deref, DerefMut};
+use crate::conn::control;
+use crate::conn::event_queue;
+use crate::conn::peer;
+use crate::conn::recv;
+use crate::conn::retired;
+use crate::conn::send;
+use crate::conn::stream_journal;
+use crate::stream;
+use std::ops;
 
 #[derive(Clone, Copy)]
 pub(super) enum Access {
@@ -26,7 +30,7 @@ pub(super) struct Setup {
     pub(super) receive_segment_capacity: usize,
 }
 
-pub(super) struct Streams<B: ReceiveBuffer> {
+pub(super) struct Streams<B: stream::ReceiveBuffer> {
     pub(super) state: State<B>,
     pub(super) events: event_queue::Events,
 }
@@ -37,7 +41,7 @@ pub(super) struct ReceiveCredits(u8);
 
 const _: () = assert!(std::mem::size_of::<ReceiveCredits>() == 1);
 
-pub(super) struct State<B: ReceiveBuffer> {
+pub(super) struct State<B: stream::ReceiveBuffer> {
     pub(super) transmit: TransmitState,
     pub(super) receive: ReceiveState<B>,
     pub(super) peer_initiated: PeerInitiated,
@@ -45,7 +49,7 @@ pub(super) struct State<B: ReceiveBuffer> {
     pub(super) receive_credits: ReceiveCredits,
 }
 
-impl<B: ReceiveBuffer> Deref for Streams<B> {
+impl<B: stream::ReceiveBuffer> ops::Deref for Streams<B> {
     type Target = State<B>;
 
     fn deref(&self) -> &Self::Target {
@@ -53,7 +57,7 @@ impl<B: ReceiveBuffer> Deref for Streams<B> {
     }
 }
 
-impl<B: ReceiveBuffer> DerefMut for Streams<B> {
+impl<B: stream::ReceiveBuffer> ops::DerefMut for Streams<B> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.state
     }
@@ -68,7 +72,7 @@ pub(super) struct TransmitState {
     pub(super) peer_total_sent: u64,
 }
 
-pub(super) struct ReceiveState<B: ReceiveBuffer> {
+pub(super) struct ReceiveState<B: stream::ReceiveBuffer> {
     pub(super) map: recv::Map<B>,
     pub(super) ranges: crate::range_buffer::Arena<B>,
     pub(super) control_schedule: recv::ControlSchedule,
@@ -95,7 +99,7 @@ pub(super) struct LocalInitiated {
     pub(super) capacity: [u64; 2],
 }
 
-impl<B: ReceiveBuffer> Streams<B> {
+impl<B: stream::ReceiveBuffer> Streams<B> {
     pub(super) fn new(setup: Setup) -> Self {
         let [bidi_capacity, uni_capacity] = setup.local_capacity;
         let send_capacity = bidi_capacity
@@ -109,7 +113,7 @@ impl<B: ReceiveBuffer> Streams<B> {
         Self {
             state: State {
                 transmit: TransmitState {
-                    scratch_pending: Vec::with_capacity(STREAM_SCHEDULE_CAPACITY),
+                    scratch_pending: Vec::with_capacity(crate::conn::STREAM_SCHEDULE_CAPACITY),
                     schedule: send::Schedule::new(),
                     deliveries: stream_journal::journal::Journal::new(
                         setup.stream_journal_capacity,

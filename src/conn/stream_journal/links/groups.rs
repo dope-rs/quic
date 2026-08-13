@@ -1,5 +1,5 @@
-use crate::conn::stream_journal::NONE;
-use crate::conn::stream_journal::journal::Journal;
+use crate::conn::stream_journal;
+use crate::conn::stream_journal::journal;
 
 pub(in crate::conn::stream_journal) trait GroupOps {
     fn link_retry_group(&mut self, index: u32);
@@ -12,7 +12,7 @@ pub(in crate::conn::stream_journal) trait GroupOps {
     fn unlink_reclaim_group(&mut self, index: u32);
 }
 
-impl GroupOps for Journal {
+impl GroupOps for journal::Journal {
     fn link_retry_group(&mut self, index: u32) {
         if self.storage.groups[index as usize]
             .value
@@ -30,10 +30,10 @@ impl GroupOps for Journal {
                 .as_mut()
                 .expect("validated group");
             group.retry.links.previous = previous;
-            group.retry.links.next = NONE;
+            group.retry.links.next = stream_journal::NONE;
             group.retry.linked = true;
         }
-        if previous == NONE {
+        if previous == stream_journal::NONE {
             self.queues.retry.head = index;
         } else {
             self.storage.groups[previous as usize]
@@ -64,10 +64,10 @@ impl GroupOps for Journal {
                 .as_mut()
                 .expect("validated group");
             group.probe.links.previous = previous;
-            group.probe.links.next = NONE;
+            group.probe.links.next = stream_journal::NONE;
             group.probe.linked = true;
         }
-        if previous == NONE {
+        if previous == stream_journal::NONE {
             self.queues.probe.chain.head = index;
         } else {
             self.storage.groups[previous as usize]
@@ -92,8 +92,8 @@ impl GroupOps for Journal {
         let next = group.probe.links.next;
         if self.queues.probe.group_cursor == index {
             self.queues.probe.group_cursor = next;
-            self.queues.probe.node_cursor = if next == NONE {
-                NONE
+            self.queues.probe.node_cursor = if next == stream_journal::NONE {
+                stream_journal::NONE
             } else {
                 self.storage.groups[next as usize]
                     .value
@@ -104,7 +104,7 @@ impl GroupOps for Journal {
                     .head
             };
         }
-        if previous == NONE {
+        if previous == stream_journal::NONE {
             self.queues.probe.chain.head = next;
         } else {
             self.storage.groups[previous as usize]
@@ -115,7 +115,7 @@ impl GroupOps for Journal {
                 .links
                 .next = next;
         }
-        if next == NONE {
+        if next == stream_journal::NONE {
             self.queues.probe.chain.tail = previous;
         } else {
             self.storage.groups[next as usize]
@@ -130,8 +130,8 @@ impl GroupOps for Journal {
             .value
             .as_mut()
             .expect("validated group");
-        group.probe.links.previous = NONE;
-        group.probe.links.next = NONE;
+        group.probe.links.previous = stream_journal::NONE;
+        group.probe.links.next = stream_journal::NONE;
         group.probe.linked = false;
     }
 
@@ -144,7 +144,7 @@ impl GroupOps for Journal {
         }
         let previous = group.retry.links.previous;
         let next = group.retry.links.next;
-        if previous == NONE {
+        if previous == stream_journal::NONE {
             self.queues.retry.head = next;
         } else {
             self.storage.groups[previous as usize]
@@ -155,7 +155,7 @@ impl GroupOps for Journal {
                 .links
                 .next = next;
         }
-        if next == NONE {
+        if next == stream_journal::NONE {
             self.queues.retry.tail = previous;
         } else {
             self.storage.groups[next as usize]
@@ -170,8 +170,8 @@ impl GroupOps for Journal {
             .value
             .as_mut()
             .expect("validated group");
-        group.retry.links.previous = NONE;
-        group.retry.links.next = NONE;
+        group.retry.links.previous = stream_journal::NONE;
+        group.retry.links.next = stream_journal::NONE;
         group.retry.linked = false;
     }
 
@@ -211,7 +211,7 @@ impl GroupOps for Journal {
             .expect("next retry node")
             .retry
             .links
-            .previous = NONE;
+            .previous = stream_journal::NONE;
         self.storage.nodes[tail as usize]
             .value
             .as_mut()
@@ -224,7 +224,7 @@ impl GroupOps for Journal {
             .as_mut()
             .expect("validated retry node");
         node.retry.links.previous = tail;
-        node.retry.links.next = NONE;
+        node.retry.links.next = stream_journal::NONE;
         self.storage.groups[group_index as usize]
             .value
             .as_mut()
@@ -245,10 +245,10 @@ impl GroupOps for Journal {
                 return;
             }
             group.reclaim.links.previous = previous;
-            group.reclaim.links.next = NONE;
+            group.reclaim.links.next = stream_journal::NONE;
             group.reclaim.linked = true;
         }
-        if previous == NONE {
+        if previous == stream_journal::NONE {
             self.queues.reclaim.head = index;
         } else {
             self.storage.groups[previous as usize]
@@ -272,7 +272,7 @@ impl GroupOps for Journal {
         }
         let previous = group.reclaim.links.previous;
         let next = group.reclaim.links.next;
-        if previous == NONE {
+        if previous == stream_journal::NONE {
             self.queues.reclaim.head = next;
         } else {
             self.storage.groups[previous as usize]
@@ -283,7 +283,7 @@ impl GroupOps for Journal {
                 .links
                 .next = next;
         }
-        if next == NONE {
+        if next == stream_journal::NONE {
             self.queues.reclaim.tail = previous;
         } else {
             self.storage.groups[next as usize]
@@ -298,8 +298,8 @@ impl GroupOps for Journal {
             .value
             .as_mut()
             .expect("validated group");
-        group.reclaim.links.previous = NONE;
-        group.reclaim.links.next = NONE;
+        group.reclaim.links.previous = stream_journal::NONE;
+        group.reclaim.links.next = stream_journal::NONE;
         group.reclaim.linked = false;
     }
 }

@@ -2,9 +2,11 @@ use std::{collections, time};
 
 use shin::{client, crypto, wire};
 
-use crate::{conn, stream::ReceiveBuffer, transport_params};
+use crate::conn;
+use crate::stream;
+use crate::transport_params;
 
-pub struct Connection<const DOMAIN: u8 = 0, B: ReceiveBuffer = Vec<u8>> {
+pub struct Connection<const DOMAIN: u8 = 0, B: stream::ReceiveBuffer = Vec<u8>> {
     pub(in crate::conn) received: [crate::pn_space::Receive; 3],
     pub(in crate::conn) egress: conn::egress::Egress,
     pub(in crate::conn) control: conn::control::Pending,
@@ -24,7 +26,7 @@ pub struct Connection<const DOMAIN: u8 = 0, B: ReceiveBuffer = Vec<u8>> {
     pub(in crate::conn) recv_crypto: [conn::reassembly::Crypto; 3],
 }
 
-impl<const DOMAIN: u8, B: ReceiveBuffer> Connection<DOMAIN, B> {
+impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Connection<DOMAIN, B> {
     pub(crate) fn is_client(&self) -> bool {
         self.is_client
     }
@@ -115,7 +117,9 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Connection<DOMAIN, B> {
     }
 }
 
-impl<const DOMAIN: u8, B: ReceiveBuffer> conn::handshake::Transition for Connection<DOMAIN, B> {
+impl<const DOMAIN: u8, B: stream::ReceiveBuffer> conn::handshake::Transition
+    for Connection<DOMAIN, B>
+{
     fn reject_early_data(&mut self) {
         conn::recovery::early::EarlyData::new(
             &mut self.egress,

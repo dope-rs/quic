@@ -1,19 +1,19 @@
-use crate::conn::retired::storage::{Index, Interval};
-use crate::conn::retired::{MIN_DEGREE, Tree};
+use crate::conn::retired;
+use crate::conn::retired::storage;
 
 pub(super) trait Remove<Tag> {
     fn remove(&mut self, start: u64) -> bool;
-    fn remove_from(&mut self, index: Index<Tag>, start: u64) -> bool;
-    fn remove_internal(&mut self, parent: Index<Tag>, at: usize);
-    fn minimum(&self, index: Index<Tag>) -> Interval;
-    fn maximum(&self, index: Index<Tag>) -> Interval;
-    fn fill(&mut self, parent: Index<Tag>, at: usize);
-    fn borrow_previous(&mut self, parent: Index<Tag>, at: usize);
-    fn borrow_next(&mut self, parent: Index<Tag>, at: usize);
-    fn merge(&mut self, parent: Index<Tag>, at: usize);
+    fn remove_from(&mut self, index: storage::Index<Tag>, start: u64) -> bool;
+    fn remove_internal(&mut self, parent: storage::Index<Tag>, at: usize);
+    fn minimum(&self, index: storage::Index<Tag>) -> storage::Interval;
+    fn maximum(&self, index: storage::Index<Tag>) -> storage::Interval;
+    fn fill(&mut self, parent: storage::Index<Tag>, at: usize);
+    fn borrow_previous(&mut self, parent: storage::Index<Tag>, at: usize);
+    fn borrow_next(&mut self, parent: storage::Index<Tag>, at: usize);
+    fn merge(&mut self, parent: storage::Index<Tag>, at: usize);
 }
 
-impl<Tag> Remove<Tag> for Tree<Tag> {
+impl<Tag> Remove<Tag> for retired::Tree<Tag> {
     fn remove(&mut self, start: u64) -> bool {
         if self.root.is_none() || !self.remove_from(self.root, start) {
             return false;
@@ -27,7 +27,7 @@ impl<Tag> Remove<Tag> for Tree<Tag> {
         true
     }
 
-    fn remove_from(&mut self, index: Index<Tag>, start: u64) -> bool {
+    fn remove_from(&mut self, index: storage::Index<Tag>, start: u64) -> bool {
         let len = self.pool.get(index).len();
         let at = self.pool.get(index).keys[..len].partition_point(|range| range.start < start);
         if at != len && self.pool.get(index).keys[at].start == start {
@@ -46,7 +46,7 @@ impl<Tag> Remove<Tag> for Tree<Tag> {
 
         let last = at == len;
         let child = self.pool.get(index).children[at];
-        if self.pool.get(child).len() < MIN_DEGREE {
+        if self.pool.get(child).len() < retired::MIN_DEGREE {
             self.fill(index, at);
         }
         let parent_len = self.pool.get(index).len();
@@ -55,15 +55,15 @@ impl<Tag> Remove<Tag> for Tree<Tag> {
         self.remove_from(child, start)
     }
 
-    fn remove_internal(&mut self, parent: Index<Tag>, at: usize) {
+    fn remove_internal(&mut self, parent: storage::Index<Tag>, at: usize) {
         let key = self.pool.get(parent).keys[at];
         let left = self.pool.get(parent).children[at];
         let right = self.pool.get(parent).children[at + 1];
-        if self.pool.get(left).len() >= MIN_DEGREE {
+        if self.pool.get(left).len() >= retired::MIN_DEGREE {
             let predecessor = self.maximum(left);
             self.pool.get_mut(parent).keys[at] = predecessor;
             assert!(self.remove_from(left, predecessor.start));
-        } else if self.pool.get(right).len() >= MIN_DEGREE {
+        } else if self.pool.get(right).len() >= retired::MIN_DEGREE {
             let successor = self.minimum(right);
             self.pool.get_mut(parent).keys[at] = successor;
             assert!(self.remove_from(right, successor.start));
@@ -73,7 +73,7 @@ impl<Tag> Remove<Tag> for Tree<Tag> {
         }
     }
 
-    fn minimum(&self, mut index: Index<Tag>) -> Interval {
+    fn minimum(&self, mut index: storage::Index<Tag>) -> storage::Interval {
         loop {
             let node = self.pool.get(index);
             if node.leaf {
@@ -83,7 +83,7 @@ impl<Tag> Remove<Tag> for Tree<Tag> {
         }
     }
 
-    fn maximum(&self, mut index: Index<Tag>) -> Interval {
+    fn maximum(&self, mut index: storage::Index<Tag>) -> storage::Interval {
         loop {
             let node = self.pool.get(index);
             if node.leaf {
@@ -93,18 +93,18 @@ impl<Tag> Remove<Tag> for Tree<Tag> {
         }
     }
 
-    fn fill(&mut self, parent: Index<Tag>, at: usize) {
+    fn fill(&mut self, parent: storage::Index<Tag>, at: usize) {
         let parent_len = self.pool.get(parent).len();
         if at != 0 {
             let previous = self.pool.get(parent).children[at - 1];
-            if self.pool.get(previous).len() >= MIN_DEGREE {
+            if self.pool.get(previous).len() >= retired::MIN_DEGREE {
                 self.borrow_previous(parent, at);
                 return;
             }
         }
         if at != parent_len {
             let next = self.pool.get(parent).children[at + 1];
-            if self.pool.get(next).len() >= MIN_DEGREE {
+            if self.pool.get(next).len() >= retired::MIN_DEGREE {
                 self.borrow_next(parent, at);
                 return;
             }
@@ -116,7 +116,7 @@ impl<Tag> Remove<Tag> for Tree<Tag> {
         }
     }
 
-    fn borrow_previous(&mut self, parent: Index<Tag>, at: usize) {
+    fn borrow_previous(&mut self, parent: storage::Index<Tag>, at: usize) {
         let child = self.pool.get(parent).children[at];
         let previous = self.pool.get(parent).children[at - 1];
         let child_len = self.pool.get(child).len();
@@ -140,7 +140,7 @@ impl<Tag> Remove<Tag> for Tree<Tag> {
         self.pool.get_mut(previous).len -= 1;
     }
 
-    fn borrow_next(&mut self, parent: Index<Tag>, at: usize) {
+    fn borrow_next(&mut self, parent: storage::Index<Tag>, at: usize) {
         let child = self.pool.get(parent).children[at];
         let next = self.pool.get(parent).children[at + 1];
         let child_len = self.pool.get(child).len();
@@ -170,7 +170,7 @@ impl<Tag> Remove<Tag> for Tree<Tag> {
         }
     }
 
-    fn merge(&mut self, parent: Index<Tag>, at: usize) {
+    fn merge(&mut self, parent: storage::Index<Tag>, at: usize) {
         let left = self.pool.get(parent).children[at];
         let right = self.pool.get(parent).children[at + 1];
         let left_len = self.pool.get(left).len();

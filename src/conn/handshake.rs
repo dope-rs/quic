@@ -1,18 +1,21 @@
-use std::collections::VecDeque;
+use std::collections;
 
-use shin::client::{FramedClient, FramedConnection, QuicPostHandshake};
-use shin::connection::{
-    DriveError, Event, EventContext, EventSink, LendingEventSink, OutboundFlight, OutboundLayout,
-};
-use shin::server::QuicConnection;
-use shin::server::config::{ClientCertVerifier, EarlyDataGuard};
-use shin::wire::record::CipherSuite;
+use shin::client;
+use shin::connection;
+use shin::server;
+use shin::server::config;
 
-use crate::packet_protection::PacketProtection;
-use crate::qkdf::PacketKeys;
-use crate::{stream::ReceiveBuffer, transport_params};
+use crate::packet_protection;
 
-use super::{Epoch, Error, State, crypto_tx, egress, path, session, streams};
+use crate::stream;
+use crate::transport_params;
+
+use crate::conn;
+use crate::conn::crypto_tx;
+use crate::conn::egress;
+use crate::conn::path;
+use crate::conn::session;
+use crate::conn::streams;
 
 const MAX_SESSION_TICKETS: usize = 8;
 const MAX_SESSION_TICKET_BYTES: usize = 256 * 1024;
@@ -20,14 +23,14 @@ const MAX_SESSION_TICKET_BYTES: usize = 256 * 1024;
 pub(crate) type Clock = fn() -> u64;
 
 pub(super) struct Handshake<const DOMAIN: u8> {
-    client: Option<Box<FramedClient<Clock>>>,
-    read: [Option<PacketProtection>; 3],
-    write: [Option<PacketProtection>; 3],
-    zero_rtt_read: Option<PacketProtection>,
-    zero_rtt_write: Option<PacketProtection>,
+    client: Option<Box<client::FramedClient<Clock>>>,
+    read: [Option<packet_protection::PacketProtection>; 3],
+    write: [Option<packet_protection::PacketProtection>; 3],
+    zero_rtt_read: Option<packet_protection::PacketProtection>,
+    zero_rtt_write: Option<packet_protection::PacketProtection>,
     crypto: crypto_tx::Tx,
     peer_transport_params: Option<transport_params::Params>,
-    received_tickets: VecDeque<session::Ticket>,
+    received_tickets: collections::VecDeque<session::Ticket>,
     received_ticket_bytes: usize,
 }
 
@@ -38,7 +41,7 @@ pub(super) struct Outcome {
 
 pub(super) trait Transition {
     fn reject_early_data(&mut self);
-    fn establish(&mut self) -> Result<(), Error>;
+    fn establish(&mut self) -> Result<(), conn::Error>;
     fn close(&mut self);
 }
 
@@ -54,7 +57,7 @@ pub(super) fn apply_outcome(outcome: Outcome, transition: &mut impl Transition) 
 /// The exact connection fields consumed by a successful handshake transition.
 /// Every value remains in its natural owner and every temporary borrow ends at
 /// completion of this transition.
-pub(super) struct Establishment<'a, const DOMAIN: u8, B: ReceiveBuffer> {
+pub(super) struct Establishment<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> {
     pub(super) egress: &'a mut egress::Egress,
     pub(super) handshake: &'a mut Handshake<DOMAIN>,
     pub(super) path: &'a mut path::Path,
@@ -63,38 +66,38 @@ pub(super) struct Establishment<'a, const DOMAIN: u8, B: ReceiveBuffer> {
     pub(super) is_client: bool,
 }
 
-impl<const DOMAIN: u8, B: ReceiveBuffer> Establishment<'_, DOMAIN, B> {
-    pub(super) fn complete(self) -> Result<(), Error> {
+impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Establishment<'_, DOMAIN, B> {
+    pub(super) fn complete(self) -> Result<(), conn::Error> {
         let peer_tp = self
             .handshake
             .take_peer_transport_params()
-            .ok_or(Error::TransportParameterMismatch)?;
+            .ok_or(conn::Error::TransportParameterMismatch)?;
 
         let expected_iscid = self
             .path
             .peer_first_scid
             .as_ref()
-            .ok_or(Error::TransportParameterMismatch)?;
+            .ok_or(conn::Error::TransportParameterMismatch)?;
         let peer_iscid = peer_tp
             .initial_source_connection_id
             .as_ref()
-            .ok_or(Error::TransportParameterMismatch)?;
+            .ok_or(conn::Error::TransportParameterMismatch)?;
         if peer_iscid.as_slice() != expected_iscid.as_slice() {
-            return Err(Error::TransportParameterMismatch);
+            return Err(conn::Error::TransportParameterMismatch);
         }
 
         if self.is_client {
             let peer_odcid = peer_tp
                 .original_destination_connection_id
                 .as_ref()
-                .ok_or(Error::TransportParameterMismatch)?;
+                .ok_or(conn::Error::TransportParameterMismatch)?;
             if peer_odcid.as_slice() != self.path.original_dcid.as_slice() {
-                return Err(Error::TransportParameterMismatch);
+                return Err(conn::Error::TransportParameterMismatch);
             }
         } else if peer_tp.original_destination_connection_id.is_some()
             || peer_tp.retry_source_connection_id.is_some()
         {
-            return Err(Error::TransportParameterMismatch);
+            return Err(conn::Error::TransportParameterMismatch);
         }
 
         if self.is_client
@@ -114,7 +117,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> Establishment<'_, DOMAIN, B> {
             .path
             .issue_local_cids(peer_tp.active_connection_id_limit);
         *self.peer_transport_params = Some(peer_tp);
-        self.egress.state = State::Established;
+        self.egress.state = crate::conn::State::Established;
         self.egress
             .derived_controls
             .arm_established(!self.is_client, local_cids);
@@ -129,7 +132,7 @@ pub(super) trait Reader<const DOMAIN: u8> {
         epoch: shin::connection::Epoch,
         data: &[u8],
         is_client: bool,
-    ) -> Result<Outcome, Error>;
+    ) -> Result<Outcome, conn::Error>;
 }
 
 pub(super) struct ClientReader;
@@ -139,12 +142,12 @@ pub(crate) struct ClientTls<'pool> {
 }
 
 enum ClientTlsState<'pool> {
-    Handshaking(FramedConnection<'pool, Clock>),
-    PostHandshake(QuicPostHandshake<'pool, Clock>),
+    Handshaking(client::FramedConnection<'pool, Clock>),
+    PostHandshake(client::QuicPostHandshake<'pool, Clock>),
 }
 
 impl<'pool> ClientTls<'pool> {
-    pub(super) fn new(connection: FramedConnection<'pool, Clock>) -> Self {
+    pub(super) fn new(connection: client::FramedConnection<'pool, Clock>) -> Self {
         Self {
             state: Some(ClientTlsState::Handshaking(connection)),
         }
@@ -153,9 +156,9 @@ impl<'pool> ClientTls<'pool> {
     pub(super) fn start<const DOMAIN: u8>(
         &mut self,
         handshake: &mut Handshake<DOMAIN>,
-    ) -> Result<Outcome, Error> {
+    ) -> Result<Outcome, conn::Error> {
         let Some(ClientTlsState::Handshaking(connection)) = self.state.as_mut() else {
-            return Err(Error::Tls);
+            return Err(conn::Error::Tls);
         };
         handshake.drive(true, |_, events| connection.start_into(events))
     }
@@ -166,8 +169,8 @@ impl<'pool> ClientTls<'pool> {
         epoch: shin::connection::Epoch,
         data: &[u8],
         is_client: bool,
-    ) -> Result<Outcome, Error> {
-        let outcome = match self.state.as_mut().ok_or(Error::Tls)? {
+    ) -> Result<Outcome, conn::Error> {
+        let outcome = match self.state.as_mut().ok_or(conn::Error::Tls)? {
             ClientTlsState::Handshaking(connection) => handshake
                 .drive(is_client, |_, events| {
                     connection.read_framed_into(epoch, data, events)
@@ -179,11 +182,11 @@ impl<'pool> ClientTls<'pool> {
         };
         if outcome.done && matches!(self.state, Some(ClientTlsState::Handshaking(_))) {
             let Some(ClientTlsState::Handshaking(connection)) = self.state.take() else {
-                return Err(Error::Tls);
+                return Err(conn::Error::Tls);
             };
             let post = connection
                 .into_quic_post_handshake()
-                .map_err(|_| Error::Tls)?;
+                .map_err(|_| conn::Error::Tls)?;
             self.state = Some(ClientTlsState::PostHandshake(post));
         }
         Ok(outcome)
@@ -207,7 +210,7 @@ impl<const DOMAIN: u8> Reader<DOMAIN> for PooledClientReader<'_, '_> {
         epoch: shin::connection::Epoch,
         data: &[u8],
         is_client: bool,
-    ) -> Result<Outcome, Error> {
+    ) -> Result<Outcome, conn::Error> {
         self.tls.read(handshake, epoch, data, is_client)
     }
 }
@@ -219,31 +222,31 @@ impl<const DOMAIN: u8> Reader<DOMAIN> for ClientReader {
         epoch: shin::connection::Epoch,
         data: &[u8],
         is_client: bool,
-    ) -> Result<Outcome, Error> {
+    ) -> Result<Outcome, conn::Error> {
         handshake.read_client(epoch, data, is_client)
     }
 }
 
 pub(super) struct ServerReader<'a, G, V, const DOMAIN: u8>
 where
-    G: EarlyDataGuard,
-    V: ClientCertVerifier,
+    G: config::EarlyDataGuard,
+    V: config::ClientCertVerifier,
 {
-    server: &'a mut QuicConnection<Clock, DOMAIN, G, V>,
+    server: &'a mut server::QuicConnection<Clock, DOMAIN, G, V>,
 }
 
 pub(super) struct PooledServerReader<'a, 'pool, G, V, const DOMAIN: u8>
 where
-    G: EarlyDataGuard,
-    V: ClientCertVerifier,
+    G: config::EarlyDataGuard,
+    V: config::ClientCertVerifier,
 {
     server: &'a mut shin::server::QuicPooledConnection<'pool, Clock, DOMAIN, V, G>,
 }
 
 impl<'a, 'pool, G, V, const DOMAIN: u8> PooledServerReader<'a, 'pool, G, V, DOMAIN>
 where
-    G: EarlyDataGuard,
-    V: ClientCertVerifier,
+    G: config::EarlyDataGuard,
+    V: config::ClientCertVerifier,
 {
     pub(super) fn new(
         server: &'a mut shin::server::QuicPooledConnection<'pool, Clock, DOMAIN, V, G>,
@@ -254,8 +257,8 @@ where
 
 impl<G, V, const DOMAIN: u8> Reader<DOMAIN> for PooledServerReader<'_, '_, G, V, DOMAIN>
 where
-    G: EarlyDataGuard,
-    V: ClientCertVerifier,
+    G: config::EarlyDataGuard,
+    V: config::ClientCertVerifier,
 {
     fn read(
         &mut self,
@@ -263,7 +266,7 @@ where
         epoch: shin::connection::Epoch,
         data: &[u8],
         is_client: bool,
-    ) -> Result<Outcome, Error> {
+    ) -> Result<Outcome, conn::Error> {
         handshake.drive(is_client, |client, events| match client {
             Some(_) => Err(shin::connection::Error::BadConfig.into()),
             None => self.server.read_framed_into(epoch, data, events),
@@ -280,25 +283,25 @@ impl<const DOMAIN: u8> Reader<DOMAIN> for FinishedReader {
         _epoch: shin::connection::Epoch,
         _data: &[u8],
         _is_client: bool,
-    ) -> Result<Outcome, Error> {
-        Err(Error::Tls)
+    ) -> Result<Outcome, conn::Error> {
+        Err(conn::Error::Tls)
     }
 }
 
 impl<'a, G, V, const DOMAIN: u8> ServerReader<'a, G, V, DOMAIN>
 where
-    G: EarlyDataGuard,
-    V: ClientCertVerifier,
+    G: config::EarlyDataGuard,
+    V: config::ClientCertVerifier,
 {
-    pub(super) fn new(server: &'a mut QuicConnection<Clock, DOMAIN, G, V>) -> Self {
+    pub(super) fn new(server: &'a mut server::QuicConnection<Clock, DOMAIN, G, V>) -> Self {
         Self { server }
     }
 }
 
 impl<G, V, const DOMAIN: u8> Reader<DOMAIN> for ServerReader<'_, G, V, DOMAIN>
 where
-    G: EarlyDataGuard,
-    V: ClientCertVerifier,
+    G: config::EarlyDataGuard,
+    V: config::ClientCertVerifier,
 {
     fn read(
         &mut self,
@@ -306,18 +309,18 @@ where
         epoch: shin::connection::Epoch,
         data: &[u8],
         is_client: bool,
-    ) -> Result<Outcome, Error> {
+    ) -> Result<Outcome, conn::Error> {
         handshake.read_server(epoch, data, self.server, is_client)
     }
 }
 
 impl<const DOMAIN: u8> Handshake<DOMAIN> {
     pub(super) fn client(
-        client: FramedClient<Clock>,
-        initial_read: PacketProtection,
-        initial_write: PacketProtection,
+        client: client::FramedClient<Clock>,
+        initial_read: packet_protection::PacketProtection,
+        initial_write: packet_protection::PacketProtection,
         crypto_capacity: usize,
-        outbound_layout: OutboundLayout,
+        outbound_layout: connection::OutboundLayout,
     ) -> Self {
         Self::new(
             Some(Box::new(client)),
@@ -329,10 +332,10 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
     }
 
     pub(super) fn server(
-        initial_read: PacketProtection,
-        initial_write: PacketProtection,
+        initial_read: packet_protection::PacketProtection,
+        initial_write: packet_protection::PacketProtection,
         crypto_capacity: usize,
-        outbound_layout: OutboundLayout,
+        outbound_layout: connection::OutboundLayout,
     ) -> Self {
         Self::new(
             None,
@@ -344,11 +347,11 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
     }
 
     fn new(
-        client: Option<Box<FramedClient<Clock>>>,
-        initial_read: PacketProtection,
-        initial_write: PacketProtection,
+        client: Option<Box<client::FramedClient<Clock>>>,
+        initial_read: packet_protection::PacketProtection,
+        initial_write: packet_protection::PacketProtection,
         crypto_capacity: usize,
-        outbound_layout: OutboundLayout,
+        outbound_layout: connection::OutboundLayout,
     ) -> Self {
         Self {
             client,
@@ -358,12 +361,12 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
             zero_rtt_write: None,
             crypto: crypto_tx::Tx::new(crypto_capacity, outbound_layout),
             peer_transport_params: None,
-            received_tickets: VecDeque::new(),
+            received_tickets: collections::VecDeque::new(),
             received_ticket_bytes: 0,
         }
     }
 
-    pub(super) fn start_client(&mut self) -> Result<Outcome, Error> {
+    pub(super) fn start_client(&mut self) -> Result<Outcome, conn::Error> {
         self.drive(true, |client, events| match client {
             Some(client) => client.start_into(events),
             None => Err(shin::connection::Error::BadConfig.into()),
@@ -375,7 +378,7 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
         epoch: shin::connection::Epoch,
         data: &[u8],
         is_client: bool,
-    ) -> Result<Outcome, Error> {
+    ) -> Result<Outcome, conn::Error> {
         self.drive(is_client, |client, events| match client {
             Some(client) => client.read_framed_into(epoch, data, events),
             None => Err(shin::connection::Error::BadConfig.into()),
@@ -386,12 +389,12 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
         &mut self,
         epoch: shin::connection::Epoch,
         data: &[u8],
-        server: &mut QuicConnection<Clock, DOMAIN, G, V>,
+        server: &mut server::QuicConnection<Clock, DOMAIN, G, V>,
         is_client: bool,
-    ) -> Result<Outcome, Error>
+    ) -> Result<Outcome, conn::Error>
     where
-        G: EarlyDataGuard,
-        V: ClientCertVerifier,
+        G: config::EarlyDataGuard,
+        V: config::ClientCertVerifier,
     {
         self.drive(is_client, |client, events| match client {
             Some(_) => Err(shin::connection::Error::BadConfig.into()),
@@ -403,10 +406,10 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
         &mut self,
         is_client: bool,
         run: impl FnOnce(
-            &mut Option<Box<FramedClient<Clock>>>,
+            &mut Option<Box<client::FramedClient<Clock>>>,
             &mut Events<'_>,
-        ) -> Result<(), DriveError<Error>>,
-    ) -> Result<Outcome, Error> {
+        ) -> Result<(), connection::DriveError<conn::Error>>,
+    ) -> Result<Outcome, conn::Error> {
         let Self {
             client,
             read,
@@ -436,33 +439,43 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
                 done: events.done,
                 reject_early_data: events.reject_early_data,
             }),
-            Err(DriveError::Protocol(_)) => Err(Error::Tls),
-            Err(DriveError::Sink(error)) => Err(error),
+            Err(connection::DriveError::Protocol(_)) => Err(conn::Error::Tls),
+            Err(connection::DriveError::Sink(error)) => Err(error),
         }
     }
 
-    pub(super) fn read_key(&self, epoch: Epoch) -> Option<&PacketProtection> {
+    pub(super) fn read_key(
+        &self,
+        epoch: conn::Epoch,
+    ) -> Option<&packet_protection::PacketProtection> {
         self.read[epoch as usize].as_ref()
     }
 
-    pub(super) fn write_key(&self, epoch: Epoch) -> Option<&PacketProtection> {
+    pub(super) fn write_key(
+        &self,
+        epoch: conn::Epoch,
+    ) -> Option<&packet_protection::PacketProtection> {
         self.write[epoch as usize].as_ref()
     }
 
-    pub(super) fn zero_rtt_read_key(&self) -> Option<&PacketProtection> {
+    pub(super) fn zero_rtt_read_key(&self) -> Option<&packet_protection::PacketProtection> {
         self.zero_rtt_read.as_ref()
     }
 
-    pub(super) fn zero_rtt_write_key(&self) -> Option<&PacketProtection> {
+    pub(super) fn zero_rtt_write_key(&self) -> Option<&packet_protection::PacketProtection> {
         self.zero_rtt_write.as_ref()
     }
 
-    pub(super) fn replace_initial_keys(&mut self, read: PacketProtection, write: PacketProtection) {
-        self.read[Epoch::Initial as usize] = Some(read);
-        self.write[Epoch::Initial as usize] = Some(write);
+    pub(super) fn replace_initial_keys(
+        &mut self,
+        read: packet_protection::PacketProtection,
+        write: packet_protection::PacketProtection,
+    ) {
+        self.read[conn::Epoch::Initial as usize] = Some(read);
+        self.write[conn::Epoch::Initial as usize] = Some(write);
     }
 
-    pub(super) fn discard(&mut self, epoch: Epoch) {
+    pub(super) fn discard(&mut self, epoch: conn::Epoch) {
         self.read[epoch as usize] = None;
         self.write[epoch as usize] = None;
         self.crypto.discard(epoch);
@@ -491,90 +504,103 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
 }
 
 struct Events<'a> {
-    read: &'a mut [Option<PacketProtection>; 3],
-    write: &'a mut [Option<PacketProtection>; 3],
-    zero_rtt_read: &'a mut Option<PacketProtection>,
-    zero_rtt_write: &'a mut Option<PacketProtection>,
+    read: &'a mut [Option<packet_protection::PacketProtection>; 3],
+    write: &'a mut [Option<packet_protection::PacketProtection>; 3],
+    zero_rtt_read: &'a mut Option<packet_protection::PacketProtection>,
+    zero_rtt_write: &'a mut Option<packet_protection::PacketProtection>,
     crypto: &'a mut crypto_tx::Tx,
     peer_transport_params: &'a mut Option<transport_params::Params>,
-    received_tickets: &'a mut VecDeque<session::Ticket>,
+    received_tickets: &'a mut collections::VecDeque<session::Ticket>,
     received_ticket_bytes: &'a mut usize,
     is_client: bool,
     done: bool,
     reject_early_data: bool,
 }
 
-impl EventSink for Events<'_> {
-    type Error = Error;
+impl connection::EventSink for Events<'_> {
+    type Error = conn::Error;
 
     fn begin_send(
         &mut self,
         epoch: shin::connection::Epoch,
         _maximum: usize,
-        context: EventContext,
-    ) -> Result<Option<OutboundFlight<'_>>, Self::Error> {
-        LendingEventSink::lend_send(self, epoch, context).map(Some)
+        context: connection::EventContext,
+    ) -> Result<Option<connection::OutboundFlight<'_>>, Self::Error> {
+        connection::LendingEventSink::lend_send(self, epoch, context).map(Some)
     }
 
-    fn event(&mut self, event: Event<'_>, context: EventContext) -> Result<(), Self::Error> {
+    fn event(
+        &mut self,
+        event: connection::Event<'_>,
+        context: connection::EventContext,
+    ) -> Result<(), Self::Error> {
         match event {
-            Event::Send { epoch, data } => match epoch {
-                shin::connection::Epoch::Plaintext => self.crypto.append(Epoch::Initial, data)?,
-                shin::connection::Epoch::Handshake => self.crypto.append(Epoch::Handshake, data)?,
+            connection::Event::Send { epoch, data } => match epoch {
+                shin::connection::Epoch::Plaintext => {
+                    self.crypto.append(conn::Epoch::Initial, data)?
+                }
+                shin::connection::Epoch::Handshake => {
+                    self.crypto.append(conn::Epoch::Handshake, data)?
+                }
                 shin::connection::Epoch::Application => {
-                    self.crypto.append(Epoch::Application, data)?
+                    self.crypto.append(conn::Epoch::Application, data)?
                 }
                 shin::connection::Epoch::EarlyData => {}
             },
-            Event::KeysReady {
+            connection::Event::KeysReady {
                 epoch,
                 read_secret,
                 write_secret,
             } => {
-                if context.cipher_suite() != Some(CipherSuite::Aes128GcmSha256) {
-                    return Err(Error::Tls);
+                if context.cipher_suite() != Some(shin::wire::record::CipherSuite::Aes128GcmSha256)
+                {
+                    return Err(conn::Error::Tls);
                 }
-                let read_keys =
-                    PacketKeys::aes_128(read_secret.as_slice()).map_err(|_| Error::Tls)?;
-                let write_keys =
-                    PacketKeys::aes_128(write_secret.as_slice()).map_err(|_| Error::Tls)?;
-                let read = PacketProtection::aes_128(&read_keys).map_err(|_| Error::Tls)?;
-                let write = PacketProtection::aes_128(&write_keys).map_err(|_| Error::Tls)?;
+                let read_keys = crate::qkdf::PacketKeys::aes_128(read_secret.as_slice())
+                    .map_err(|_| conn::Error::Tls)?;
+                let write_keys = crate::qkdf::PacketKeys::aes_128(write_secret.as_slice())
+                    .map_err(|_| conn::Error::Tls)?;
+                let read = packet_protection::PacketProtection::aes_128(&read_keys)
+                    .map_err(|_| conn::Error::Tls)?;
+                let write = packet_protection::PacketProtection::aes_128(&write_keys)
+                    .map_err(|_| conn::Error::Tls)?;
                 let index = match epoch {
-                    shin::connection::Epoch::Handshake => Epoch::Handshake as usize,
-                    shin::connection::Epoch::Application => Epoch::Application as usize,
+                    shin::connection::Epoch::Handshake => conn::Epoch::Handshake as usize,
+                    shin::connection::Epoch::Application => conn::Epoch::Application as usize,
                     shin::connection::Epoch::Plaintext | shin::connection::Epoch::EarlyData => {
-                        return Err(Error::Tls);
+                        return Err(conn::Error::Tls);
                     }
                 };
                 self.read[index] = Some(read);
                 self.write[index] = Some(write);
             }
-            Event::PeerExtension { ty, data } => {
+            connection::Event::PeerExtension { ty, data } => {
                 if ty != shin::wire::extension::Type::QUIC_TRANSPORT_PARAMETERS.0
                     || self.peer_transport_params.is_some()
                 {
-                    return Err(Error::TransportParameterDecode);
+                    return Err(conn::Error::TransportParameterDecode);
                 }
                 *self.peer_transport_params = Some(transport_params::Params::decode(data)?);
             }
-            Event::Done => self.done = true,
-            Event::KeyUpdate { .. } => return Err(Error::Tls),
-            Event::ZeroRttKeysReady { secret, .. } => {
-                let keys = PacketKeys::aes_128(secret.as_slice()).map_err(|_| Error::Tls)?;
-                let protection = PacketProtection::aes_128(&keys).map_err(|_| Error::Tls)?;
+            connection::Event::Done => self.done = true,
+            connection::Event::KeyUpdate { .. } => return Err(conn::Error::Tls),
+            connection::Event::ZeroRttKeysReady { secret, .. } => {
+                let keys = crate::qkdf::PacketKeys::aes_128(secret.as_slice())
+                    .map_err(|_| conn::Error::Tls)?;
+                let protection = packet_protection::PacketProtection::aes_128(&keys)
+                    .map_err(|_| conn::Error::Tls)?;
                 if self.is_client {
                     *self.zero_rtt_write = Some(protection);
                 } else {
                     *self.zero_rtt_read = Some(protection);
                 }
             }
-            Event::EarlyDataAccepted => {}
-            Event::EarlyDataRejected => {
+            connection::Event::EarlyDataAccepted => {}
+            connection::Event::EarlyDataRejected => {
                 *self.zero_rtt_write = None;
                 self.reject_early_data = true;
             }
-            Event::NewSessionTicket(ticket) => {
+            connection::Event::NewSessionTicket(ticket) => {
                 let alpn = ticket.alpn().map(<[u8]>::to_vec);
                 let ticket_bytes = ticket
                     .ticket()
@@ -594,7 +620,7 @@ impl EventSink for Events<'_> {
                         expired.ticket.len() + expired.alpn.as_ref().map_or(0, Vec::len),
                     );
                 }
-                let psk = ticket.try_psk().map_err(|_| Error::Tls)?;
+                let psk = ticket.try_psk().map_err(|_| conn::Error::Tls)?;
                 self.received_tickets.push_back(session::Ticket {
                     ticket_lifetime: ticket.ticket_lifetime_secs(),
                     ticket_age_add: ticket.ticket_age_add(),
@@ -612,17 +638,17 @@ impl EventSink for Events<'_> {
     }
 }
 
-impl LendingEventSink for Events<'_> {
+impl connection::LendingEventSink for Events<'_> {
     fn lend_send(
         &mut self,
         epoch: shin::connection::Epoch,
-        _context: EventContext,
-    ) -> Result<OutboundFlight<'_>, Self::Error> {
+        _context: connection::EventContext,
+    ) -> Result<connection::OutboundFlight<'_>, Self::Error> {
         let epoch = match epoch {
-            shin::connection::Epoch::Plaintext => Epoch::Initial,
-            shin::connection::Epoch::Handshake => Epoch::Handshake,
-            shin::connection::Epoch::Application => Epoch::Application,
-            shin::connection::Epoch::EarlyData => return Err(Error::Tls),
+            shin::connection::Epoch::Plaintext => conn::Epoch::Initial,
+            shin::connection::Epoch::Handshake => conn::Epoch::Handshake,
+            shin::connection::Epoch::Application => conn::Epoch::Application,
+            shin::connection::Epoch::EarlyData => return Err(conn::Error::Tls),
         };
         self.crypto.begin(epoch)
     }

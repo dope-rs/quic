@@ -1,11 +1,9 @@
-use std::mem::take;
+use crate::conn::commit;
+use crate::conn::delivery;
 
-use crate::conn::{Epoch, PN_LEN, STREAM_FRAME_OVERHEAD, TAG_LEN, commit, delivery};
-use crate::frame::Frame;
-use crate::packet::{LONG_ZERO_RTT, LongHeader, QUIC_V1};
-use crate::stream::ReceiveBuffer;
+use crate::stream;
 
-use super::{Application, Builder};
+use crate::conn::transmit::builder::application;
 
 pub(in crate::conn::transmit) trait BuildZeroRtt {
     fn build_zero_rtt(
@@ -16,7 +14,9 @@ pub(in crate::conn::transmit) trait BuildZeroRtt {
     ) -> Option<(usize, commit::Packet)>;
 }
 
-impl<const DOMAIN: u8, B: ReceiveBuffer> BuildZeroRtt for Application<'_, DOMAIN, B> {
+impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildZeroRtt
+    for application::Application<'_, DOMAIN, B>
+{
     fn build_zero_rtt(
         &mut self,
         dst: &mut Vec<u8>,
@@ -25,17 +25,18 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildZeroRtt for Application<'_, DOMAIN
     ) -> Option<(usize, commit::Packet)> {
         self.packet.connection.handshake.zero_rtt_write_key()?;
         if !(if pto_probe {
-            self.packet.can_track_probe(Epoch::Application)
+            self.packet.can_track_probe(crate::conn::Epoch::Application)
         } else {
             self.packet.can_track_packet()
         }) {
             return None;
         }
         let payload_limit = self.packet.handshake_payload_limit(max_packet_bytes);
-        let pn = self.packet.connection.egress.spaces[Epoch::Application as usize].next_pn;
-        let mut frames = take(&mut self.packet.connection.scratch_frames);
+        let pn =
+            self.packet.connection.egress.spaces[crate::conn::Epoch::Application as usize].next_pn;
+        let mut frames = std::mem::take(&mut self.packet.connection.scratch_frames);
         frames.clear();
-        let mut commit = commit::Packet::new(Epoch::Application, pn);
+        let mut commit = commit::Packet::new(crate::conn::Epoch::Application, pn);
         commit.early_data = true;
         if pto_probe {
             while !commit.streams.is_full() {
@@ -55,8 +56,11 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildZeroRtt for Application<'_, DOMAIN
                 let Some((handle, send_handle, record)) = next else {
                     break;
                 };
-                let room = payload_limit
-                    .saturating_sub(frames.len().saturating_add(STREAM_FRAME_OVERHEAD));
+                let room = payload_limit.saturating_sub(
+                    frames
+                        .len()
+                        .saturating_add(crate::conn::STREAM_FRAME_OVERHEAD),
+                );
                 if record.len as usize > room {
                     break;
                 }
@@ -88,7 +92,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildZeroRtt for Application<'_, DOMAIN
                 let Ok(len) = usize::try_from(record.len) else {
                     continue;
                 };
-                if !Builder::<DOMAIN, B>::append_stream_frame(
+                if !crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_stream_frame(
                     &mut frames,
                     payload_limit,
                     record.stream_id,
@@ -106,7 +110,11 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildZeroRtt for Application<'_, DOMAIN
                 commit.ack_eliciting = true;
             }
             if !commit.ack_eliciting {
-                if !Builder::<DOMAIN, B>::append_frame(&mut frames, payload_limit, &Frame::Ping) {
+                if !crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_frame(
+                    &mut frames,
+                    payload_limit,
+                    &crate::frame::Frame::Ping,
+                ) {
                     self.packet.connection.scratch_frames = frames;
                     return None;
                 }
@@ -167,8 +175,11 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildZeroRtt for Application<'_, DOMAIN
                                 .saturating_add(packet_fresh_bytes),
                         )
                 });
-            let packet_room =
-                payload_limit.saturating_sub(frames.len().saturating_add(STREAM_FRAME_OVERHEAD));
+            let packet_room = payload_limit.saturating_sub(
+                frames
+                    .len()
+                    .saturating_add(crate::conn::STREAM_FRAME_OVERHEAD),
+            );
             let take = stream_budget.min(conn_budget).min(packet_room as u64) as usize;
             let fin_only = stream.unsent_len() == 0 && stream.would_fin(0);
             if take == 0 && !fin_only {
@@ -183,7 +194,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildZeroRtt for Application<'_, DOMAIN
                 continue;
             }
             let fin_now = stream.would_fin(n);
-            if !Builder::<DOMAIN, B>::append_stream_frame(
+            if !crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_stream_frame(
                 &mut frames,
                 payload_limit,
                 id,
@@ -202,7 +213,7 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildZeroRtt for Application<'_, DOMAIN
             });
             packet_fresh_bytes = packet_fresh_bytes.saturating_add(n as u64);
             commit.ack_eliciting = true;
-            if payload_limit.saturating_sub(frames.len()) <= STREAM_FRAME_OVERHEAD {
+            if payload_limit.saturating_sub(frames.len()) <= crate::conn::STREAM_FRAME_OVERHEAD {
                 break;
             }
         }
@@ -210,17 +221,17 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildZeroRtt for Application<'_, DOMAIN
             self.packet.connection.scratch_frames = frames;
             return None;
         }
-        let body_len_after_pn = frames.len() + TAG_LEN;
-        let mut header = take(&mut self.packet.connection.scratch_header);
+        let body_len_after_pn = frames.len() + crate::conn::TAG_LEN;
+        let mut header = std::mem::take(&mut self.packet.connection.scratch_header);
         header.clear();
-        let pn_off = LongHeader {
-            version: QUIC_V1,
-            packet_type: LONG_ZERO_RTT,
+        let pn_off = crate::packet::LongHeader {
+            version: crate::packet::QUIC_V1,
+            packet_type: crate::packet::LONG_ZERO_RTT,
             dcid: self.packet.connection.path.peer_cid(),
             scid: self.packet.connection.path.local_cid(),
             token: None,
             packet_number: pn,
-            packet_number_len: PN_LEN,
+            packet_number_len: crate::conn::PN_LEN,
         }
         .encode_into(&mut header, body_len_after_pn)
         .ok()?;
@@ -229,7 +240,14 @@ impl<const DOMAIN: u8, B: ReceiveBuffer> BuildZeroRtt for Application<'_, DOMAIN
             .connection
             .handshake
             .zero_rtt_write_key()?
-            .encrypt_long_into(dst, &header, &frames, pn, pn_off, PN_LEN as usize)
+            .encrypt_long_into(
+                dst,
+                &header,
+                &frames,
+                pn,
+                pn_off,
+                crate::conn::PN_LEN as usize,
+            )
             .ok()?;
         header.clear();
         self.packet.connection.scratch_header = header;

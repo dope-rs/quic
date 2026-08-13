@@ -1,9 +1,9 @@
-use std::ops::Range;
+use std::ops;
 
-use shin::crypto::aead::Key;
+use shin::crypto::aead;
 
-use crate::hp::HeaderProtectionKey;
-use crate::qkdf::PacketKeys;
+use crate::hp;
+use crate::qkdf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoFailure {
@@ -23,8 +23,8 @@ impl_error!(CryptoFailure {
 });
 
 pub struct PacketProtection {
-    aead: Key,
-    hp: HeaderProtectionKey,
+    aead: aead::Key,
+    hp: hp::HeaderProtectionKey,
 }
 
 const LONG_HEADER_MASK: u8 = 0x0f;
@@ -32,10 +32,12 @@ const SHORT_HEADER_MASK: u8 = 0x1f;
 const MAX_PACKET_NUMBER: u64 = (1 << 62) - 1;
 
 impl PacketProtection {
-    pub fn aes_128(keys: &PacketKeys) -> Result<Self, CryptoFailure> {
+    pub fn aes_128(keys: &qkdf::PacketKeys) -> Result<Self, CryptoFailure> {
         Ok(Self {
-            aead: Key::aes_128_gcm(&keys.key, keys.iv).map_err(|_| CryptoFailure::InvalidKey)?,
-            hp: HeaderProtectionKey::aes_128(&keys.hp).map_err(|_| CryptoFailure::InvalidKey)?,
+            aead: aead::Key::aes_128_gcm(&keys.key, keys.iv)
+                .map_err(|_| CryptoFailure::InvalidKey)?,
+            hp: hp::HeaderProtectionKey::aes_128(&keys.hp)
+                .map_err(|_| CryptoFailure::InvalidKey)?,
         })
     }
 
@@ -95,7 +97,7 @@ impl PacketProtection {
         protected: &mut [u8],
         pn_offset: usize,
         expected_packet_number: u64,
-    ) -> Result<(u64, Range<usize>), CryptoFailure> {
+    ) -> Result<(u64, ops::Range<usize>), CryptoFailure> {
         self.decrypt_in_place(
             protected,
             pn_offset,
@@ -205,7 +207,7 @@ impl PacketProtection {
         header_with_pn: &[u8],
         payload: &[u8],
         packet_number: u64,
-        packet_number_range: Range<usize>,
+        packet_number_range: ops::Range<usize>,
         first_byte_mask: u8,
     ) -> Result<usize, CryptoFailure> {
         let start = dst.len();
@@ -268,7 +270,7 @@ impl PacketProtection {
         protected: &mut [u8],
         pn_offset: usize,
         expected_packet_number: u64,
-    ) -> Result<(u64, Range<usize>), CryptoFailure> {
+    ) -> Result<(u64, ops::Range<usize>), CryptoFailure> {
         self.decrypt_in_place(
             protected,
             pn_offset,
@@ -283,7 +285,7 @@ impl PacketProtection {
         pn_offset: usize,
         expected_packet_number: u64,
         first_byte_mask: u8,
-    ) -> Result<(u64, Range<usize>), CryptoFailure> {
+    ) -> Result<(u64, ops::Range<usize>), CryptoFailure> {
         let sample_start = pn_offset
             .checked_add(4)
             .ok_or(CryptoFailure::InvalidPacket)?;

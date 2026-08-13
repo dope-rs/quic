@@ -1,4 +1,4 @@
-use crate::varint::VarInt;
+use crate::varint;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ranges<'a> {
@@ -13,18 +13,18 @@ impl<'a> Ranges<'a> {
 }
 
 impl Iterator for Ranges<'_> {
-    type Item = (VarInt, VarInt);
+    type Item = (varint::VarInt, varint::VarInt);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {
             return None;
         }
-        let Ok((gap, gap_len)) = VarInt::decode(self.input) else {
+        let Ok((gap, gap_len)) = varint::VarInt::decode(self.input) else {
             self.remaining = 0;
             return None;
         };
         let input = &self.input[gap_len..];
-        let Ok((range, range_len)) = VarInt::decode(input) else {
+        let Ok((range, range_len)) = varint::VarInt::decode(input) else {
             self.remaining = 0;
             return None;
         };

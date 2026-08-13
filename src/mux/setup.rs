@@ -1,37 +1,36 @@
-use std::marker::PhantomData;
+use std::marker;
 
-use shin::crypto::sig::SigningKey;
-use shin::server::{config::ClientCertVerifier, config::NoGuard};
+use ring::rand::SecureRandom as _;
+use shin::crypto::sig;
 
-use crate::ConnectFailure;
-use crate::conn::{self, config::Validated};
-use crate::stream::ReceiveBuffer;
+use crate::conn;
+use crate::stream;
 
-use super::{
-    DEFAULT_MAX_CONNS, DEFAULT_OUTGOING_BYTES_CAP, DEFAULT_OUTGOING_CAP, Handler, MAX_CONNECTIONS,
-    MAX_OUTGOING_BYTES, MAX_OUTGOING_CAPACITY, Mux, PooledRouter, ServerRuntime, drive, lifecycle,
-    output, routing,
-};
+use crate::mux;
+use crate::mux::drive;
+use crate::mux::lifecycle;
+use crate::mux::output;
+use crate::mux::routing;
 
-pub struct Client<H, const DOMAIN: u8 = 0, B: ReceiveBuffer = Vec<u8>>
+pub struct Client<H, const DOMAIN: u8 = 0, B: stream::ReceiveBuffer = Vec<u8>>
 where
-    H: Handler<DOMAIN, B>,
+    H: mux::Handler<DOMAIN, B>,
 {
     handler: H,
     max_connections: usize,
     outgoing_capacity: usize,
     outgoing_bytes_capacity: usize,
-    _buffer: PhantomData<fn() -> B>,
+    _buffer: marker::PhantomData<fn() -> B>,
 }
 
-impl<H: Handler<DOMAIN, B>, const DOMAIN: u8, B: ReceiveBuffer> Client<H, DOMAIN, B> {
+impl<H: mux::Handler<DOMAIN, B>, const DOMAIN: u8, B: stream::ReceiveBuffer> Client<H, DOMAIN, B> {
     pub fn new(handler: H) -> Self {
         Self {
             handler,
-            max_connections: DEFAULT_MAX_CONNS,
-            outgoing_capacity: DEFAULT_OUTGOING_CAP,
-            outgoing_bytes_capacity: DEFAULT_OUTGOING_BYTES_CAP,
-            _buffer: PhantomData,
+            max_connections: mux::DEFAULT_MAX_CONNS,
+            outgoing_capacity: mux::DEFAULT_OUTGOING_CAP,
+            outgoing_bytes_capacity: mux::DEFAULT_OUTGOING_BYTES_CAP,
+            _buffer: marker::PhantomData,
         }
     }
 
@@ -58,7 +57,9 @@ impl<H: Handler<DOMAIN, B>, const DOMAIN: u8, B: ReceiveBuffer> Client<H, DOMAIN
         self
     }
 
-    pub fn build(self) -> Result<Mux<H, conn::server::Standard, DOMAIN, B>, ConnectFailure> {
+    pub fn build(
+        self,
+    ) -> Result<mux::Mux<H, conn::server::Standard, DOMAIN, B>, crate::ConnectFailure> {
         construct(
             self.handler,
             None,
@@ -70,7 +71,8 @@ impl<H: Handler<DOMAIN, B>, const DOMAIN: u8, B: ReceiveBuffer> Client<H, DOMAIN
 
     pub fn build_pooled<'tls>(
         self,
-    ) -> Result<PooledRouter<'tls, H, conn::server::Standard, DOMAIN, B>, ConnectFailure> {
+    ) -> Result<mux::PooledRouter<'tls, H, conn::server::Standard, DOMAIN, B>, crate::ConnectFailure>
+    {
         construct_inner(
             self.handler,
             None,
@@ -82,71 +84,71 @@ impl<H: Handler<DOMAIN, B>, const DOMAIN: u8, B: ReceiveBuffer> Client<H, DOMAIN
 }
 
 pub struct Server<P: conn::server::Policy = conn::server::Standard, const DOMAIN: u8 = 0>(
-    PhantomData<fn() -> P>,
+    marker::PhantomData<fn() -> P>,
 );
 
 impl<const DOMAIN: u8> Server<conn::server::Standard, DOMAIN> {
-    pub fn accept<H: Handler<DOMAIN>>(
+    pub fn accept<H: mux::Handler<DOMAIN>>(
         handler: H,
-        signing_key: SigningKey,
+        signing_key: sig::SigningKey,
         server_config: conn::config::Options,
-    ) -> Result<Mux<H, conn::server::Standard, DOMAIN>, ConnectFailure> {
+    ) -> Result<mux::Mux<H, conn::server::Standard, DOMAIN>, crate::ConnectFailure> {
         Self::with_limits(
             handler,
             signing_key,
             server_config,
-            DEFAULT_MAX_CONNS,
-            DEFAULT_OUTGOING_CAP,
-            DEFAULT_OUTGOING_BYTES_CAP,
+            mux::DEFAULT_MAX_CONNS,
+            mux::DEFAULT_OUTGOING_CAP,
+            mux::DEFAULT_OUTGOING_BYTES_CAP,
         )
     }
 
-    pub fn with_outgoing_capacity<H: Handler<DOMAIN>>(
+    pub fn with_outgoing_capacity<H: mux::Handler<DOMAIN>>(
         handler: H,
-        signing_key: SigningKey,
+        signing_key: sig::SigningKey,
         server_config: conn::config::Options,
         outgoing_capacity: usize,
-    ) -> Result<Mux<H, conn::server::Standard, DOMAIN>, ConnectFailure> {
+    ) -> Result<mux::Mux<H, conn::server::Standard, DOMAIN>, crate::ConnectFailure> {
         Self::with_limits(
             handler,
             signing_key,
             server_config,
-            DEFAULT_MAX_CONNS,
+            mux::DEFAULT_MAX_CONNS,
             outgoing_capacity,
-            DEFAULT_OUTGOING_BYTES_CAP,
+            mux::DEFAULT_OUTGOING_BYTES_CAP,
         )
     }
 
-    pub fn with_outgoing_limits<H: Handler<DOMAIN>>(
+    pub fn with_outgoing_limits<H: mux::Handler<DOMAIN>>(
         handler: H,
-        signing_key: SigningKey,
+        signing_key: sig::SigningKey,
         server_config: conn::config::Options,
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
-    ) -> Result<Mux<H, conn::server::Standard, DOMAIN>, ConnectFailure> {
+    ) -> Result<mux::Mux<H, conn::server::Standard, DOMAIN>, crate::ConnectFailure> {
         Self::with_limits(
             handler,
             signing_key,
             server_config,
-            DEFAULT_MAX_CONNS,
+            mux::DEFAULT_MAX_CONNS,
             outgoing_capacity,
             outgoing_bytes_capacity,
         )
     }
 
-    pub fn with_limits<H: Handler<DOMAIN>>(
+    pub fn with_limits<H: mux::Handler<DOMAIN>>(
         handler: H,
-        signing_key: SigningKey,
+        signing_key: sig::SigningKey,
         server_config: conn::config::Options,
         max_conns: usize,
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
-    ) -> Result<Mux<H, conn::server::Standard, DOMAIN>, ConnectFailure> {
+    ) -> Result<mux::Mux<H, conn::server::Standard, DOMAIN>, crate::ConnectFailure> {
         Self::build(
             handler,
             signing_key,
             server_config,
-            NoGuard,
+            shin::server::config::NoGuard,
             max_conns,
             outgoing_capacity,
             outgoing_bytes_capacity,
@@ -158,32 +160,32 @@ impl<G, const DOMAIN: u8> Server<conn::server::Standard<G>, DOMAIN>
 where
     G: conn::server::ReplayGuard + 'static,
 {
-    pub fn with_early_data_guard<H: Handler<DOMAIN>>(
+    pub fn with_early_data_guard<H: mux::Handler<DOMAIN>>(
         handler: H,
-        signing_key: SigningKey,
+        signing_key: sig::SigningKey,
         server_config: conn::config::Options,
         guard: G,
-    ) -> Result<Mux<H, conn::server::Standard<G>, DOMAIN>, ConnectFailure> {
+    ) -> Result<mux::Mux<H, conn::server::Standard<G>, DOMAIN>, crate::ConnectFailure> {
         Self::with_early_data_guard_and_limits(
             handler,
             signing_key,
             server_config,
             guard,
-            DEFAULT_MAX_CONNS,
-            DEFAULT_OUTGOING_CAP,
-            DEFAULT_OUTGOING_BYTES_CAP,
+            mux::DEFAULT_MAX_CONNS,
+            mux::DEFAULT_OUTGOING_CAP,
+            mux::DEFAULT_OUTGOING_BYTES_CAP,
         )
     }
 
-    pub fn with_early_data_guard_and_limits<H: Handler<DOMAIN>>(
+    pub fn with_early_data_guard_and_limits<H: mux::Handler<DOMAIN>>(
         handler: H,
-        signing_key: SigningKey,
+        signing_key: sig::SigningKey,
         server_config: conn::config::Options,
         guard: G,
         max_conns: usize,
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
-    ) -> Result<Mux<H, conn::server::Standard<G>, DOMAIN>, ConnectFailure> {
+    ) -> Result<mux::Mux<H, conn::server::Standard<G>, DOMAIN>, crate::ConnectFailure> {
         Self::build(
             handler,
             signing_key,
@@ -196,36 +198,42 @@ where
     }
 }
 
-impl<V, const DOMAIN: u8> Server<conn::server::Mutual<NoGuard, V>, DOMAIN>
+impl<V, const DOMAIN: u8> Server<conn::server::Mutual<shin::server::config::NoGuard, V>, DOMAIN>
 where
-    V: ClientCertVerifier + 'static,
+    V: shin::server::config::ClientCertVerifier + 'static,
 {
-    pub fn mutual<H: Handler<DOMAIN>>(
+    pub fn mutual<H: mux::Handler<DOMAIN>>(
         handler: H,
-        signing_key: SigningKey,
+        signing_key: sig::SigningKey,
         server_config: conn::config::Options,
         authentication: conn::server::Authentication<V>,
-    ) -> Result<Mux<H, conn::server::Mutual<NoGuard, V>, DOMAIN>, ConnectFailure> {
+    ) -> Result<
+        mux::Mux<H, conn::server::Mutual<shin::server::config::NoGuard, V>, DOMAIN>,
+        crate::ConnectFailure,
+    > {
         Self::mutual_with_limits(
             handler,
             signing_key,
             server_config,
             authentication,
-            DEFAULT_MAX_CONNS,
-            DEFAULT_OUTGOING_CAP,
-            DEFAULT_OUTGOING_BYTES_CAP,
+            mux::DEFAULT_MAX_CONNS,
+            mux::DEFAULT_OUTGOING_CAP,
+            mux::DEFAULT_OUTGOING_BYTES_CAP,
         )
     }
 
-    pub fn mutual_with_limits<H: Handler<DOMAIN>>(
+    pub fn mutual_with_limits<H: mux::Handler<DOMAIN>>(
         handler: H,
-        signing_key: SigningKey,
+        signing_key: sig::SigningKey,
         server_config: conn::config::Options,
         authentication: conn::server::Authentication<V>,
         max_conns: usize,
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
-    ) -> Result<Mux<H, conn::server::Mutual<NoGuard, V>, DOMAIN>, ConnectFailure> {
+    ) -> Result<
+        mux::Mux<H, conn::server::Mutual<shin::server::config::NoGuard, V>, DOMAIN>,
+        crate::ConnectFailure,
+    > {
         Self::build(
             handler,
             signing_key,
@@ -241,34 +249,34 @@ where
 impl<G, V, const DOMAIN: u8> Server<conn::server::Mutual<G, V>, DOMAIN>
 where
     G: conn::server::ReplayGuard + 'static,
-    V: ClientCertVerifier + 'static,
+    V: shin::server::config::ClientCertVerifier + 'static,
 {
-    pub fn mutual_with_early_data_guard<H: Handler<DOMAIN>>(
+    pub fn mutual_with_early_data_guard<H: mux::Handler<DOMAIN>>(
         handler: H,
-        signing_key: SigningKey,
+        signing_key: sig::SigningKey,
         server_config: conn::config::Options,
         authentication: conn::server::Authentication<V, G>,
-    ) -> Result<Mux<H, conn::server::Mutual<G, V>, DOMAIN>, ConnectFailure> {
+    ) -> Result<mux::Mux<H, conn::server::Mutual<G, V>, DOMAIN>, crate::ConnectFailure> {
         Self::mutual_with_early_data_guard_and_limits(
             handler,
             signing_key,
             server_config,
             authentication,
-            DEFAULT_MAX_CONNS,
-            DEFAULT_OUTGOING_CAP,
-            DEFAULT_OUTGOING_BYTES_CAP,
+            mux::DEFAULT_MAX_CONNS,
+            mux::DEFAULT_OUTGOING_CAP,
+            mux::DEFAULT_OUTGOING_BYTES_CAP,
         )
     }
 
-    pub fn mutual_with_early_data_guard_and_limits<H: Handler<DOMAIN>>(
+    pub fn mutual_with_early_data_guard_and_limits<H: mux::Handler<DOMAIN>>(
         handler: H,
-        signing_key: SigningKey,
+        signing_key: sig::SigningKey,
         server_config: conn::config::Options,
         authentication: conn::server::Authentication<V, G>,
         max_conns: usize,
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
-    ) -> Result<Mux<H, conn::server::Mutual<G, V>, DOMAIN>, ConnectFailure> {
+    ) -> Result<mux::Mux<H, conn::server::Mutual<G, V>, DOMAIN>, crate::ConnectFailure> {
         Self::build(
             handler,
             signing_key,
@@ -290,18 +298,18 @@ impl<P: conn::server::Policy, const DOMAIN: u8> Server<P, DOMAIN> {
         max_conns: usize,
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
-    ) -> Result<PooledRouter<'tls, H, P, DOMAIN, B>, ConnectFailure>
+    ) -> Result<mux::PooledRouter<'tls, H, P, DOMAIN, B>, crate::ConnectFailure>
     where
-        H: Handler<DOMAIN, B>,
-        B: ReceiveBuffer,
+        H: mux::Handler<DOMAIN, B>,
+        B: stream::ReceiveBuffer,
     {
         if pool.capacities().3 != crate::transport_params::Params::MAX_ENCODED_LEN
             || !pool.matches_shard(shard)
         {
-            return Err(ConnectFailure::InvalidConfig);
+            return Err(crate::ConnectFailure::InvalidConfig);
         }
-        let server_config = Validated::new_pooled_server(server_config)?;
-        let server = ServerRuntime::pooled(server_config, shard, pool);
+        let server_config = crate::conn::config::Validated::new_pooled_server(server_config)?;
+        let server = mux::ServerRuntime::pooled(server_config, shard, pool);
         construct_inner(
             handler,
             Some(server),
@@ -311,33 +319,33 @@ impl<P: conn::server::Policy, const DOMAIN: u8> Server<P, DOMAIN> {
         )
     }
 
-    pub fn with_policy<H: Handler<DOMAIN>>(
+    pub fn with_policy<H: mux::Handler<DOMAIN>>(
         handler: H,
-        signing_key: SigningKey,
+        signing_key: sig::SigningKey,
         server_config: conn::config::Options,
         policy_setup: P::Setup,
-    ) -> Result<Mux<H, P, DOMAIN>, ConnectFailure> {
+    ) -> Result<mux::Mux<H, P, DOMAIN>, crate::ConnectFailure> {
         Self::with_policy_and_limits(
             handler,
             signing_key,
             server_config,
             policy_setup,
-            DEFAULT_MAX_CONNS,
-            DEFAULT_OUTGOING_CAP,
-            DEFAULT_OUTGOING_BYTES_CAP,
+            mux::DEFAULT_MAX_CONNS,
+            mux::DEFAULT_OUTGOING_CAP,
+            mux::DEFAULT_OUTGOING_BYTES_CAP,
         )
     }
 
-    pub fn with_policy_and_limits<H: Handler<DOMAIN>>(
+    pub fn with_policy_and_limits<H: mux::Handler<DOMAIN>>(
         handler: H,
-        signing_key: SigningKey,
+        signing_key: sig::SigningKey,
         server_config: conn::config::Options,
         policy_setup: P::Setup,
         max_conns: usize,
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
-    ) -> Result<Mux<H, P, DOMAIN>, ConnectFailure> {
-        let server_config = Validated::new(server_config)?;
+    ) -> Result<mux::Mux<H, P, DOMAIN>, crate::ConnectFailure> {
+        let server_config = crate::conn::config::Validated::new(server_config)?;
         Self::build_validated(
             handler,
             signing_key,
@@ -349,16 +357,16 @@ impl<P: conn::server::Policy, const DOMAIN: u8> Server<P, DOMAIN> {
         )
     }
 
-    pub(crate) fn build<H: Handler<DOMAIN>>(
+    pub(crate) fn build<H: mux::Handler<DOMAIN>>(
         handler: H,
-        signing_key: SigningKey,
+        signing_key: sig::SigningKey,
         server_config: conn::config::Options,
         policy_setup: P::Setup,
         max_conns: usize,
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
-    ) -> Result<Mux<H, P, DOMAIN>, ConnectFailure> {
-        let server_config = Validated::new(server_config)?;
+    ) -> Result<mux::Mux<H, P, DOMAIN>, crate::ConnectFailure> {
+        let server_config = crate::conn::config::Validated::new(server_config)?;
         Self::build_validated(
             handler,
             signing_key,
@@ -372,21 +380,21 @@ impl<P: conn::server::Policy, const DOMAIN: u8> Server<P, DOMAIN> {
 
     pub(crate) fn build_validated<H, B>(
         handler: H,
-        signing_key: SigningKey,
-        mut server_config: Validated,
+        signing_key: sig::SigningKey,
+        mut server_config: crate::conn::config::Validated,
         policy_setup: P::Setup,
         max_conns: usize,
         outgoing_capacity: usize,
         outgoing_bytes_capacity: usize,
-    ) -> Result<Mux<H, P, DOMAIN, B>, ConnectFailure>
+    ) -> Result<mux::Mux<H, P, DOMAIN, B>, crate::ConnectFailure>
     where
-        H: Handler<DOMAIN, B>,
-        B: ReceiveBuffer,
+        H: mux::Handler<DOMAIN, B>,
+        B: stream::ReceiveBuffer,
     {
         let shard_config = server_config.take_server_config(signing_key)?;
-        let shard =
-            P::build::<DOMAIN>(shard_config, policy_setup).map_err(|_| ConnectFailure::Tls)?;
-        let server = ServerRuntime::new(server_config, shard);
+        let shard = P::build::<DOMAIN>(shard_config, policy_setup)
+            .map_err(|_| crate::ConnectFailure::Tls)?;
+        let server = mux::ServerRuntime::new(server_config, shard);
         construct(
             handler,
             Some(server),
@@ -402,7 +410,7 @@ pub(super) fn is_initial(wire: &[u8]) -> bool {
 }
 
 pub(super) fn stateless_reset_into(out: &mut Vec<u8>, token: [u8; 16], len: usize) -> bool {
-    use ring::rand::{SecureRandom, SystemRandom};
+    use ring::rand::SystemRandom;
 
     let len = len.max(22);
     out.clear();
@@ -441,15 +449,15 @@ pub(super) fn connection_ceiling(
     max_packet_bytes(config).min(outgoing_capacity)
 }
 
-fn construct<H, P, const DOMAIN: u8, B: ReceiveBuffer>(
+fn construct<H, P, const DOMAIN: u8, B: stream::ReceiveBuffer>(
     handler: H,
-    server: Option<ServerRuntime<'static, P, DOMAIN>>,
+    server: Option<mux::ServerRuntime<'static, P, DOMAIN>>,
     max_conns: usize,
     outgoing_capacity: usize,
     outgoing_bytes_capacity: usize,
-) -> Result<Mux<H, P, DOMAIN, B>, ConnectFailure>
+) -> Result<mux::Mux<H, P, DOMAIN, B>, crate::ConnectFailure>
 where
-    H: Handler<DOMAIN, B>,
+    H: mux::Handler<DOMAIN, B>,
     P: conn::server::Policy,
 {
     construct_inner(
@@ -461,25 +469,25 @@ where
     )
 }
 
-fn construct_inner<'tls, H, P, const DOMAIN: u8, B: ReceiveBuffer>(
+fn construct_inner<'tls, H, P, const DOMAIN: u8, B: stream::ReceiveBuffer>(
     handler: H,
-    server: Option<ServerRuntime<'tls, P, DOMAIN>>,
+    server: Option<mux::ServerRuntime<'tls, P, DOMAIN>>,
     max_conns: usize,
     outgoing_capacity: usize,
     outgoing_bytes_capacity: usize,
-) -> Result<PooledRouter<'tls, H, P, DOMAIN, B>, ConnectFailure>
+) -> Result<mux::PooledRouter<'tls, H, P, DOMAIN, B>, crate::ConnectFailure>
 where
-    H: Handler<DOMAIN, B>,
+    H: mux::Handler<DOMAIN, B>,
     P: conn::server::Policy,
 {
     if max_conns == 0
-        || max_conns > MAX_CONNECTIONS
+        || max_conns > crate::mux::MAX_CONNECTIONS
         || outgoing_capacity == 0
-        || outgoing_capacity > MAX_OUTGOING_CAPACITY
+        || outgoing_capacity > crate::mux::MAX_OUTGOING_CAPACITY
         || outgoing_bytes_capacity == 0
-        || outgoing_bytes_capacity > MAX_OUTGOING_BYTES
+        || outgoing_bytes_capacity > crate::mux::MAX_OUTGOING_BYTES
     {
-        return Err(ConnectFailure::InvalidConfig);
+        return Err(crate::ConnectFailure::InvalidConfig);
     }
     Ok(super::Router {
         registry: routing::registry::Registry::new(max_conns),

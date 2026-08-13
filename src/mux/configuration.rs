@@ -1,25 +1,31 @@
 use std::io;
 
 use dope::manifold::datagram;
-use shin::crypto::ticket::Keys;
+use shin::crypto::ticket;
 
 use crate::conn;
-use crate::stream::ReceiveBuffer;
+use crate::stream;
 
-use super::{Handler, MAX_CONNECTIONS, Router};
+use crate::mux;
 
-pub struct Control<'a, 'tls, H, P, const DOMAIN: u8, B: ReceiveBuffer = Vec<u8>>
+pub struct Control<'a, 'tls, H, P, const DOMAIN: u8, B: stream::ReceiveBuffer = Vec<u8>>
 where
-    H: Handler<DOMAIN, B>,
+    H: mux::Handler<DOMAIN, B>,
     P: conn::server::Policy,
 {
-    mux: &'a mut Router<'tls, H, P, DOMAIN, B>,
+    mux: &'a mut mux::Router<'tls, H, P, DOMAIN, B>,
 }
 
-impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8, B: ReceiveBuffer>
-    Control<'a, 'tls, H, P, DOMAIN, B>
+impl<
+    'a,
+    'tls,
+    H: mux::Handler<DOMAIN, B>,
+    P: conn::server::Policy,
+    const DOMAIN: u8,
+    B: stream::ReceiveBuffer,
+> Control<'a, 'tls, H, P, DOMAIN, B>
 {
-    pub(super) fn new(mux: &'a mut Router<'tls, H, P, DOMAIN, B>) -> Self {
+    pub(super) fn new(mux: &'a mut mux::Router<'tls, H, P, DOMAIN, B>) -> Self {
         Self { mux }
     }
 
@@ -47,7 +53,7 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
         if self.mux.lifecycle.shutting_down
             || self.mux.registry.active_conns != 0
             || max == 0
-            || max > MAX_CONNECTIONS
+            || max > crate::mux::MAX_CONNECTIONS
         {
             return false;
         }
@@ -55,7 +61,7 @@ impl<'a, 'tls, H: Handler<DOMAIN, B>, P: conn::server::Policy, const DOMAIN: u8,
         true
     }
 
-    pub fn replace_ticket_keys(&mut self, keys: Option<Keys>) -> bool {
+    pub fn replace_ticket_keys(&mut self, keys: Option<ticket::Keys>) -> bool {
         let Some(server) = self.mux.server.as_mut() else {
             return false;
         };

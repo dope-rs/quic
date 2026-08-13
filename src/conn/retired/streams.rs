@@ -1,6 +1,6 @@
 use super::remove::Remove as _;
-use super::storage::Interval;
-use super::{Full, Tree};
+
+use crate::conn::retired;
 
 struct Retire<'a, Tag> {
     sequence: &'a mut Sequence<Tag>,
@@ -8,7 +8,7 @@ struct Retire<'a, Tag> {
 }
 
 impl<Tag> Retire<'_, Tag> {
-    fn commit(self) -> Result<bool, Full> {
+    fn commit(self) -> Result<bool, retired::Full> {
         let sequence = self.sequence;
         let index = self.index;
         if index < sequence.contiguous {
@@ -40,7 +40,7 @@ impl<Tag> Retire<'_, Tag> {
             }
             (Some(_), _, true, false) => neighbors.extend_left(index + 1),
             (_, Some(_), false, true) => neighbors.extend_right(index),
-            _ => neighbors.insert(Interval {
+            _ => neighbors.insert(crate::conn::retired::storage::Interval {
                 start: index,
                 end: index + 1,
             })?,
@@ -53,7 +53,7 @@ impl<Tag> Retire<'_, Tag> {
 /// every structural index inside the exclusive mutation that produced it.
 pub(super) struct Sequence<Tag> {
     pub(super) contiguous: u64,
-    pub(super) ranges: Tree<Tag>,
+    pub(super) ranges: retired::Tree<Tag>,
 }
 
 impl<Tag> Sequence<Tag> {
@@ -63,11 +63,11 @@ impl<Tag> Sequence<Tag> {
             // The contiguous frontier consumes the leading retired run. Every
             // remaining interval therefore needs a distinct live hole before
             // it, so interval count cannot exceed simultaneous live streams.
-            ranges: Tree::new(live_capacity),
+            ranges: retired::Tree::new(live_capacity),
         }
     }
 
-    pub(super) fn retire(&mut self, index: u64) -> Result<bool, Full> {
+    pub(super) fn retire(&mut self, index: u64) -> Result<bool, retired::Full> {
         Retire {
             sequence: self,
             index,
@@ -108,7 +108,11 @@ impl Streams {
         }
     }
 
-    pub(in crate::conn) fn retire_recv(&mut self, id: u64, is_client: bool) -> Result<bool, Full> {
+    pub(in crate::conn) fn retire_recv(
+        &mut self,
+        id: u64,
+        is_client: bool,
+    ) -> Result<bool, retired::Full> {
         let uni = id & 0x2 != 0;
         let local = (id & 0x1 == 0) == is_client;
         match (local, uni) {
@@ -130,7 +134,10 @@ impl Streams {
         }
     }
 
-    pub(in crate::conn) fn retire_peer_bidi_send(&mut self, id: u64) -> Result<bool, Full> {
+    pub(in crate::conn) fn retire_peer_bidi_send(
+        &mut self,
+        id: u64,
+    ) -> Result<bool, retired::Full> {
         self.peer_bidi_send.retire(id >> 2)
     }
 
