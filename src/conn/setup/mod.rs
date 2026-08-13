@@ -96,7 +96,7 @@ impl<const DOMAIN: u8> Client<DOMAIN> {
             .handshake
             .start_client()
             .map_err(|_| errors::ConnectFailure::Tls)?;
-        conn::handshake::apply_outcome(outcome, &mut connection);
+        outcome.apply(&mut connection);
         Ok(connection)
     }
 }

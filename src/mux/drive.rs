@@ -4,6 +4,7 @@ use std::time;
 use dope::core::driver::schedule;
 
 use crate::conn;
+use crate::conn::transmit::eligibility::Eligibility;
 
 use crate::stream;
 
@@ -165,9 +166,7 @@ impl<
                 .entries
                 .get(idx)
                 .and_then(crate::mux::Entry::slot)
-                .is_some_and(|slot| {
-                    crate::conn::transmit::eligibility::has_pending_output(&slot.conn)
-                });
+                .is_some_and(|slot| Eligibility::new(&slot.conn).has_pending_output());
             if pending && produced {
                 mux::FlushRound::More
             } else if pending {
@@ -223,9 +222,7 @@ impl<
                 .entries
                 .get(idx)
                 .and_then(crate::mux::Entry::slot)
-                .is_some_and(|slot| {
-                    crate::conn::transmit::eligibility::has_pending_output(&slot.conn)
-                });
+                .is_some_and(|slot| Eligibility::new(&slot.conn).has_pending_output());
             if pending && packets_left != packet_limit {
                 mux::FlushRound::More
             } else if pending {

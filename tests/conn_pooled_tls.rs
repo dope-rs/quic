@@ -79,7 +79,7 @@ fn pooled_authority_rejects_connection_local_tls_configuration() {
         ticket_keys: None,
     })
     .unwrap();
-    let server_pool = tls::server_pool(&shard, 1).unwrap();
+    let server_pool = tls::ServerPool::new(&shard, 1).unwrap();
     let client_pool = tls::ClientPool::new(server_pubkey, Vec::new(), false, None, 1).unwrap();
 
     let mut client_options = options();
@@ -140,7 +140,7 @@ fn one_slot_tls_pools_recycle_after_handshake_while_connections_stay_live() {
         ticket_keys: None,
     })
     .unwrap();
-    let server_pool = tls::server_pool(&shard, 1).unwrap();
+    let server_pool = tls::ServerPool::new(&shard, 1).unwrap();
     let client_pool = tls::ClientPool::new(server_pubkey, Vec::new(), false, None, 1).unwrap();
 
     assert_eq!(client_pool.capacity_profile().0, 0);

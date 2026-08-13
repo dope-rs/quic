@@ -49,7 +49,7 @@ impl<
                 server_config.require_address_validation,
                 server_config.retry_token_secret,
                 server_config.cid_prefix,
-                crate::mux::setup::max_packet_bytes(server_config),
+                server_config.max_packet_bytes(),
             )
         };
         if !require_address_validation {
@@ -124,13 +124,15 @@ impl<
             return false;
         };
         let secret = crate::secrets::StatelessResetSecret(reset_secret);
-        let Some(dcid) = crate::mux::setup::dcid(trigger, mux::ROUTED_CID_LEN) else {
+        let trigger = crate::mux::setup::RoutedPacket::new(trigger);
+        let Some(dcid) = trigger.dcid(mux::ROUTED_CID_LEN) else {
             return false;
         };
         if trigger.len() < 23 {
             return false;
         }
-        let packet_ceiling = crate::mux::setup::max_packet_bytes(server_config)
+        let packet_ceiling = server_config
+            .max_packet_bytes()
             .min(self.outgoing.bytes_capacity)
             .min(trigger.len().saturating_mul(3));
         if packet_ceiling < 22 {
@@ -143,7 +145,7 @@ impl<
         let Some(mut reset) = self.take_packet_buffer(len) else {
             return false;
         };
-        if !crate::mux::setup::stateless_reset_into(&mut reset, secret.token_for(dcid), len) {
+        if !crate::mux::setup::ResetPacket::new(&mut reset).write(secret.token_for(dcid), len) {
             self.recycle_packet(reset);
             return false;
         }

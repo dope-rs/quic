@@ -8,6 +8,7 @@ use std::time;
 use crate::conn;
 use crate::conn::path;
 use crate::conn::session;
+use crate::conn::transmit::eligibility::Eligibility;
 use crate::packet;
 
 use crate::stream;
@@ -113,8 +114,7 @@ impl<
             .gen_cid(cid_prefix)
             .ok_or(conn::Error::ConnectionIdLimit)?;
         let client_initial_dcid = initial_dcid;
-        let max_packet_bytes =
-            super::setup::connection_ceiling(&server_config, self.outgoing.bytes_capacity);
+        let max_packet_bytes = server_config.connection_ceiling(self.outgoing.bytes_capacity);
         if max_packet_bytes < crate::pmtud::BASE_PMTU as usize {
             return Err(conn::Error::PacketCeiling);
         }
@@ -429,9 +429,7 @@ impl<
             return Some(now);
         }
         let mut deadline = slot.conn.status().next_timer();
-        if !flush_linked
-            && let Some(send) = crate::conn::transmit::eligibility::send_deadline(&slot.conn, now)
-        {
+        if !flush_linked && let Some(send) = Eligibility::new(&slot.conn).send_deadline(now) {
             deadline = Some(deadline.map_or(send, |timer| timer.min(send)));
         }
         deadline

@@ -7,28 +7,41 @@ use crate::transport_params;
 use std::ops;
 use std::time;
 
-pub type ServerPool<
-    V = shin::server::config::NoClientAuth,
+pub struct ServerPool<
+    V: shin::server::config::ClientCertVerifier = shin::server::config::NoClientAuth,
     const DOMAIN: u8 = 0,
-    G = shin::server::config::NoGuard,
-> = shin::server::workspace::QuicPool<fn() -> u64, V, DOMAIN, G>;
+    G: shin::server::config::EarlyDataGuard = shin::server::config::NoGuard,
+>(shin::server::workspace::QuicPool<fn() -> u64, V, DOMAIN, G>);
 
-/// Builds the only server TLS pool shape accepted by QUIC: framed handshake
-/// storage plus the exact maximum encoded transport-parameter reservation.
-pub fn server_pool<G, V, const DOMAIN: u8>(
-    shard: &shin::server::Shard<G, V, DOMAIN>,
-    capacity: usize,
-) -> Result<ServerPool<V, DOMAIN, G>, errors::ConnectFailure>
+impl<G, V, const DOMAIN: u8> ServerPool<V, DOMAIN, G>
 where
     G: shin::server::config::EarlyDataGuard,
     V: shin::server::config::ClientCertVerifier,
 {
-    let capacity =
-        slab::Capacity::try_from(capacity).map_err(|_| errors::ConnectFailure::InvalidConfig)?;
-    let profile = shard
-        .quic_profile(transport_params::Params::MAX_ENCODED_LEN)
-        .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
-    Ok(profile.into_pool::<fn() -> u64>(capacity))
+    /// Builds framed storage with the exact transport-parameter reservation.
+    pub fn new(
+        shard: &shin::server::Shard<G, V, DOMAIN>,
+        capacity: usize,
+    ) -> Result<Self, errors::ConnectFailure> {
+        let capacity = slab::Capacity::try_from(capacity)
+            .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
+        let profile = shard
+            .quic_profile(transport_params::Params::MAX_ENCODED_LEN)
+            .map_err(|_| errors::ConnectFailure::InvalidConfig)?;
+        Ok(Self(profile.into_pool::<fn() -> u64>(capacity)))
+    }
+}
+
+impl<G, V, const DOMAIN: u8> ops::Deref for ServerPool<V, DOMAIN, G>
+where
+    G: shin::server::config::EarlyDataGuard,
+    V: shin::server::config::ClientCertVerifier,
+{
+    type Target = shin::server::workspace::QuicPool<fn() -> u64, V, DOMAIN, G>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 /// Exact, externally owned TLS storage for one QUIC client authority.

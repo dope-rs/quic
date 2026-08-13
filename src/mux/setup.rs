@@ -409,48 +409,61 @@ impl<P: conn::server::Policy, const DOMAIN: u8> Server<P, DOMAIN> {
     }
 }
 
-pub(super) fn is_initial(wire: &[u8]) -> bool {
-    matches!(wire.first(), Some(&byte) if (byte & 0xb0) == 0x80)
+pub(super) struct RoutedPacket<'wire> {
+    wire: &'wire [u8],
 }
 
-pub(super) fn stateless_reset_into(out: &mut Vec<u8>, token: [u8; 16], len: usize) -> bool {
-    use ring::rand::SystemRandom;
-
-    let len = len.max(22);
-    out.clear();
-    if out.try_reserve_exact(len).is_err() {
-        return false;
+impl<'wire> RoutedPacket<'wire> {
+    pub(super) fn new(wire: &'wire [u8]) -> Self {
+        Self { wire }
     }
-    out.resize(len, 0);
-    if SystemRandom::new().fill(out).is_err() {
-        out.clear();
-        return false;
-    }
-    out[0] = (out[0] & 0x3f) | 0x40;
-    let tail = len - 16;
-    out[tail..].copy_from_slice(&token);
-    true
-}
 
-pub(super) fn dcid(wire: &[u8], short_header_dcid_len: usize) -> Option<&[u8]> {
-    let first = *wire.first()?;
-    if first & 0x80 != 0 {
-        let dcid_len = usize::from(*wire.get(5)?);
-        wire.get(6..6usize.checked_add(dcid_len)?)
-    } else {
-        wire.get(1..1usize.checked_add(short_header_dcid_len)?)
+    pub(super) fn is_initial(&self) -> bool {
+        matches!(self.wire.first(), Some(&byte) if (byte & 0xb0) == 0x80)
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.wire.len()
+    }
+
+    pub(super) fn dcid(&self, short_header_dcid_len: usize) -> Option<&'wire [u8]> {
+        let first = *self.wire.first()?;
+        if first & 0x80 != 0 {
+            let dcid_len = usize::from(*self.wire.get(5)?);
+            self.wire.get(6..6usize.checked_add(dcid_len)?)
+        } else {
+            self.wire.get(1..1usize.checked_add(short_header_dcid_len)?)
+        }
     }
 }
 
-pub(super) fn max_packet_bytes(config: &conn::config::Options) -> usize {
-    config.max_pmtu as usize
+pub(super) struct ResetPacket<'packet> {
+    out: &'packet mut Vec<u8>,
 }
 
-pub(super) fn connection_ceiling(
-    config: &conn::config::Options,
-    outgoing_capacity: usize,
-) -> usize {
-    max_packet_bytes(config).min(outgoing_capacity)
+impl<'packet> ResetPacket<'packet> {
+    pub(super) fn new(out: &'packet mut Vec<u8>) -> Self {
+        Self { out }
+    }
+
+    pub(super) fn write(&mut self, token: [u8; 16], len: usize) -> bool {
+        use ring::rand::SystemRandom;
+
+        let len = len.max(22);
+        self.out.clear();
+        if self.out.try_reserve_exact(len).is_err() {
+            return false;
+        }
+        self.out.resize(len, 0);
+        if SystemRandom::new().fill(self.out).is_err() {
+            self.out.clear();
+            return false;
+        }
+        self.out[0] = (self.out[0] & 0x3f) | 0x40;
+        let tail = len - 16;
+        self.out[tail..].copy_from_slice(&token);
+        true
+    }
 }
 
 fn construct<H, P, const DOMAIN: u8, B: stream::ReceiveBuffer>(

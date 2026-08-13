@@ -45,12 +45,14 @@ pub(super) trait Transition {
     fn close(&mut self);
 }
 
-pub(super) fn apply_outcome(outcome: Outcome, transition: &mut impl Transition) {
-    if outcome.reject_early_data {
-        transition.reject_early_data();
-    }
-    if outcome.done && transition.establish().is_err() {
-        transition.close();
+impl Outcome {
+    pub(super) fn apply(self, transition: &mut impl Transition) {
+        if self.reject_early_data {
+            transition.reject_early_data();
+        }
+        if self.done && transition.establish().is_err() {
+            transition.close();
+        }
     }
 }
 

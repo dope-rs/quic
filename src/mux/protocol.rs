@@ -63,8 +63,7 @@ impl<
             return Err(crate::errors::ConnectFailure::Capacity);
         }
         client_config.validate()?;
-        let max_packet_bytes =
-            super::setup::connection_ceiling(&client_config, self.mux.outgoing.bytes_capacity);
+        let max_packet_bytes = client_config.connection_ceiling(self.mux.outgoing.bytes_capacity);
         if max_packet_bytes < pmtud::BASE_PMTU as usize {
             return Err(crate::errors::ConnectFailure::InvalidConfig);
         }
@@ -131,8 +130,7 @@ impl<
             return Err(crate::errors::ConnectFailure::Capacity);
         }
         client_config.validate()?;
-        let max_packet_bytes =
-            super::setup::connection_ceiling(&client_config, self.mux.outgoing.bytes_capacity);
+        let max_packet_bytes = client_config.connection_ceiling(self.mux.outgoing.bytes_capacity);
         if max_packet_bytes < pmtud::BASE_PMTU as usize {
             return Err(crate::errors::ConnectFailure::InvalidConfig);
         }
@@ -187,10 +185,11 @@ impl<
         if self.mux.lifecycle.shutting_down {
             return Ok(());
         }
-        let dcid = super::setup::dcid(data, super::ROUTED_CID_LEN);
+        let packet = super::setup::RoutedPacket::new(data);
+        let dcid = packet.dcid(super::ROUTED_CID_LEN);
         let routed = match dcid.and_then(|value| self.mux.find_cid(value)) {
             Some(routed) => routed,
-            None if super::setup::is_initial(data) && self.mux.server.is_some() => {
+            None if packet.is_initial() && self.mux.server.is_some() => {
                 if self.mux.registry.active_conns >= self.mux.registry.max_conns {
                     return Ok(());
                 }
@@ -337,10 +336,11 @@ where
         if self.mux.lifecycle.shutting_down {
             return Ok(());
         }
-        let dcid = super::setup::dcid(packet.as_ref(), super::ROUTED_CID_LEN);
+        let routed_packet = super::setup::RoutedPacket::new(packet.as_ref());
+        let dcid = routed_packet.dcid(super::ROUTED_CID_LEN);
         let routed = match dcid.and_then(|value| self.mux.find_cid(value)) {
             Some(routed) => routed,
-            None if super::setup::is_initial(packet.as_ref()) && self.mux.server.is_some() => {
+            None if routed_packet.is_initial() && self.mux.server.is_some() => {
                 if self.mux.registry.active_conns >= self.mux.registry.max_conns {
                     return Ok(());
                 }

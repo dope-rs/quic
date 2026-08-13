@@ -522,7 +522,7 @@ where
                 let outcome = tls
                     .start(&mut conn.handshake)
                     .map_err(|_| errors::ConnectFailure::Tls)?;
-                conn::handshake::apply_outcome(outcome, &mut conn);
+                outcome.apply(&mut conn);
                 Built::ClientPooled {
                     connection: conn,
                     tls,

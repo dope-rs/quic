@@ -107,6 +107,14 @@ impl Default for Options {
 }
 
 impl Options {
+    pub(crate) fn max_packet_bytes(&self) -> usize {
+        self.max_pmtu as usize
+    }
+
+    pub(crate) fn connection_ceiling(&self, outgoing_capacity: usize) -> usize {
+        self.max_packet_bytes().min(outgoing_capacity)
+    }
+
     pub fn validate(&self) -> Result<(), errors::ConnectFailure> {
         let indexed = [
             self.packet_journal_capacity,
