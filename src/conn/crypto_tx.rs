@@ -53,65 +53,84 @@ struct Slot {
     entry: Option<Entry>,
 }
 
-struct Space {
+struct ByteStore {
     bytes: Vec<u8>,
     limit: usize,
+}
+
+struct Offsets {
     stored_offset: u64,
     reclaim_offset: u64,
     next_unsent: u64,
+}
+
+struct Queues {
     ready: u32,
     in_flight: Chain,
     order: Chain,
     probe_cursor: u32,
 }
 
+struct Space {
+    store: ByteStore,
+    offsets: Offsets,
+    queues: Queues,
+}
+
 impl Space {
     fn new(capacity: usize, limit: usize) -> Self {
         Self {
-            bytes: Vec::with_capacity(capacity),
-            limit,
-            stored_offset: 0,
-            reclaim_offset: 0,
-            next_unsent: 0,
-            ready: NONE,
-            in_flight: Chain::EMPTY,
-            order: Chain::EMPTY,
-            probe_cursor: NONE,
+            store: ByteStore {
+                bytes: Vec::with_capacity(capacity),
+                limit,
+            },
+            offsets: Offsets {
+                stored_offset: 0,
+                reclaim_offset: 0,
+                next_unsent: 0,
+            },
+            queues: Queues {
+                ready: NONE,
+                in_flight: Chain::EMPTY,
+                order: Chain::EMPTY,
+                probe_cursor: NONE,
+            },
         }
     }
 
     fn end_offset(&self) -> Option<u64> {
-        self.stored_offset
-            .checked_add(u64::try_from(self.bytes.len()).ok()?)
+        self.offsets
+            .stored_offset
+            .checked_add(u64::try_from(self.store.bytes.len()).ok()?)
     }
 
     fn index(&self, offset: u64) -> Option<usize> {
-        usize::try_from(offset.checked_sub(self.stored_offset)?).ok()
+        usize::try_from(offset.checked_sub(self.offsets.stored_offset)?).ok()
     }
 
     fn prepare_append(&mut self, maximum: usize) {
-        if self.limit.saturating_sub(self.bytes.len()) < maximum {
+        if self.store.limit.saturating_sub(self.store.bytes.len()) < maximum {
             self.compact();
         }
     }
 
     fn compact(&mut self) {
-        let Some(prefix) = self.index(self.reclaim_offset) else {
+        let Some(prefix) = self.index(self.offsets.reclaim_offset) else {
             return;
         };
         if prefix == 0 {
             return;
         }
-        self.bytes.copy_within(prefix.., 0);
-        self.bytes.truncate(self.bytes.len() - prefix);
-        self.stored_offset = self.reclaim_offset;
+        self.store.bytes.copy_within(prefix.., 0);
+        self.store.bytes.truncate(self.store.bytes.len() - prefix);
+        self.offsets.stored_offset = self.offsets.reclaim_offset;
     }
 
     fn reclaim_to(&mut self, offset: u64) {
-        self.reclaim_offset = offset;
+        self.offsets.reclaim_offset = offset;
         if self.end_offset() == Some(offset) {
-            self.bytes.clear();
-            self.stored_offset = offset;
+            self.store.bytes.clear();
+            self.offsets.stored_offset = offset;
         }
     }
 }
@@ -158,49 +177,51 @@ impl Tx {
         epoch: conn::Epoch,
     ) -> Result<connection::OutboundFlight<'_>, conn::Error> {
         let space = &mut self.spaces[epoch as usize];
-        if space.bytes.is_empty()
-            && space.bytes.capacity() < space.limit
-            && self.spare.capacity() >= space.limit
+        if space.store.bytes.is_empty()
+            && space.store.bytes.capacity() < space.store.limit
+            && self.spare.capacity() >= space.store.limit
         {
-            mem::swap(&mut space.bytes, &mut self.spare);
+            mem::swap(&mut space.store.bytes, &mut self.spare);
         }
         space.compact();
         let maximum = space
+            .store
             .limit
-            .checked_sub(space.bytes.len())
+            .checked_sub(space.store.bytes.len())
             .ok_or(conn::Error::EventCapacity)?;
-        connection::OutboundFlight::from_reserved(&mut space.bytes, maximum)
+        connection::OutboundFlight::from_reserved(&mut space.store.bytes, maximum)
             .ok_or(conn::Error::EventCapacity)
     }
 
     pub(super) fn append(&mut self, epoch: conn::Epoch, data: &[u8]) -> Result<(), conn::Error> {
         let space = &mut self.spaces[epoch as usize];
-        if space.bytes.is_empty()
-            && space.bytes.capacity() < space.limit
-            && self.spare.capacity() >= space.limit
+        if space.store.bytes.is_empty()
+            && space.store.bytes.capacity() < space.store.limit
+            && self.spare.capacity() >= space.store.limit
         {
-            mem::swap(&mut space.bytes, &mut self.spare);
+            mem::swap(&mut space.store.bytes, &mut self.spare);
         }
         space.prepare_append(data.len());
         let end = space
+            .store
             .bytes
             .len()
             .checked_add(data.len())
-            .filter(|end| *end <= space.limit)
+            .filter(|end| *end <= space.store.limit)
             .ok_or(conn::Error::EventCapacity)?;
-        if end > space.bytes.capacity() {
+        if end > space.store.bytes.capacity() {
             return Err(conn::Error::EventCapacity);
         }
-        space.bytes.extend_from_slice(data);
+        space.store.bytes.extend_from_slice(data);
         Ok(())
     }
 
     pub(super) fn has_sendable(&self, epoch: conn::Epoch) -> bool {
         let space = &self.spaces[epoch as usize];
-        space.ready != NONE
+        space.queues.ready != NONE
             || space
                 .end_offset()
-                .is_some_and(|end| space.next_unsent < end)
+                .is_some_and(|end| space.offsets.next_unsent < end)
     }
 
     pub(super) fn has_room(&self, needed: usize) -> bool {
@@ -209,15 +230,16 @@ impl Tx {
 
     pub(super) fn peek(&self, epoch: conn::Epoch) -> Option<delivery::Crypto> {
         let space = &self.spaces[epoch as usize];
-        if space.ready != NONE {
-            return self.slots[space.ready as usize]
+        if space.queues.ready != NONE {
+            return self.slots[space.queues.ready as usize]
                 .entry
                 .as_ref()
                 .map(|entry| entry.record);
         }
-        let len = usize::try_from(space.end_offset()?.checked_sub(space.next_unsent)?).ok()?;
+        let len =
+            usize::try_from(space.end_offset()?.checked_sub(space.offsets.next_unsent)?).ok()?;
         (len != 0).then_some(delivery::Crypto {
-            offset: space.next_unsent,
+            offset: space.offsets.next_unsent,
             len,
         })
     }
@@ -227,14 +249,15 @@ impl Tx {
             return None;
         }
         let space = &self.spaces[epoch as usize];
-        let (handle, offset, available) = if space.ready == NONE {
+        let (handle, offset, available) = if space.queues.ready == NONE {
             (
                 None,
-                space.next_unsent,
-                usize::try_from(space.end_offset()?.checked_sub(space.next_unsent)?).ok()?,
+                space.offsets.next_unsent,
+                usize::try_from(space.end_offset()?.checked_sub(space.offsets.next_unsent)?)
+                    .ok()?,
             )
         } else {
-            let index = space.ready as usize;
+            let index = space.queues.ready as usize;
             let entry = self.slots[index].entry.as_ref()?;
             (self.handle(index), entry.record.offset, entry.record.len)
         };
@@ -244,13 +267,13 @@ impl Tx {
         Some(Selection {
             record: delivery::Crypto { offset, len },
             handle,
-            data: space.bytes.get(start..end)?,
+            data: space.store.bytes.get(start..end)?,
         })
     }
 
     pub(super) fn select_probe(&self, epoch: conn::Epoch, max_len: usize) -> Option<Selection<'_>> {
         let space = &self.spaces[epoch as usize];
-        let current = space.probe_cursor;
+        let current = space.queues.probe_cursor;
         if current == NONE {
             return None;
         }
@@ -264,7 +287,7 @@ impl Tx {
         Some(Selection {
             record: entry.record,
             handle: self.handle(index),
-            data: space.bytes.get(start..end)?,
+            data: space.store.bytes.get(start..end)?,
         })
     }
 
@@ -285,7 +308,7 @@ impl Tx {
             }
             match entry.status {
                 Status::Queued
-                    if self.spaces[epoch as usize].ready == index as u32
+                    if self.spaces[epoch as usize].queues.ready == index as u32
                         && record.len <= entry.record.len =>
                 {
                     let original_len = entry.record.len;
@@ -311,7 +334,7 @@ impl Tx {
                     let next = entry.flight.next;
                     self.slots[index].entry.as_mut().unwrap().status =
                         Status::InFlight { carriers };
-                    self.spaces[epoch as usize].probe_cursor = next;
+                    self.spaces[epoch as usize].queues.probe_cursor = next;
                     return Some(handle);
                 }
                 Status::Queued | Status::InFlight { .. } | Status::Acknowledged => return None,
@@ -319,7 +342,7 @@ impl Tx {
         }
 
         let space = &self.spaces[epoch as usize];
-        if record.offset != space.next_unsent
+        if record.offset != space.offsets.next_unsent
             || record.offset.checked_add(u64::try_from(record.len).ok()?)? > space.end_offset()?
             || !self.has_room(1)
         {
@@ -335,7 +358,7 @@ impl Tx {
             order_next: NONE,
         });
         self.len += 1;
-        self.spaces[epoch as usize].next_unsent =
+        self.spaces[epoch as usize].offsets.next_unsent =
             record.offset.checked_add(u64::try_from(record.len).ok()?)?;
         self.link_order_tail(index);
         self.link_flight(index);
@@ -381,7 +404,7 @@ impl Tx {
 
     pub(super) fn arm_probes(&mut self, epoch: conn::Epoch) {
         let space = &mut self.spaces[epoch as usize];
-        space.probe_cursor = space.in_flight.head;
+        space.queues.probe_cursor = space.queues.in_flight.head;
     }
 
     pub(super) fn discard(&mut self, epoch: conn::Epoch) {
@@ -393,27 +416,27 @@ impl Tx {
     }
 
     pub(super) fn bytes(&self, epoch: conn::Epoch) -> &[u8] {
-        &self.spaces[epoch as usize].bytes
+        &self.spaces[epoch as usize].store.bytes
     }
 
     fn clear_epoch(&mut self, epoch: conn::Epoch, clear_bytes: bool) {
         let space = &mut self.spaces[epoch as usize];
-        space.ready = NONE;
-        space.in_flight = Chain::EMPTY;
-        space.order = Chain::EMPTY;
-        space.probe_cursor = NONE;
+        space.queues.ready = NONE;
+        space.queues.in_flight = Chain::EMPTY;
+        space.queues.order = Chain::EMPTY;
+        space.queues.probe_cursor = NONE;
         if clear_bytes {
-            let end = space.end_offset().unwrap_or(space.stored_offset);
-            let mut released = mem::take(&mut space.bytes);
+            let end = space.end_offset().unwrap_or(space.offsets.stored_offset);
+            let mut released = mem::take(&mut space.store.bytes);
             released.clear();
             if released.capacity() > self.spare.capacity() {
                 mem::swap(&mut released, &mut self.spare);
             }
-            space.stored_offset = end;
-            space.reclaim_offset = end;
-            space.next_unsent = end;
+            space.offsets.stored_offset = end;
+            space.offsets.reclaim_offset = end;
+            space.offsets.next_unsent = end;
         } else {
-            space.next_unsent = space.stored_offset;
+            space.offsets.next_unsent = space.offsets.stored_offset;
         }
         for index in 0..self.slots.len() {
             if self.slots[index]
@@ -449,7 +472,7 @@ impl Tx {
 
     fn reclaim(&mut self, epoch: conn::Epoch) {
         loop {
-            let index = self.spaces[epoch as usize].order.head;
+            let index = self.spaces[epoch as usize].queues.order.head;
             if index == NONE {
                 break;
             }
@@ -526,14 +549,14 @@ impl Tx {
 
     fn link_order_tail(&mut self, index: usize) {
         let epoch = self.slots[index].entry.as_ref().unwrap().epoch as usize;
-        let tail = self.spaces[epoch].order.tail;
+        let tail = self.spaces[epoch].queues.order.tail;
         self.slots[index].entry.as_mut().unwrap().order_next = NONE;
         if tail == NONE {
-            self.spaces[epoch].order.head = index as u32;
+            self.spaces[epoch].queues.order.head = index as u32;
         } else {
             self.slots[tail as usize].entry.as_mut().unwrap().order_next = index as u32;
         }
-        self.spaces[epoch].order.tail = index as u32;
+        self.spaces[epoch].queues.order.tail = index as u32;
     }
 
     fn link_order_after(&mut self, previous: usize, index: usize) {
@@ -542,45 +565,45 @@ impl Tx {
         self.slots[index].entry.as_mut().unwrap().order_next = next;
         self.slots[previous].entry.as_mut().unwrap().order_next = index as u32;
         if next == NONE {
-            self.spaces[epoch].order.tail = index as u32;
+            self.spaces[epoch].queues.order.tail = index as u32;
         }
     }
 
     fn unlink_order_head(&mut self, index: usize) {
         let entry = self.slots[index].entry.as_ref().unwrap();
         let epoch = entry.epoch as usize;
-        debug_assert_eq!(self.spaces[epoch].order.head, index as u32);
+        debug_assert_eq!(self.spaces[epoch].queues.order.head, index as u32);
         let next = entry.order_next;
-        self.spaces[epoch].order.head = next;
+        self.spaces[epoch].queues.order.head = next;
         if next == NONE {
-            self.spaces[epoch].order.tail = NONE;
+            self.spaces[epoch].queues.order.tail = NONE;
         }
         self.slots[index].entry.as_mut().unwrap().order_next = NONE;
     }
 
     fn link_ready(&mut self, index: usize) {
         let epoch = self.slots[index].entry.as_ref().unwrap().epoch as usize;
-        self.slots[index].entry.as_mut().unwrap().ready_next = self.spaces[epoch].ready;
-        self.spaces[epoch].ready = index as u32;
+        self.slots[index].entry.as_mut().unwrap().ready_next = self.spaces[epoch].queues.ready;
+        self.spaces[epoch].queues.ready = index as u32;
     }
 
     fn unlink_ready(&mut self, index: usize) {
         let entry = self.slots[index].entry.as_ref().unwrap();
         let epoch = entry.epoch as usize;
-        debug_assert_eq!(self.spaces[epoch].ready, index as u32);
-        self.spaces[epoch].ready = entry.ready_next;
+        debug_assert_eq!(self.spaces[epoch].queues.ready, index as u32);
+        self.spaces[epoch].queues.ready = entry.ready_next;
         self.slots[index].entry.as_mut().unwrap().ready_next = NONE;
     }
 
     fn link_flight(&mut self, index: usize) {
         let epoch = self.slots[index].entry.as_ref().unwrap().epoch as usize;
-        let tail = self.spaces[epoch].in_flight.tail;
+        let tail = self.spaces[epoch].queues.in_flight.tail;
         self.slots[index].entry.as_mut().unwrap().flight = Links {
             prev: tail,
             next: NONE,
         };
         if tail == NONE {
-            self.spaces[epoch].in_flight.head = index as u32;
+            self.spaces[epoch].queues.in_flight.head = index as u32;
         } else {
             self.slots[tail as usize]
                 .entry
@@ -589,7 +612,7 @@ impl Tx {
                 .flight
                 .next = index as u32;
         }
-        self.spaces[epoch].in_flight.tail = index as u32;
+        self.spaces[epoch].queues.in_flight.tail = index as u32;
     }
 
     fn unlink_flight(&mut self, index: usize) {
@@ -597,7 +620,7 @@ impl Tx {
         let epoch = entry.epoch as usize;
         let links = entry.flight;
         if links.prev == NONE {
-            self.spaces[epoch].in_flight.head = links.next;
+            self.spaces[epoch].queues.in_flight.head = links.next;
         } else {
             self.slots[links.prev as usize]
                 .entry
@@ -607,7 +630,7 @@ impl Tx {
                 .next = links.next;
         }
         if links.next == NONE {
-            self.spaces[epoch].in_flight.tail = links.prev;
+            self.spaces[epoch].queues.in_flight.tail = links.prev;
         } else {
             self.slots[links.next as usize]
                 .entry
@@ -616,8 +639,8 @@ impl Tx {
                 .flight
                 .prev = links.prev;
         }
-        if self.spaces[epoch].probe_cursor == index as u32 {
-            self.spaces[epoch].probe_cursor = links.next;
+        if self.spaces[epoch].queues.probe_cursor == index as u32 {
+            self.spaces[epoch].queues.probe_cursor = links.next;
         }
         self.slots[index].entry.as_mut().unwrap().flight = Links::EMPTY;
     }
