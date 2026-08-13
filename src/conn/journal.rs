@@ -57,8 +57,33 @@ pub(super) struct Packet {
     pub(super) crypto: Option<delivery::Handle<delivery::Crypto>>,
 }
 
-pub(super) type ControlDrain<'a> = arena::StackDrain<'a, delivery::Handle<delivery::Control>>;
-pub(super) type StreamDrain<'a> = arena::StackDrain<'a, delivery::Handle<delivery::Stream>>;
+pub(super) struct ControlDrain<'a>(arena::StackDrain<'a, delivery::Handle<delivery::Control>>);
+
+impl Iterator for ControlDrain<'_> {
+    type Item = delivery::Handle<delivery::Control>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+pub(super) struct StreamDrain<'a>(arena::StackDrain<'a, delivery::Handle<delivery::Stream>>);
+
+impl Iterator for StreamDrain<'_> {
+    type Item = delivery::Handle<delivery::Stream>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct PacketKey {
@@ -153,7 +178,11 @@ impl Ring {
         journal: Packet,
         emit: &mut impl FnMut(Packet, ControlDrain<'_>, StreamDrain<'_>),
     ) {
-        emit(journal, self.controls.drain(slot), self.streams.drain(slot));
+        emit(
+            journal,
+            ControlDrain(self.controls.drain(slot)),
+            StreamDrain(self.streams.drain(slot)),
+        );
     }
 
     fn reindex(&mut self) {
@@ -231,7 +260,11 @@ impl Ring {
             |journal| {
                 removed = true;
                 let slot = journal.pn as usize % capacity;
-                emit(journal, controls.drain(slot), streams.drain(slot));
+                emit(
+                    journal,
+                    ControlDrain(controls.drain(slot)),
+                    StreamDrain(streams.drain(slot)),
+                );
             },
         );
         if removed {
