@@ -13,7 +13,7 @@ impl<'a, const MASK: u16> Cursor<'a, MASK> {
     pub(super) fn new(pending: &'a control::Pending) -> Self {
         Self {
             pending,
-            remaining: pending.ready_bits & MASK,
+            remaining: pending.lanes.ready_bits & MASK,
             current: control::NONE,
         }
     }
@@ -25,7 +25,7 @@ impl<const MASK: u16> Iterator for Cursor<'_, MASK> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.current != control::NONE {
-                let entry = self.pending.slots[self.current as usize]
+                let entry = self.pending.storage.slots[self.current as usize]
                     .entry
                     .as_ref()
                     .unwrap();
@@ -38,7 +38,7 @@ impl<const MASK: u16> Iterator for Cursor<'_, MASK> {
             }
             let bit = 1 << self.remaining.trailing_zeros();
             self.remaining &= !bit;
-            self.current = self.pending.ready[crate::conn::control::lane(bit)].tail;
+            self.current = self.pending.lanes.ready[crate::conn::control::lane(bit)].tail;
         }
     }
 }

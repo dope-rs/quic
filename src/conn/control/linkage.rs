@@ -10,35 +10,40 @@ pub(super) trait Linkage {
 
 impl Linkage for control::Pending {
     fn link_ready(&mut self, index: usize) {
-        let bit = control::kind_bit(self.slots[index].entry.as_ref().unwrap().record);
+        let bit = control::kind_bit(self.storage.slots[index].entry.as_ref().unwrap().record);
         if bit == 0 {
             return;
         }
         let lane = control::lane(bit);
-        let tail = self.ready[lane].tail;
-        self.slots[index].entry.as_mut().unwrap().ready = control::Links {
+        let tail = self.lanes.ready[lane].tail;
+        self.storage.slots[index].entry.as_mut().unwrap().ready = control::Links {
             prev: tail,
             next: control::NONE,
         };
         if tail == control::NONE {
-            self.ready[lane].head = index as u32;
+            self.lanes.ready[lane].head = index as u32;
         } else {
-            self.slots[tail as usize].entry.as_mut().unwrap().ready.next = index as u32;
+            self.storage.slots[tail as usize]
+                .entry
+                .as_mut()
+                .unwrap()
+                .ready
+                .next = index as u32;
         }
-        self.ready[lane].tail = index as u32;
-        self.ready_bits |= bit;
+        self.lanes.ready[lane].tail = index as u32;
+        self.lanes.ready_bits |= bit;
     }
 
     fn unlink_ready(&mut self, index: usize) {
-        let record = self.slots[index].entry.as_ref().unwrap().record;
+        let record = self.storage.slots[index].entry.as_ref().unwrap().record;
         let bit = control::kind_bit(record);
         debug_assert_ne!(bit, 0);
         let lane = control::lane(bit);
-        let links = self.slots[index].entry.as_ref().unwrap().ready;
+        let links = self.storage.slots[index].entry.as_ref().unwrap().ready;
         if links.prev == control::NONE {
-            self.ready[lane].head = links.next;
+            self.lanes.ready[lane].head = links.next;
         } else {
-            self.slots[links.prev as usize]
+            self.storage.slots[links.prev as usize]
                 .entry
                 .as_mut()
                 .unwrap()
@@ -46,53 +51,53 @@ impl Linkage for control::Pending {
                 .next = links.next;
         }
         if links.next == control::NONE {
-            self.ready[lane].tail = links.prev;
+            self.lanes.ready[lane].tail = links.prev;
         } else {
-            self.slots[links.next as usize]
+            self.storage.slots[links.next as usize]
                 .entry
                 .as_mut()
                 .unwrap()
                 .ready
                 .prev = links.prev;
         }
-        self.slots[index].entry.as_mut().unwrap().ready = control::Links::EMPTY;
-        if self.ready[lane].head == control::NONE {
-            self.ready_bits &= !bit;
+        self.storage.slots[index].entry.as_mut().unwrap().ready = control::Links::EMPTY;
+        if self.lanes.ready[lane].head == control::NONE {
+            self.lanes.ready_bits &= !bit;
         }
     }
 
     fn link_flight(&mut self, index: usize, epoch: conn::Epoch) {
         let epoch_index = epoch as usize;
-        let tail = self.in_flight[epoch_index].tail;
-        self.slots[index].entry.as_mut().unwrap().flight = control::Links {
+        let tail = self.flights.in_flight[epoch_index].tail;
+        self.storage.slots[index].entry.as_mut().unwrap().flight = control::Links {
             prev: tail,
             next: control::NONE,
         };
         if tail == control::NONE {
-            self.in_flight[epoch_index].head = index as u32;
+            self.flights.in_flight[epoch_index].head = index as u32;
         } else {
-            self.slots[tail as usize]
+            self.storage.slots[tail as usize]
                 .entry
                 .as_mut()
                 .unwrap()
                 .flight
                 .next = index as u32;
         }
-        self.in_flight[epoch_index].tail = index as u32;
+        self.flights.in_flight[epoch_index].tail = index as u32;
     }
 
     fn unlink_flight(&mut self, index: usize) {
         let control::Status::InFlight { epoch, .. } =
-            self.slots[index].entry.as_ref().unwrap().status
+            self.storage.slots[index].entry.as_ref().unwrap().status
         else {
             return;
         };
         let epoch_index = epoch as usize;
-        let links = self.slots[index].entry.as_ref().unwrap().flight;
+        let links = self.storage.slots[index].entry.as_ref().unwrap().flight;
         if links.prev == control::NONE {
-            self.in_flight[epoch_index].head = links.next;
+            self.flights.in_flight[epoch_index].head = links.next;
         } else {
-            self.slots[links.prev as usize]
+            self.storage.slots[links.prev as usize]
                 .entry
                 .as_mut()
                 .unwrap()
@@ -100,18 +105,18 @@ impl Linkage for control::Pending {
                 .next = links.next;
         }
         if links.next == control::NONE {
-            self.in_flight[epoch_index].tail = links.prev;
+            self.flights.in_flight[epoch_index].tail = links.prev;
         } else {
-            self.slots[links.next as usize]
+            self.storage.slots[links.next as usize]
                 .entry
                 .as_mut()
                 .unwrap()
                 .flight
                 .prev = links.prev;
         }
-        if self.probe_cursor[epoch_index] == index as u32 {
-            self.probe_cursor[epoch_index] = links.next;
+        if self.flights.probe_cursor[epoch_index] == index as u32 {
+            self.flights.probe_cursor[epoch_index] = links.next;
         }
-        self.slots[index].entry.as_mut().unwrap().flight = control::Links::EMPTY;
+        self.storage.slots[index].entry.as_mut().unwrap().flight = control::Links::EMPTY;
     }
 }

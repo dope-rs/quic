@@ -27,13 +27,16 @@ impl<'a> Delivery<'a> {
                 if control::kind_bit(record) != 0 {
                     self.pending.unlink_ready(index);
                 }
-                let probe_round = self.pending.probe_round[epoch as usize];
-                self.pending.slots[index].entry.as_mut().unwrap().status =
-                    control::Status::InFlight {
-                        epoch,
-                        carriers: 1,
-                        probe_round,
-                    };
+                let probe_round = self.pending.flights.probe_round[epoch as usize];
+                self.pending.storage.slots[index]
+                    .entry
+                    .as_mut()
+                    .unwrap()
+                    .status = control::Status::InFlight {
+                    epoch,
+                    carriers: 1,
+                    probe_round,
+                };
                 self.pending.link_flight(index, epoch);
                 Some(selected)
             }
@@ -44,14 +47,14 @@ impl<'a> Delivery<'a> {
             } if delivery_epoch == epoch => {
                 let carriers = carriers.checked_add(1)?;
                 let next = entry.flight.next;
-                let round = self.pending.probe_round[epoch as usize];
-                let entry = self.pending.slots[index].entry.as_mut().unwrap();
+                let round = self.pending.flights.probe_round[epoch as usize];
+                let entry = self.pending.storage.slots[index].entry.as_mut().unwrap();
                 entry.status = control::Status::InFlight {
                     epoch,
                     carriers,
                     probe_round: round,
                 };
-                self.pending.probe_cursor[epoch as usize] = next;
+                self.pending.flights.probe_cursor[epoch as usize] = next;
                 Some(selected)
             }
             control::Status::Queued | control::Status::InFlight { .. } => None,

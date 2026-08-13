@@ -191,22 +191,34 @@ struct Slot {
     entry: Option<Entry>,
 }
 
-/// Bounded owner for control values, delivery generations, and queue links.
-/// Typed owner keys resolve in one slot access; a borrowing cursor prevents
-/// selected records from outliving or racing generation mutation.
-pub(super) struct Pending {
+struct Storage {
     slots: Vec<Slot>,
     free_head: u32,
     len: usize,
     limit: usize,
     overflowed: bool,
+}
+
+struct Lanes {
     bits: u16,
     ready_bits: u16,
     kind_counts: [usize; LANE_COUNT],
     ready: [Chain; LANE_COUNT],
+}
+
+struct Flights {
     in_flight: [Chain; 3],
     probe_cursor: [u32; 3],
     probe_round: [u32; 3],
+}
+
+/// Bounded owner for control values, delivery generations, and queue links.
+/// Typed owner keys resolve in one slot access; a borrowing cursor prevents
+/// selected records from outliving or racing generation mutation.
+pub(super) struct Pending {
+    storage: Storage,
+    lanes: Lanes,
+    flights: Flights,
     handshake_done: Option<OwnerKey<kind::HandshakeDone>>,
 }
 
@@ -223,16 +235,18 @@ impl Permit<'_> {
             .remaining
             .checked_sub(1)
             .expect("control commit consumes only its proven capacity");
-        self.pending.limit = self
+        self.pending.storage.limit = self
             .pending
+            .storage
             .limit
             .checked_add(1)
             .expect("released control reservation fits its original limit");
     }
 
     fn credit(&mut self) {
-        self.pending.limit = self
+        self.pending.storage.limit = self
             .pending
+            .storage
             .limit
             .checked_sub(1)
             .expect("a removed control leaves one reusable reserved slot");
@@ -270,8 +284,9 @@ impl Permit<'_> {
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
-        self.pending.limit = self
+        self.pending.storage.limit = self
             .pending
+            .storage
             .limit
             .checked_add(self.remaining)
             .expect("released control reservations fit the original limit");
@@ -508,7 +523,7 @@ impl Write for Pending {
             return;
         };
         if carriers > 1 {
-            self.slots[index].entry.as_mut().unwrap().status = Status::InFlight {
+            self.storage.slots[index].entry.as_mut().unwrap().status = Status::InFlight {
                 epoch,
                 carriers: carriers - 1,
                 probe_round,
@@ -519,7 +534,7 @@ impl Write for Pending {
             return;
         }
         self.unlink_flight(index);
-        let entry = self.slots[index].entry.as_mut().unwrap();
+        let entry = self.storage.slots[index].entry.as_mut().unwrap();
         entry.status = Status::Queued;
         entry.flight.prev = NONE;
         entry.flight.next = NONE;
@@ -672,9 +687,11 @@ impl Write for Permit<'_> {
         &mut self,
         handle: crate::conn::delivery::Handle<crate::conn::delivery::Control>,
     ) -> Effect {
-        let previous_len = self.pending.len;
+        let previous_len = self.pending.storage.len;
         let effect = delivery::Delivery::new(self.pending).acknowledge(handle);
-        if self.pending.len != previous_len && self.pending.free_head == handle.index() as u32 {
+        if self.pending.storage.len != previous_len
+            && self.pending.storage.free_head == handle.index() as u32
+        {
             self.credit();
         }
         effect
@@ -697,7 +714,11 @@ impl Write for Permit<'_> {
             return;
         };
         if carriers > 1 {
-            self.pending.slots[index].entry.as_mut().unwrap().status = Status::InFlight {
+            self.pending.storage.slots[index]
+                .entry
+                .as_mut()
+                .unwrap()
+                .status = Status::InFlight {
                 epoch,
                 carriers: carriers - 1,
                 probe_round,
@@ -708,7 +729,7 @@ impl Write for Permit<'_> {
             return;
         }
         self.pending.unlink_flight(index);
-        let entry = self.pending.slots[index].entry.as_mut().unwrap();
+        let entry = self.pending.storage.slots[index].entry.as_mut().unwrap();
         entry.status = Status::Queued;
         entry.flight.prev = NONE;
         entry.flight.next = NONE;
@@ -722,38 +743,44 @@ impl Pending {
     pub(super) fn new(limit: usize) -> Self {
         let limit = limit.min((u32::MAX - 1) as usize);
         Self {
-            slots: Vec::with_capacity(limit),
-            free_head: NONE,
-            len: 0,
-            limit,
-            overflowed: false,
-            bits: 0,
-            ready_bits: 0,
-            kind_counts: [0; LANE_COUNT],
-            ready: [Chain::EMPTY; LANE_COUNT],
-            in_flight: [Chain::EMPTY; 3],
-            probe_cursor: [NONE; 3],
-            probe_round: [0; 3],
+            storage: Storage {
+                slots: Vec::with_capacity(limit),
+                free_head: NONE,
+                len: 0,
+                limit,
+                overflowed: false,
+            },
+            lanes: Lanes {
+                bits: 0,
+                ready_bits: 0,
+                kind_counts: [0; LANE_COUNT],
+                ready: [Chain::EMPTY; LANE_COUNT],
+            },
+            flights: Flights {
+                in_flight: [Chain::EMPTY; 3],
+                probe_cursor: [NONE; 3],
+                probe_round: [0; 3],
+            },
             handshake_done: None,
         }
     }
 
     pub(super) fn overflowed(&self) -> bool {
-        self.overflowed
+        self.storage.overflowed
     }
 
     pub(super) fn take_overflowed(&mut self) -> bool {
-        let overflowed = self.overflowed;
-        self.overflowed = false;
+        let overflowed = self.storage.overflowed;
+        self.storage.overflowed = false;
         overflowed
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.bits == 0
+        self.lanes.bits == 0
     }
 
     pub(super) fn remaining_capacity(&self) -> usize {
-        self.limit - self.len
+        self.storage.limit - self.storage.len
     }
 
     pub(super) fn handshake_done_control_slots(&self) -> usize {
@@ -761,10 +788,10 @@ impl Pending {
     }
 
     pub(super) fn try_reserve(&mut self, additional: usize) -> Option<Permit<'_>> {
-        if additional > self.limit - self.len {
+        if additional > self.storage.limit - self.storage.len {
             return None;
         }
-        self.limit -= additional;
+        self.storage.limit -= additional;
         Some(Permit {
             pending: self,
             remaining: additional,
@@ -772,23 +799,23 @@ impl Pending {
     }
 
     pub(super) fn only_path_responses(&self) -> Option<cursor::Cursor<'_, PATH_RESPONSE>> {
-        (self.bits == PATH_RESPONSE).then(|| cursor::Cursor::new(self))
+        (self.lanes.bits == PATH_RESPONSE).then(|| cursor::Cursor::new(self))
     }
 
     pub(super) fn only_path_challenges(&self) -> Option<cursor::Cursor<'_, PATH_CHALLENGE>> {
-        (self.bits == PATH_CHALLENGE).then(|| cursor::Cursor::new(self))
+        (self.lanes.bits == PATH_CHALLENGE).then(|| cursor::Cursor::new(self))
     }
 
     pub(super) fn prefix(&self) -> Option<cursor::Cursor<'_, PREFIX>> {
-        (self.ready_bits & PREFIX != 0).then(|| cursor::Cursor::new(self))
+        (self.lanes.ready_bits & PREFIX != 0).then(|| cursor::Cursor::new(self))
     }
 
     pub(super) fn suffix(&self) -> Option<cursor::Cursor<'_, SUFFIX>> {
-        (self.ready_bits & SUFFIX != 0).then(|| cursor::Cursor::new(self))
+        (self.lanes.ready_bits & SUFFIX != 0).then(|| cursor::Cursor::new(self))
     }
 
     pub(super) fn has_sendable(&self) -> bool {
-        self.ready_bits & (PREFIX | SUFFIX) != 0
+        self.lanes.ready_bits & (PREFIX | SUFFIX) != 0
     }
 
     pub(super) fn data_blocked_sendable(&self, credit: &send::Credit<kind::DataBlocked>) -> bool {
@@ -857,9 +884,9 @@ impl Pending {
 
     pub(super) fn arm_probes(&mut self, epoch: conn::Epoch) {
         let epoch_index = epoch as usize;
-        let next = self.probe_round[epoch_index].wrapping_add(1);
+        let next = self.flights.probe_round[epoch_index].wrapping_add(1);
         if next == 0 {
-            for slot in &mut self.slots {
+            for slot in &mut self.storage.slots {
                 if let Some(Entry {
                     status: Status::InFlight { probe_round, .. },
                     ..
@@ -868,11 +895,11 @@ impl Pending {
                     *probe_round = 0;
                 }
             }
-            self.probe_round[epoch_index] = 1;
+            self.flights.probe_round[epoch_index] = 1;
         } else {
-            self.probe_round[epoch_index] = next;
+            self.flights.probe_round[epoch_index] = next;
         }
-        self.probe_cursor[epoch_index] = self.in_flight[epoch_index].head;
+        self.flights.probe_cursor[epoch_index] = self.flights.in_flight[epoch_index].head;
     }
 
     pub(super) fn next_probe(
@@ -884,11 +911,11 @@ impl Pending {
         crate::conn::delivery::Control,
     )> {
         let epoch_index = epoch as usize;
-        let round = self.probe_round[epoch_index];
-        let mut current = self.probe_cursor[epoch_index];
+        let round = self.flights.probe_round[epoch_index];
+        let mut current = self.flights.probe_cursor[epoch_index];
         while current != NONE {
             let index = current as usize;
-            let slot = &self.slots[index];
+            let slot = &self.storage.slots[index];
             let entry = slot.entry.as_ref().unwrap();
             current = entry.flight.next;
             if let Status::InFlight {

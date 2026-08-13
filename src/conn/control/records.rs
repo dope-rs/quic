@@ -40,7 +40,7 @@ impl Records for control::Pending {
     ) -> Option<delivery::Handle<delivery::Control>> {
         if let Some(index) = (*owner).and_then(|owner| self.owner_index(owner)) {
             let unchanged = {
-                let entry = self.slots[index].entry.as_ref().unwrap();
+                let entry = self.storage.slots[index].entry.as_ref().unwrap();
                 entry.record == record
                     && match (&entry.new_connection_id, &new_connection_id) {
                         (None, None) => true,
@@ -55,25 +55,25 @@ impl Records for control::Pending {
             return self.handle(index);
         }
         *owner = None;
-        if self.len == self.limit {
-            self.overflowed = true;
+        if self.storage.len == self.storage.limit {
+            self.storage.overflowed = true;
             return None;
         }
         let Some(index) = self.allocate() else {
-            self.overflowed = true;
+            self.storage.overflowed = true;
             return None;
         };
-        self.slots[index].entry = Some(control::Entry {
+        self.storage.slots[index].entry = Some(control::Entry {
             record,
             new_connection_id,
             status: control::Status::Queued,
             ready: control::Links::EMPTY,
             flight: control::Links::EMPTY,
         });
-        self.len += 1;
+        self.storage.len += 1;
         self.add_kind(record);
         self.link_ready(index);
-        *owner = control::OwnerKey::new(index, self.slots[index].owner_generation);
+        *owner = control::OwnerKey::new(index, self.storage.slots[index].owner_generation);
         self.handle(index)
     }
 
@@ -83,7 +83,7 @@ impl Records for control::Pending {
         record: delivery::Control,
         new_connection_id: Option<control::NewConnectionId>,
     ) {
-        let entry = self.slots[index].entry.as_ref().unwrap();
+        let entry = self.storage.slots[index].entry.as_ref().unwrap();
         let status = entry.status;
         let previous = entry.record;
         if !self.bump_generation(index) {
@@ -107,7 +107,7 @@ impl Records for control::Pending {
             self.remove_kind(previous);
             self.add_kind(record);
         }
-        let entry = self.slots[index].entry.as_mut().unwrap();
+        let entry = self.storage.slots[index].entry.as_mut().unwrap();
         entry.record = record;
         entry.new_connection_id = new_connection_id;
         entry.status = control::Status::Queued;
@@ -119,17 +119,17 @@ impl Records for control::Pending {
     }
 
     fn allocate(&mut self) -> Option<usize> {
-        if self.free_head != crate::conn::control::NONE {
-            let index = self.free_head as usize;
-            self.free_head = self.slots[index].next_free;
-            self.slots[index].next_free = crate::conn::control::NONE;
+        if self.storage.free_head != crate::conn::control::NONE {
+            let index = self.storage.free_head as usize;
+            self.storage.free_head = self.storage.slots[index].next_free;
+            self.storage.slots[index].next_free = crate::conn::control::NONE;
             return Some(index);
         }
-        if self.slots.len() >= self.limit {
+        if self.storage.slots.len() >= self.storage.limit {
             return None;
         }
-        let index = self.slots.len();
-        self.slots.push(crate::conn::control::Slot {
+        let index = self.storage.slots.len();
+        self.storage.slots.push(crate::conn::control::Slot {
             delivery_generation: 0,
             owner_generation: 0,
             next_free: crate::conn::control::NONE,
@@ -141,37 +141,37 @@ impl Records for control::Pending {
     fn remove_owner<Kind>(&mut self, owner: &mut Option<control::OwnerKey<Kind>>) -> bool {
         if let Some(index) = owner.take().and_then(|owner| self.owner_index(owner)) {
             self.remove(index);
-            self.free_head == index as u32
+            self.storage.free_head == index as u32
         } else {
             false
         }
     }
 
     fn remove(&mut self, index: usize) -> Option<delivery::Control> {
-        let entry = self.slots.get(index)?.entry.as_ref()?;
+        let entry = self.storage.slots.get(index)?.entry.as_ref()?;
         let record = entry.record;
         if matches!(entry.status, control::Status::Queued) && control::kind_bit(record) != 0 {
             self.unlink_ready(index);
         } else if matches!(entry.status, control::Status::InFlight { .. }) {
             self.unlink_flight(index);
         }
-        self.slots[index].entry.take();
-        self.len -= 1;
+        self.storage.slots[index].entry.take();
+        self.storage.len -= 1;
         self.remove_kind(record);
         if !self.bump_generation(index) {
             return Some(record);
         }
-        let Some(next_owner_generation) = self.slots[index]
+        let Some(next_owner_generation) = self.storage.slots[index]
             .owner_generation
             .checked_add(1)
             .filter(|generation| *generation <= i32::MAX as u32)
         else {
-            self.overflowed = true;
+            self.storage.overflowed = true;
             return Some(record);
         };
-        self.slots[index].owner_generation = next_owner_generation;
-        self.slots[index].next_free = self.free_head;
-        self.free_head = index as u32;
+        self.storage.slots[index].owner_generation = next_owner_generation;
+        self.storage.slots[index].next_free = self.storage.free_head;
+        self.storage.free_head = index as u32;
         Some(record)
     }
 
@@ -181,8 +181,8 @@ impl Records for control::Pending {
             return;
         }
         let lane = control::lane(bit);
-        self.kind_counts[lane] += 1;
-        self.bits |= bit;
+        self.lanes.kind_counts[lane] += 1;
+        self.lanes.bits |= bit;
     }
 
     fn remove_kind(&mut self, record: delivery::Control) {
@@ -191,27 +191,27 @@ impl Records for control::Pending {
             return;
         }
         let lane = control::lane(bit);
-        self.kind_counts[lane] -= 1;
-        if self.kind_counts[lane] == 0 {
-            self.bits &= !bit;
+        self.lanes.kind_counts[lane] -= 1;
+        if self.lanes.kind_counts[lane] == 0 {
+            self.lanes.bits &= !bit;
         }
     }
 
     fn bump_generation(&mut self, index: usize) -> bool {
-        let Some(next) = self.slots[index].delivery_generation.checked_add(1) else {
-            self.overflowed = true;
+        let Some(next) = self.storage.slots[index].delivery_generation.checked_add(1) else {
+            self.storage.overflowed = true;
             return false;
         };
-        self.slots[index].delivery_generation = next;
+        self.storage.slots[index].delivery_generation = next;
         true
     }
 
     fn handle(&self, index: usize) -> Option<delivery::Handle<delivery::Control>> {
-        delivery::Handle::new(index, self.slots.get(index)?.delivery_generation)
+        delivery::Handle::new(index, self.storage.slots.get(index)?.delivery_generation)
     }
 
     fn resolve(&self, handle: delivery::Handle<delivery::Control>) -> Option<&control::Entry> {
-        let slot = self.slots.get(handle.index())?;
+        let slot = self.storage.slots.get(handle.index())?;
         (slot.delivery_generation == handle.generation())
             .then_some(slot.entry.as_ref())
             .flatten()
@@ -222,11 +222,11 @@ impl Records for control::Pending {
         owner: Option<control::OwnerKey<Kind>>,
     ) -> Option<&control::Entry> {
         let index = self.owner_index(owner?)?;
-        self.slots[index].entry.as_ref()
+        self.storage.slots[index].entry.as_ref()
     }
 
     fn owner_index<Kind>(&self, owner: control::OwnerKey<Kind>) -> Option<usize> {
-        let slot = self.slots.get(owner.index())?;
+        let slot = self.storage.slots.get(owner.index())?;
         (slot.owner_generation == owner.generation() && slot.entry.is_some())
             .then_some(owner.index())
     }
