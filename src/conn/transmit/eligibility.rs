@@ -68,7 +68,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility<'_, DOMAIN, B> {
             .write_key(conn::Epoch::Initial)
             .is_some()
             && (self.has_crypto(conn::Epoch::Initial)
-                || connection.received[conn::Epoch::Initial as usize].ack_pending)
+                || connection.receive.packet_numbers[conn::Epoch::Initial as usize].ack_pending)
         {
             return true;
         }
@@ -86,7 +86,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility<'_, DOMAIN, B> {
             .write_key(conn::Epoch::Handshake)
             .is_some()
             && (self.has_crypto(conn::Epoch::Handshake)
-                || connection.received[conn::Epoch::Handshake as usize].ack_pending)
+                || connection.receive.packet_numbers[conn::Epoch::Handshake as usize].ack_pending)
         {
             return true;
         }
@@ -96,7 +96,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility<'_, DOMAIN, B> {
             .is_some()
             && (connection.egress.pending_close.is_some()
                 || connection.control.overflowed()
-                || connection.received[conn::Epoch::Application as usize].ack_pending
+                || connection.receive.packet_numbers[conn::Epoch::Application as usize].ack_pending
                 || !connection.egress.pending_datagrams.is_empty()
                 || connection.egress.derived_controls.is_pending()
                 || connection.path.controls_pending()
@@ -164,7 +164,8 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility<'_, DOMAIN, B> {
                 .write_key(conn::Epoch::Initial)
                 .is_some()
                 && (self.has_crypto(conn::Epoch::Initial)
-                    || connection.received[conn::Epoch::Initial as usize].ack_pending))
+                    || connection.receive.packet_numbers[conn::Epoch::Initial as usize]
+                        .ack_pending))
             || (connection.handshake.zero_rtt_write_key().is_some()
                 && connection
                     .handshake
@@ -176,14 +177,16 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility<'_, DOMAIN, B> {
                 .write_key(conn::Epoch::Handshake)
                 .is_some()
                 && (self.has_crypto(conn::Epoch::Handshake)
-                    || connection.received[conn::Epoch::Handshake as usize].ack_pending))
+                    || connection.receive.packet_numbers[conn::Epoch::Handshake as usize]
+                        .ack_pending))
             || (connection
                 .handshake
                 .write_key(conn::Epoch::Application)
                 .is_some()
                 && (connection.egress.pending_close.is_some()
                     || connection.control.overflowed()
-                    || connection.received[conn::Epoch::Application as usize].ack_pending
+                    || connection.receive.packet_numbers[conn::Epoch::Application as usize]
+                        .ack_pending
                     || !connection.egress.pending_datagrams.is_empty()
                     || connection
                         .egress

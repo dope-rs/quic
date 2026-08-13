@@ -489,20 +489,26 @@ where
         });
 
         let mut conn = conn::session::Connection {
-            received: Default::default(),
             egress,
             control: conn::control::Pending::new(control_journal_capacity),
             handshake,
             path,
             streams,
-            is_client,
-            scratch_frames: Vec::with_capacity(new_reno::MAX_DATAGRAM_SIZE as usize),
-            scratch_header: Vec::with_capacity(128),
-            incoming_datagrams: collections::VecDeque::new(),
-            incoming_datagrams_capacity,
-            peer_transport_params: None,
-            local_max_idle_timeout: local_idle,
-            recv_crypto: array::from_fn(|_| conn::reassembly::Crypto::default()),
+            receive: conn::session::ReceiveState {
+                packet_numbers: Default::default(),
+                crypto: array::from_fn(|_| conn::reassembly::Crypto::default()),
+                datagrams: collections::VecDeque::new(),
+                datagram_capacity: incoming_datagrams_capacity,
+            },
+            scratch: conn::session::Scratch {
+                frames: Vec::with_capacity(new_reno::MAX_DATAGRAM_SIZE as usize),
+                header: Vec::with_capacity(128),
+            },
+            peer: conn::session::PeerState {
+                is_client,
+                transport_params: None,
+                local_max_idle_timeout: local_idle,
+            },
         };
         if let Some(tp) = resumption_peer_tp {
             conn.streams
@@ -511,7 +517,7 @@ where
                 .initialize(tp.initial_max_data);
             conn.streams.local_initiated.peer_max =
                 [tp.initial_max_streams_bidi, tp.initial_max_streams_uni];
-            conn.peer_transport_params = Some(tp);
+            conn.peer.transport_params = Some(tp);
         }
         Ok(match tls {
             Tls::Server(tls) => Built::Server {

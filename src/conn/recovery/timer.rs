@@ -14,8 +14,8 @@ impl<'a> Timer<'a> {
     ) -> Self {
         Self::from_parts(
             &connection.egress,
-            &connection.peer_transport_params,
-            connection.local_max_idle_timeout,
+            &connection.peer.transport_params,
+            connection.peer.local_max_idle_timeout,
         )
     }
 

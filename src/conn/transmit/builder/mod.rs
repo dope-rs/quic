@@ -267,7 +267,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
             conn::Epoch::Handshake => crate::packet::LONG_HANDSHAKE,
             conn::Epoch::Application => return None,
         };
-        let mut header = mem::take(&mut self.connection.scratch_header);
+        let mut header = mem::take(&mut self.connection.scratch.header);
         header.clear();
         let token =
             (epoch == conn::Epoch::Initial).then_some(self.connection.path.retry_token.as_slice());
@@ -294,7 +294,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
                 .ok()
         });
         header.clear();
-        self.connection.scratch_header = header;
+        self.connection.scratch.header = header;
         result
     }
 
@@ -307,7 +307,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
     ) -> Option<(usize, commit::Packet)> {
         if epoch == conn::Epoch::Application
             || epoch == conn::Epoch::Initial
-                && self.connection.is_client
+                && self.connection.peer.is_client
                 && max_packet_bytes < crate::conn::MIN_INITIAL_LEN
         {
             return None;
@@ -325,7 +325,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
         };
         let pn = self.connection.egress.spaces[epoch as usize].next_pn;
 
-        let mut frames = mem::take(&mut self.connection.scratch_frames);
+        let mut frames = mem::take(&mut self.connection.scratch.frames);
         frames.clear();
         let ack_included = self.append_ack_frame(epoch, &mut frames, payload_limit);
         let frame_room = payload_limit.saturating_sub(frames.len());
@@ -371,19 +371,19 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
         }
 
         if mode == packet::CryptoMode::Regular && frames.is_empty() {
-            self.connection.scratch_frames = frames;
+            self.connection.scratch.frames = frames;
             return None;
         }
 
         if epoch == conn::Epoch::Initial
-            && self.connection.is_client
+            && self.connection.peer.is_client
             && frames.len() < payload_limit
         {
             frames.resize(payload_limit, 0);
         }
         let sealed = self.seal_crypto_packet(dst, epoch, pn, &frames);
         frames.clear();
-        self.connection.scratch_frames = frames;
+        self.connection.scratch.frames = frames;
         let n = sealed?;
         let mut commit = commit::Packet::new(epoch, pn);
         commit.bytes = n;

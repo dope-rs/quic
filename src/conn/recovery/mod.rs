@@ -22,9 +22,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Loss<'a, DOMAIN, B> {
             control,
             handshake,
             streams,
-            is_client,
-            peer_transport_params,
-            local_max_idle_timeout,
+            peer,
             ..
         } = connection;
         Self {
@@ -34,10 +32,10 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Loss<'a, DOMAIN, B> {
                 handshake,
                 &mut streams.state,
                 &mut streams.events,
-                *is_client,
+                peer.is_client,
             ),
-            peer_transport_params,
-            local_max_idle_timeout: *local_max_idle_timeout,
+            peer_transport_params: &peer.transport_params,
+            local_max_idle_timeout: peer.local_max_idle_timeout,
         }
     }
 

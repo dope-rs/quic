@@ -61,13 +61,13 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> View<'conn, DOMAIN, B> {
     pub fn recv_eof(&self, stream_id: u64) -> bool {
         self.connection
             .streams
-            .recv_eof(stream_id, self.connection.is_client)
+            .recv_eof(stream_id, self.connection.peer.is_client)
     }
 
     pub fn recv_fin_received(&self, stream_id: u64) -> bool {
         self.connection
             .streams
-            .recv_fin_received(stream_id, self.connection.is_client)
+            .recv_fin_received(stream_id, self.connection.peer.is_client)
     }
 
     pub fn stopped(&self, stream_id: u64) -> Option<u64> {
@@ -110,17 +110,17 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Streams<'conn, DOMAIN, B
 
     fn operations_available(&self) -> bool {
         self.connection.egress.state == conn::State::Established
-            || self.connection.is_client
+            || self.connection.peer.is_client
                 && self.connection.egress.state == conn::State::Handshaking
                 && self.connection.handshake.zero_rtt_write_key().is_some()
-                && self.connection.peer_transport_params.is_some()
+                && self.connection.peer.transport_params.is_some()
     }
 
     pub fn recv(&mut self, stream_id: u64, destination: &mut Vec<u8>) -> usize {
         self.connection.streams.read(
             stream_id,
             destination,
-            self.connection.is_client,
+            self.connection.peer.is_client,
             &mut self.connection.control,
         )
     }
@@ -130,7 +130,7 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Streams<'conn, DOMAIN, B
     pub fn recv_owned(&mut self, stream_id: u64) -> Option<Vec<u8>> {
         self.connection.streams.read_owned(
             stream_id,
-            self.connection.is_client,
+            self.connection.peer.is_client,
             &mut self.connection.control,
         )
     }
@@ -139,7 +139,7 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Streams<'conn, DOMAIN, B
     pub fn recv_buffer(&mut self, stream_id: u64) -> Option<B> {
         self.connection.streams.read_buffer(
             stream_id,
-            self.connection.is_client,
+            self.connection.peer.is_client,
             &mut self.connection.control,
         )
     }
@@ -149,8 +149,8 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Streams<'conn, DOMAIN, B
         self.connection.streams.send_bytes(
             stream_id,
             data,
-            self.connection.peer_transport_params.as_ref(),
-            self.connection.is_client,
+            self.connection.peer.transport_params.as_ref(),
+            self.connection.peer.is_client,
             available,
         )
     }
@@ -160,8 +160,8 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Streams<'conn, DOMAIN, B
         self.connection.streams.send_buffer(
             stream_id,
             data,
-            self.connection.peer_transport_params.as_ref(),
-            self.connection.is_client,
+            self.connection.peer.transport_params.as_ref(),
+            self.connection.peer.is_client,
             available,
         )
     }
@@ -178,8 +178,8 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Streams<'conn, DOMAIN, B
         self.connection.streams.send_parts(
             stream_id,
             conn::streams::transmit::SendParts::new(first, second, fin),
-            self.connection.peer_transport_params.as_ref(),
-            self.connection.is_client,
+            self.connection.peer.transport_params.as_ref(),
+            self.connection.peer.is_client,
             available,
         )
     }
@@ -188,8 +188,8 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Streams<'conn, DOMAIN, B
         let available = self.operations_available();
         self.connection.streams.send_fin(
             stream_id,
-            self.connection.peer_transport_params.as_ref(),
-            self.connection.is_client,
+            self.connection.peer.transport_params.as_ref(),
+            self.connection.peer.is_client,
             available,
         )
     }
@@ -199,8 +199,8 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Streams<'conn, DOMAIN, B
         self.connection.streams.reset(
             stream_id,
             error_code,
-            self.connection.peer_transport_params.as_ref(),
-            self.connection.is_client,
+            self.connection.peer.transport_params.as_ref(),
+            self.connection.peer.is_client,
             available,
             &mut self.connection.control,
         )
@@ -211,7 +211,7 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Streams<'conn, DOMAIN, B
         self.connection.streams.stop_sending(
             stream_id,
             error_code,
-            self.connection.is_client,
+            self.connection.peer.is_client,
             available,
             &mut self.connection.control,
         )
@@ -221,8 +221,8 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Streams<'conn, DOMAIN, B
         let available = self.operations_available();
         self.connection.streams.open_local(
             false,
-            self.connection.peer_transport_params.as_ref(),
-            self.connection.is_client,
+            self.connection.peer.transport_params.as_ref(),
+            self.connection.peer.is_client,
             available,
         )
     }
@@ -231,8 +231,8 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Streams<'conn, DOMAIN, B
         let available = self.operations_available();
         self.connection.streams.open_local(
             true,
-            self.connection.peer_transport_params.as_ref(),
-            self.connection.is_client,
+            self.connection.peer.transport_params.as_ref(),
+            self.connection.peer.is_client,
             available,
         )
     }

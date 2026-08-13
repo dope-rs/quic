@@ -38,7 +38,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildTerminal
         let target_size = target_size.min(max_packet_bytes as u64);
         let pn = self.packet.connection.egress.spaces[conn::Epoch::Application as usize].next_pn;
 
-        let mut frames = mem::take(&mut self.packet.connection.scratch_frames);
+        let mut frames = mem::take(&mut self.packet.connection.scratch.frames);
         frames.clear();
         frames.push(crate::frame::TYPE_PING);
         let header_overhead =
@@ -46,14 +46,14 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildTerminal
         let payload_target =
             (target_size as usize).saturating_sub(header_overhead + crate::conn::TAG_LEN);
         if payload_target == 0 {
-            self.packet.connection.scratch_frames = frames;
+            self.packet.connection.scratch.frames = frames;
             return None;
         }
         while frames.len() < payload_target {
             frames.push(crate::frame::TYPE_PADDING);
         }
 
-        let mut header = mem::take(&mut self.packet.connection.scratch_header);
+        let mut header = mem::take(&mut self.packet.connection.scratch.header);
         header.clear();
         let pn_off = packet::ShortHeaderRef {
             dcid: self.packet.connection.path.peer_cid(),
@@ -71,9 +71,9 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildTerminal
             .ok()?;
 
         header.clear();
-        self.packet.connection.scratch_header = header;
+        self.packet.connection.scratch.header = header;
         frames.clear();
-        self.packet.connection.scratch_frames = frames;
+        self.packet.connection.scratch.frames = frames;
         let mut commit = commit::Packet::new(conn::Epoch::Application, pn);
         commit.bytes = n;
         commit.properties.ack_eliciting = true;
@@ -115,7 +115,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildTerminal
                 + reason_len;
             reason_len = reason_len.saturating_sub((encoded - payload_limit).max(1));
         }
-        let mut frames = mem::take(&mut self.packet.connection.scratch_frames);
+        let mut frames = mem::take(&mut self.packet.connection.scratch.frames);
         frames.clear();
         frames.push(if close.is_application { 0x1d } else { 0x1c });
         crate::varint::VarInt::new(close.error_code)?.encode(&mut frames);
@@ -125,7 +125,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildTerminal
         crate::varint::VarInt::from_usize(reason_len)?.encode(&mut frames);
         frames.extend_from_slice(&close.reason[..reason_len]);
 
-        let mut header = mem::take(&mut self.packet.connection.scratch_header);
+        let mut header = mem::take(&mut self.packet.connection.scratch.header);
         header.clear();
         let pn_off = packet::ShortHeaderRef {
             dcid: self.packet.connection.path.peer_cid(),
@@ -143,9 +143,9 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildTerminal
             .ok()?;
 
         header.clear();
-        self.packet.connection.scratch_header = header;
+        self.packet.connection.scratch.header = header;
         frames.clear();
-        self.packet.connection.scratch_frames = frames;
+        self.packet.connection.scratch.frames = frames;
         let mut commit = commit::Packet::new(conn::Epoch::Application, pn);
         commit.bytes = n;
         commit.properties.close = true;

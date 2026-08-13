@@ -157,7 +157,8 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Ingress<'a, DOMAIN, B> {
         let Some(zr) = self.connection.handshake.zero_rtt_read_key() else {
             return Ok(());
         };
-        let expected = self.connection.received[conn::Epoch::Application as usize].expected_pn();
+        let expected =
+            self.connection.receive.packet_numbers[conn::Epoch::Application as usize].expected_pn();
         let packet = packet
             .decrypt(zr, expected)
             .map_err(|_| conn::Error::PacketDecrypt)?;
@@ -172,7 +173,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Ingress<'a, DOMAIN, B> {
     }
 
     fn recv_retry(&mut self, wire: &[u8]) -> Result<(), conn::Error> {
-        if !self.connection.is_client || self.connection.path.retry_processed() {
+        if !self.connection.peer.is_client || self.connection.path.retry_processed() {
             return Ok(());
         }
         if self
@@ -265,10 +266,11 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Ingress<'a, DOMAIN, B> {
         let Some(initial_r) = self.connection.handshake.read_key(conn::Epoch::Initial) else {
             return Ok(());
         };
-        if self.connection.is_client && self.connection.path.peer_first_scid.is_none() {
+        if self.connection.peer.is_client && self.connection.path.peer_first_scid.is_none() {
             self.connection.path.set_first_peer_cid(packet.scid());
         }
-        let expected = self.connection.received[conn::Epoch::Initial as usize].expected_pn();
+        let expected =
+            self.connection.receive.packet_numbers[conn::Epoch::Initial as usize].expected_pn();
         let packet = packet
             .decrypt(initial_r, expected)
             .map_err(|_| conn::Error::PacketDecrypt)?;
@@ -294,7 +296,8 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Ingress<'a, DOMAIN, B> {
         let Some(hr) = self.connection.handshake.read_key(conn::Epoch::Handshake) else {
             return Ok(());
         };
-        let expected = self.connection.received[conn::Epoch::Handshake as usize].expected_pn();
+        let expected =
+            self.connection.receive.packet_numbers[conn::Epoch::Handshake as usize].expected_pn();
         let packet = packet
             .decrypt(hr, expected)
             .map_err(|_| conn::Error::PacketDecrypt)?;
@@ -323,7 +326,8 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Ingress<'a, DOMAIN, B> {
         };
         let pn_offset =
             crate::packet::ShortHeader::pn_offset_for(self.connection.path.local_cid().len());
-        let expected = self.connection.received[conn::Epoch::Application as usize].expected_pn();
+        let expected =
+            self.connection.receive.packet_numbers[conn::Epoch::Application as usize].expected_pn();
         let (pn, body) = ar
             .decrypt_short_in_place(wire, pn_offset, expected)
             .map_err(|_| conn::Error::PacketDecrypt)?;

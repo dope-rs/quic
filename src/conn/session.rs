@@ -6,29 +6,38 @@ use crate::conn;
 use crate::stream;
 use crate::transport_params;
 
+pub(in crate::conn) struct ReceiveState<B: stream::ReceiveBuffer> {
+    pub(in crate::conn) packet_numbers: [crate::pn_space::Receive; 3],
+    pub(in crate::conn) crypto: [conn::reassembly::Crypto; 3],
+    pub(in crate::conn) datagrams: collections::VecDeque<B>,
+    pub(in crate::conn) datagram_capacity: usize,
+}
+
+pub(in crate::conn) struct Scratch {
+    pub(in crate::conn) frames: Vec<u8>,
+    pub(in crate::conn) header: Vec<u8>,
+}
+
+pub(in crate::conn) struct PeerState {
+    pub(in crate::conn) is_client: bool,
+    pub(in crate::conn) transport_params: Option<transport_params::Params>,
+    pub(in crate::conn) local_max_idle_timeout: time::Duration,
+}
+
 pub struct Connection<const DOMAIN: u8 = 0, B: stream::ReceiveBuffer = Vec<u8>> {
-    pub(in crate::conn) received: [crate::pn_space::Receive; 3],
     pub(in crate::conn) egress: conn::egress::Egress,
     pub(in crate::conn) control: conn::control::Pending,
     pub(in crate::conn) handshake: conn::handshake::Handshake<DOMAIN>,
     pub(in crate::conn) path: conn::path::Path,
     pub(in crate::conn) streams: conn::streams::Streams<B>,
-    pub(in crate::conn) is_client: bool,
-
-    pub(in crate::conn) scratch_frames: Vec<u8>,
-    pub(in crate::conn) scratch_header: Vec<u8>,
-
-    pub(in crate::conn) incoming_datagrams: collections::VecDeque<B>,
-    pub(in crate::conn) incoming_datagrams_capacity: usize,
-    pub(in crate::conn) peer_transport_params: Option<transport_params::Params>,
-    pub(in crate::conn) local_max_idle_timeout: time::Duration,
-
-    pub(in crate::conn) recv_crypto: [conn::reassembly::Crypto; 3],
+    pub(in crate::conn) receive: ReceiveState<B>,
+    pub(in crate::conn) scratch: Scratch,
+    pub(in crate::conn) peer: PeerState,
 }
 
 impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Connection<DOMAIN, B> {
     pub(crate) fn is_client(&self) -> bool {
-        self.is_client
+        self.peer.is_client
     }
 
     /// Receives and decrypts one datagram in place.
@@ -130,7 +139,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> conn::handshake::Transition
             &mut self.handshake,
             &mut self.streams.state,
             &mut self.streams.events,
-            self.is_client,
+            self.peer.is_client,
         );
         early_data.reject();
     }
@@ -141,8 +150,8 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> conn::handshake::Transition
             handshake: &mut self.handshake,
             path: &mut self.path,
             streams: &mut self.streams.state,
-            peer_transport_params: &mut self.peer_transport_params,
-            is_client: self.is_client,
+            peer_transport_params: &mut self.peer.transport_params,
+            is_client: self.peer.is_client,
         }
         .complete()
     }

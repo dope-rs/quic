@@ -78,8 +78,9 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> ProcessFrames<DOMAIN, B>
         let datagram_slots = {
             let (connection, _) = packet.state();
             connection
-                .incoming_datagrams_capacity
-                .saturating_sub(connection.incoming_datagrams.len())
+                .receive
+                .datagram_capacity
+                .saturating_sub(connection.receive.datagrams.len())
         };
         let mut plan = plan::Plan::begin(self.workspace, datagram_slots);
 

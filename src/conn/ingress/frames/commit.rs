@@ -50,15 +50,13 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Commit<DOMAIN, B>
                 handshake,
                 path,
                 streams,
-                is_client,
-                incoming_datagrams,
-                peer_transport_params,
-                recv_crypto,
+                receive,
+                peer,
                 ..
             } = connection;
             let stream_state = &mut streams.state;
             let stream_events = &mut streams.events;
-            let is_client = *is_client;
+            let is_client = peer.is_client;
             let reservation = plan.reserve(stream_state, is_client)?;
             let workspace = plan.workspace();
             let parsed_frames = &mut workspace.parsed_frames;
@@ -70,7 +68,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Commit<DOMAIN, B>
             let mut event_permit = stream_events
                 .reserve(reservation.event_slots)
                 .ok_or(conn::Error::EventCapacity)?;
-            recv_crypto[epoch as usize].prepare(parsed_frames.iter().filter_map(|frame| {
+            receive.crypto[epoch as usize].prepare(parsed_frames.iter().filter_map(|frame| {
                 let crate::frame::Frame::Crypto { offset, data } = frame else {
                     return None;
                 };
@@ -130,7 +128,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Commit<DOMAIN, B>
                             payloads.get(frame_index),
                             &body[data.clone()],
                         );
-                        incoming_datagrams.push_back(bytes);
+                        receive.datagrams.push_back(bytes);
                     }
                     (
                         crate::conn::receive_workspace::ReceiveAdmission::Stream,
@@ -243,7 +241,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Commit<DOMAIN, B>
                         stream_state.ingest_stop_reserved(
                             stream_id,
                             error_code.get(),
-                            peer_transport_params.as_ref(),
+                            peer.transport_params.as_ref(),
                             is_client,
                             control,
                             &mut event_permit,
@@ -279,7 +277,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Commit<DOMAIN, B>
                         );
                         match frame {
                             crate::frame::Frame::Crypto { offset, data } => {
-                                recv_crypto[epoch as usize].accept(
+                                receive.crypto[epoch as usize].accept(
                                     offset.get(),
                                     data,
                                     |message| {
@@ -302,7 +300,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Commit<DOMAIN, B>
                                                 handshake,
                                                 path,
                                                 streams: stream_state,
-                                                peer_transport_params,
+                                                peer_transport_params: &mut peer.transport_params,
                                                 is_client,
                                             })
                                             .complete()
@@ -356,8 +354,8 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Commit<DOMAIN, B>
                                 recovery::epochs::Transition::new(egress, handshake)
                                     .discard_handshake();
                                 discarded_received.record(crate::conn::Epoch::Handshake);
-                                recv_crypto[crate::conn::Epoch::Initial as usize].discard();
-                                recv_crypto[crate::conn::Epoch::Handshake as usize].discard();
+                                receive.crypto[crate::conn::Epoch::Initial as usize].discard();
+                                receive.crypto[crate::conn::Epoch::Handshake as usize].discard();
                             }
                             crate::frame::Frame::ConnectionClose { .. } => {
                                 egress.state = crate::conn::State::Closed;
@@ -421,7 +419,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Commit<DOMAIN, B>
                                 stream_state.raise_stream_credit_reserved(
                                     stream_id,
                                     maximum_stream_data.get(),
-                                    peer_transport_params.as_ref(),
+                                    peer.transport_params.as_ref(),
                                     is_client,
                                     control,
                                 );

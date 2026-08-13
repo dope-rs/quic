@@ -34,7 +34,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildZeroRtt
         let payload_limit = self.packet.handshake_payload_limit(max_packet_bytes);
         let pn =
             self.packet.connection.egress.spaces[crate::conn::Epoch::Application as usize].next_pn;
-        let mut frames = std::mem::take(&mut self.packet.connection.scratch_frames);
+        let mut frames = std::mem::take(&mut self.packet.connection.scratch.frames);
         frames.clear();
         let mut commit = commit::Packet::new(crate::conn::Epoch::Application, pn);
         commit.properties.early_data = true;
@@ -115,7 +115,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildZeroRtt
                     payload_limit,
                     &crate::frame::Frame::Ping,
                 ) {
-                    self.packet.connection.scratch_frames = frames;
+                    self.packet.connection.scratch.frames = frames;
                     return None;
                 }
                 commit.properties.ack_eliciting = true;
@@ -157,7 +157,8 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildZeroRtt
             let conn_budget = self
                 .packet
                 .connection
-                .peer_transport_params
+                .peer
+                .transport_params
                 .as_ref()
                 .map_or(u64::MAX, |_| {
                     self.packet
@@ -218,11 +219,11 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildZeroRtt
             }
         }
         if frames.is_empty() {
-            self.packet.connection.scratch_frames = frames;
+            self.packet.connection.scratch.frames = frames;
             return None;
         }
         let body_len_after_pn = frames.len() + crate::conn::TAG_LEN;
-        let mut header = std::mem::take(&mut self.packet.connection.scratch_header);
+        let mut header = std::mem::take(&mut self.packet.connection.scratch.header);
         header.clear();
         let pn_off = crate::packet::LongHeader {
             version: crate::packet::QUIC_V1,
@@ -250,9 +251,9 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildZeroRtt
             )
             .ok()?;
         header.clear();
-        self.packet.connection.scratch_header = header;
+        self.packet.connection.scratch.header = header;
         frames.clear();
-        self.packet.connection.scratch_frames = frames;
+        self.packet.connection.scratch.frames = frames;
         commit.bytes = n;
         commit.properties.in_flight = true;
         Some((n, commit))

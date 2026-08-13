@@ -32,7 +32,8 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
         self.connection.egress.spaces[crate::conn::Epoch::Application as usize].next_pn =
             commit.pn.saturating_add(1);
         if commit.ack_included {
-            self.connection.received[crate::conn::Epoch::Application as usize].ack_pending = false;
+            self.connection.receive.packet_numbers[crate::conn::Epoch::Application as usize]
+                .ack_pending = false;
         }
         if commit.datagram {
             self.connection.egress.pending_datagrams.pop_front();
@@ -72,7 +73,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
         };
         self.connection.egress.spaces[epoch as usize].next_pn = pn.saturating_add(1);
         if commit.properties.ack_included {
-            self.connection.received[epoch as usize].ack_pending = false;
+            self.connection.receive.packet_numbers[epoch as usize].ack_pending = false;
         }
         if let Some(delivery) = commit.crypto {
             let Some(handle) = self.connection.handshake.crypto_mut().commit(

@@ -69,21 +69,24 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Epochs<'a, DOMAIN, B> {
     pub(in crate::conn) fn discard_initial(&mut self) {
         Transition::new(&mut self.connection.egress, &mut self.connection.handshake)
             .discard_initial();
-        self.connection.received[conn::Epoch::Initial as usize] = pn_space::Receive::default();
-        self.connection.recv_crypto[conn::Epoch::Initial as usize].discard();
+        self.connection.receive.packet_numbers[conn::Epoch::Initial as usize] =
+            pn_space::Receive::default();
+        self.connection.receive.crypto[conn::Epoch::Initial as usize].discard();
     }
 
     pub(in crate::conn) fn retry_initial(&mut self) {
         Transition::new(&mut self.connection.egress, &mut self.connection.handshake)
             .retry_initial();
-        self.connection.received[conn::Epoch::Initial as usize] = pn_space::Receive::default();
-        self.connection.recv_crypto[conn::Epoch::Initial as usize].discard();
+        self.connection.receive.packet_numbers[conn::Epoch::Initial as usize] =
+            pn_space::Receive::default();
+        self.connection.receive.crypto[conn::Epoch::Initial as usize].discard();
     }
 
     pub(in crate::conn) fn discard_handshake(&mut self) {
         Transition::new(&mut self.connection.egress, &mut self.connection.handshake)
             .discard_handshake();
-        self.connection.received[conn::Epoch::Handshake as usize] = pn_space::Receive::default();
-        self.connection.recv_crypto[conn::Epoch::Handshake as usize].discard();
+        self.connection.receive.packet_numbers[conn::Epoch::Handshake as usize] =
+            pn_space::Receive::default();
+        self.connection.receive.crypto[conn::Epoch::Handshake as usize].discard();
     }
 }

@@ -24,7 +24,7 @@ impl<'connection, const DOMAIN: u8, B: stream::ReceiveBuffer>
         epoch: conn::Epoch,
         pn: u64,
     ) -> Option<Self> {
-        let fresh = connection.received[epoch as usize].admit(pn)?;
+        let fresh = connection.receive.packet_numbers[epoch as usize].admit(pn)?;
         Some(Self {
             connection,
             epoch,
@@ -53,8 +53,8 @@ impl<'connection, const DOMAIN: u8, B: stream::ReceiveBuffer>
             fresh,
             discarded,
         } = self;
-        connection.received[epoch as usize].commit(fresh, ack_eliciting, now);
-        discarded.apply(&mut connection.received);
+        connection.receive.packet_numbers[epoch as usize].commit(fresh, ack_eliciting, now);
+        discarded.apply(&mut connection.receive.packet_numbers);
         connection.egress.last_activity = now;
         connection.egress.ack_eliciting_sent_since_last_receive = false;
     }

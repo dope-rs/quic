@@ -171,8 +171,9 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
         let Some(zr) = self.ingress.connection.handshake.zero_rtt_read_key() else {
             return Ok(());
         };
-        let expected =
-            self.ingress.connection.received[conn::Epoch::Application as usize].expected_pn();
+        let expected = self.ingress.connection.receive.packet_numbers
+            [conn::Epoch::Application as usize]
+            .expected_pn();
         let packet = packet
             .decrypt(zr, expected)
             .map_err(|_| conn::Error::PacketDecrypt)?;
@@ -204,7 +205,7 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
         else {
             return Ok(());
         };
-        if self.ingress.connection.is_client
+        if self.ingress.connection.peer.is_client
             && self.ingress.connection.path.peer_first_scid.is_none()
         {
             self.ingress
@@ -212,8 +213,9 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
                 .path
                 .set_first_peer_cid(packet.scid());
         }
-        let expected =
-            self.ingress.connection.received[conn::Epoch::Initial as usize].expected_pn();
+        let expected = self.ingress.connection.receive.packet_numbers
+            [conn::Epoch::Initial as usize]
+            .expected_pn();
         let packet = packet
             .decrypt(initial_r, expected)
             .map_err(|_| conn::Error::PacketDecrypt)?;
@@ -245,8 +247,9 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
         else {
             return Ok(());
         };
-        let expected =
-            self.ingress.connection.received[conn::Epoch::Handshake as usize].expected_pn();
+        let expected = self.ingress.connection.receive.packet_numbers
+            [conn::Epoch::Handshake as usize]
+            .expected_pn();
         let packet = packet
             .decrypt(hr, expected)
             .map_err(|_| conn::Error::PacketDecrypt)?;
@@ -282,8 +285,9 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
         };
         let pn_offset =
             packet::ShortHeader::pn_offset_for(self.ingress.connection.path.local_cid().len());
-        let expected =
-            self.ingress.connection.received[conn::Epoch::Application as usize].expected_pn();
+        let expected = self.ingress.connection.receive.packet_numbers
+            [conn::Epoch::Application as usize]
+            .expected_pn();
         let (pn, body) = ar
             .decrypt_short_in_place(packet.as_mut(), pn_offset, expected)
             .map_err(|_| conn::Error::PacketDecrypt)?;

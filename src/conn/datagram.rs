@@ -42,7 +42,8 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Datagrams<'conn, DOMAIN,
     pub fn max_payload(&self) -> Option<usize> {
         let peer = self
             .connection
-            .peer_transport_params
+            .peer
+            .transport_params
             .as_ref()
             .and_then(|parameters| parameters.max_datagram_frame_size)?;
         if peer == 0 {
@@ -56,7 +57,7 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Datagrams<'conn, DOMAIN,
     }
 
     pub fn recv(&mut self) -> Option<B> {
-        self.connection.incoming_datagrams.pop_front()
+        self.connection.receive.datagrams.pop_front()
     }
 
     pub fn recv_owned(&mut self) -> Option<Vec<u8>> {
@@ -64,6 +65,6 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Datagrams<'conn, DOMAIN,
     }
 
     pub(crate) fn has_received(&self) -> bool {
-        !self.connection.incoming_datagrams.is_empty()
+        !self.connection.receive.datagrams.is_empty()
     }
 }

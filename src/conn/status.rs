@@ -73,7 +73,7 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> View<'conn, DOMAIN, B> {
     }
 
     pub fn peer_transport_params(&self) -> Option<&'conn transport_params::Params> {
-        self.connection.peer_transport_params.as_ref()
+        self.connection.peer.transport_params.as_ref()
     }
 
     pub fn handshake_confirmed(&self) -> bool {

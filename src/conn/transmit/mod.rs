@@ -120,9 +120,11 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
             && self.connection.egress.pto_probe_allowance == 0
             && self.connection.egress.pending_close.is_none()
             && (!eligibility::Eligibility::new(self.connection).has_initial_crypto()
-                && !self.connection.received[conn::Epoch::Initial as usize].ack_pending)
+                && !self.connection.receive.packet_numbers[conn::Epoch::Initial as usize]
+                    .ack_pending)
             && (!eligibility::Eligibility::new(self.connection).has_handshake_crypto()
-                && !self.connection.received[conn::Epoch::Handshake as usize].ack_pending)
+                && !self.connection.receive.packet_numbers[conn::Epoch::Handshake as usize]
+                    .ack_pending)
             && self.connection.control.is_empty()
             && !self.connection.path.controls_pending()
             && !self
@@ -266,7 +268,8 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
                 }
                 let has_crypto =
                     eligibility::Eligibility::new(self.connection).has_initial_crypto();
-                let has_ack = self.connection.received[conn::Epoch::Initial as usize].ack_pending;
+                let has_ack = self.connection.receive.packet_numbers[conn::Epoch::Initial as usize]
+                    .ack_pending;
                 if !has_crypto && !has_ack {
                     break;
                 }
@@ -340,7 +343,9 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
                 }
                 let has_crypto =
                     eligibility::Eligibility::new(self.connection).has_handshake_crypto();
-                let has_ack = self.connection.received[conn::Epoch::Handshake as usize].ack_pending;
+                let has_ack = self.connection.receive.packet_numbers
+                    [conn::Epoch::Handshake as usize]
+                    .ack_pending;
                 if !has_crypto && !has_ack {
                     break;
                 }
@@ -394,8 +399,9 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
                 if remaining == 0 {
                     break;
                 }
-                let has_app_ack =
-                    self.connection.received[conn::Epoch::Application as usize].ack_pending;
+                let has_app_ack = self.connection.receive.packet_numbers
+                    [conn::Epoch::Application as usize]
+                    .ack_pending;
                 let has_datagrams = !self.connection.egress.pending_datagrams.is_empty();
                 let has_streams = !self.connection.streams.transmit.scratch_pending.is_empty();
                 let has_lifecycle = self
@@ -480,7 +486,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
         {
             conn::recovery::epochs::Epochs::new(self.connection).discard_initial();
         }
-        if sent_handshake_done && !self.connection.is_client {
+        if sent_handshake_done && !self.connection.peer.is_client {
             conn::recovery::epochs::Epochs::new(self.connection).discard_handshake();
         }
 

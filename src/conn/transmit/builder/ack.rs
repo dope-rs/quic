@@ -9,7 +9,7 @@ pub(in crate::conn) trait Ack {
 
 impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Ack for builder::Builder<'_, DOMAIN, B> {
     fn append_ack_frame(&mut self, epoch: conn::Epoch, out: &mut Vec<u8>, limit: usize) -> bool {
-        let receive = &self.connection.received[epoch as usize];
+        let receive = &self.connection.receive.packet_numbers[epoch as usize];
         if !receive.ack_pending {
             return false;
         }
