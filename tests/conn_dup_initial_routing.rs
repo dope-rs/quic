@@ -1,8 +1,10 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
+use dope_quic::conn;
+use dope_quic::mux::{Handler, Mux};
 use dope_quic::packet::{InitialHeader, QUIC_V1};
-use dope_quic::{Handler, Mux, conn, transport_params};
+use dope_quic::transport_params;
 use shin::crypto::sig::SigningKey;
 
 #[derive(Default)]

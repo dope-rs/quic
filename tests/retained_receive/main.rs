@@ -9,7 +9,10 @@ use dope::core::driver::settings;
 use dope::manifold::timing;
 use dope::runtime::{executor::Executor, shutdown};
 use dope_quic::conn::{self, Handle, server, session::Connection};
-use dope_quic::{Handler, RecvBuffer, RetainedSocket, endpoint, transport_params};
+use dope_quic::endpoint::{self, RetainedSocket};
+use dope_quic::mux::Handler;
+use dope_quic::stream::RecvBuffer;
+use dope_quic::transport_params;
 use shin::crypto::sig::SigningKey;
 use shin::server::config::NoGuard;
 

@@ -91,7 +91,7 @@ where
         server_pubkey: [u8; 32],
         client_tp: transport_params::Params,
         initial_dcid: Vec<u8>,
-    ) -> Result<conn::Handle, crate::ConnectFailure> {
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure> {
         self.inner
             .as_mut()
             .connect(peer_addr, server_pubkey, client_tp, initial_dcid)
@@ -103,7 +103,7 @@ where
         pool: &'tls conn::tls::ClientPool,
         client_tp: transport_params::Params,
         initial_dcid: Vec<u8>,
-    ) -> Result<conn::Handle, crate::ConnectFailure> {
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure> {
         self.inner
             .as_mut()
             .connect_pooled(peer_addr, pool, client_tp, initial_dcid)
@@ -120,7 +120,7 @@ where
         &mut self,
         handle: conn::Handle,
         data: Vec<u8>,
-    ) -> Result<(), crate::SendFailure<Vec<u8>>> {
+    ) -> Result<(), crate::errors::SendFailure<Vec<u8>>> {
         self.inner.as_mut().try_send_datagram(handle, data)
     }
 }
@@ -484,7 +484,7 @@ where
         server_pubkey: [u8; 32],
         client_tp: transport_params::Params,
         initial_dcid: Vec<u8>,
-    ) -> Result<conn::Handle, crate::ConnectFailure> {
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure> {
         self.connect_with_config(peer_addr, server_pubkey, client_tp.into(), initial_dcid)
     }
 
@@ -494,9 +494,9 @@ where
         server_pubkey: [u8; 32],
         client_config: conn::config::Options,
         initial_dcid: Vec<u8>,
-    ) -> Result<conn::Handle, crate::ConnectFailure> {
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure> {
         let initial_dcid = packet::ConnectionId::try_from(initial_dcid)
-            .map_err(|_| crate::ConnectFailure::InvalidConfig)?;
+            .map_err(|_| crate::errors::ConnectFailure::InvalidConfig)?;
         self.connect_with_config_id(peer_addr, server_pubkey, client_config, initial_dcid)
     }
 
@@ -506,7 +506,7 @@ where
         server_pubkey: [u8; 32],
         mut client_config: conn::config::Options,
         initial_dcid: packet::ConnectionId,
-    ) -> Result<conn::Handle, crate::ConnectFailure> {
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure> {
         let now = time::Instant::now();
         client_config.max_pmtu = client_config
             .max_pmtu
@@ -541,7 +541,7 @@ where
         self: pin::Pin<&mut Self>,
         handle: conn::Handle,
         data: Vec<u8>,
-    ) -> Result<(), crate::SendFailure<Vec<u8>>> {
+    ) -> Result<(), crate::errors::SendFailure<Vec<u8>>> {
         let now = time::Instant::now();
         self.project()
             .udp
@@ -655,7 +655,7 @@ where
         pool: &'tls conn::tls::ClientPool,
         client_tp: transport_params::Params,
         initial_dcid: Vec<u8>,
-    ) -> Result<conn::Handle, crate::ConnectFailure> {
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure> {
         self.connect_pooled_with_config(peer_addr, pool, client_tp.into(), initial_dcid)
     }
 
@@ -665,9 +665,9 @@ where
         pool: &'tls conn::tls::ClientPool,
         client_config: conn::config::Options,
         initial_dcid: Vec<u8>,
-    ) -> Result<conn::Handle, crate::ConnectFailure> {
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure> {
         let initial_dcid = packet::ConnectionId::try_from(initial_dcid)
-            .map_err(|_| crate::ConnectFailure::InvalidConfig)?;
+            .map_err(|_| crate::errors::ConnectFailure::InvalidConfig)?;
         self.connect_pooled_with_config_id(peer_addr, pool, client_config, initial_dcid)
     }
 
@@ -677,7 +677,7 @@ where
         pool: &'tls conn::tls::ClientPool,
         mut client_config: conn::config::Options,
         initial_dcid: packet::ConnectionId,
-    ) -> Result<conn::Handle, crate::ConnectFailure> {
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure> {
         let now = time::Instant::now();
         client_config.max_pmtu = client_config
             .max_pmtu

@@ -1,4 +1,4 @@
-use dope_quic::Handler;
+use dope_quic::mux::Handler;
 
 struct BorrowedHandler<'a> {
     state: &'a u64,

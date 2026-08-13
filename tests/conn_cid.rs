@@ -4,7 +4,9 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use dope_quic::conn::Handle;
-use dope_quic::{Handler, Mux, conn::session::Connection, transport_params};
+use dope_quic::conn::session::Connection;
+use dope_quic::mux::{Handler, Mux};
+use dope_quic::transport_params;
 use shin::crypto::sig::SigningKey;
 
 const CID: [u8; 8] = [0x42; 8];

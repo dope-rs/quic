@@ -6,7 +6,10 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use dope_quic::conn::Handle;
-use dope_quic::{Handler, Mux, SendFailure, conn, conn::session::Connection, transport_params};
+use dope_quic::conn::{self, session::Connection};
+use dope_quic::errors::SendFailure;
+use dope_quic::mux::{Handler, Mux};
+use dope_quic::transport_params;
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 
@@ -553,7 +556,7 @@ fn shutdown_retires_connections_deadlines_and_outgoing() {
             CID.to_vec(),
             now,
         ),
-        Err(dope_quic::ConnectFailure::Closed)
+        Err(dope_quic::errors::ConnectFailure::Closed)
     );
     assert!(client.output().drain().next().is_none());
 }

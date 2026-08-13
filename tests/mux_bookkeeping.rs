@@ -6,7 +6,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use dope_quic::{Handler, conn};
+use dope_quic::conn;
+use dope_quic::mux::Handler;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 

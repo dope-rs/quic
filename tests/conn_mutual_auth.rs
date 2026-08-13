@@ -1,9 +1,10 @@
 use std::time::Instant;
 
-use dope_quic::client_auth::{ClientAuth, ClientCertVerifier, ClientIdentity, Identity};
 use dope_quic::conn::server;
 use dope_quic::{conn, transport_params};
+use shin::client::config::Identity;
 use shin::crypto::sig::SigningKey;
+use shin::server::config::{ClientAuth, ClientCertVerifier, ClientIdentity};
 
 const CID: [u8; 8] = [0x42; 8];
 

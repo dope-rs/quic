@@ -3,7 +3,8 @@ use crate::{Capture, CaptureControl};
 // SAFETY: the control exposes only test-owned command state and cannot move
 // or replace retained endpoint storage.
 unsafe impl<'d, const ID: u8>
-    dope_quic::endpoint::raw::ControlHandler<'d, ID, dope_quic::RecvBuffer<'d>> for Capture
+    dope_quic::endpoint::raw::ControlHandler<'d, ID, dope_quic::stream::RecvBuffer<'d>>
+    for Capture
 {
     type Control<'step>
         = CaptureControl<'step>

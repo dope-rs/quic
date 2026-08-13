@@ -4,13 +4,15 @@ use std::time::Instant;
 
 use dope_quic::conn::Error;
 use dope_quic::conn::server;
+use dope_quic::conn::{self, session::Connection};
 use dope_quic::early_data::ReplayCache;
+use dope_quic::errors::ConnectFailure;
 use dope_quic::frame::Frame;
+use dope_quic::mux::Handler;
 use dope_quic::packet::{InitialHeader, QUIC_V1};
 use dope_quic::packet_protection::PacketProtection;
 use dope_quic::qkdf::{InitialSecrets, PacketKeys};
 use dope_quic::varint::VarInt;
-use dope_quic::{ConnectFailure, Handler, conn, conn::session::Connection};
 
 const INITIAL_DCID: [u8; 8] = [0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce];
 const CLIENT_SCID: [u8; 4] = [1, 2, 3, 4];

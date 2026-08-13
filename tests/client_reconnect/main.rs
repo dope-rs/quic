@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 use dope::core::driver::settings;
 use dope::manifold::timing;
 use dope::runtime::{executor::Executor, shutdown};
+use dope_quic::client::{self, BackoffPolicy, Client, EndpointSpec, Protocol, SlotId};
+use dope_quic::conn;
 use dope_quic::conn::{Handle, session::Connection};
-use dope_quic::{
-    BackoffPolicy, Client, Endpoint, EndpointSpec, Handler, Protocol, SlotId, client, conn,
-    endpoint, transport_params,
-};
+use dope_quic::endpoint::{self, Endpoint};
+use dope_quic::mux::Handler;
+use dope_quic::transport_params;
 use shin::crypto::sig::SigningKey;
 
 const ENDPOINT: endpoint::Config = endpoint::Config {

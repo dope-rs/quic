@@ -10,7 +10,10 @@ use dope::manifold::timing;
 use dope::runtime::{executor::Executor, shutdown};
 use dope_quic::conn::Handle;
 use dope_quic::conn::server;
-use dope_quic::{Endpoint, Handler, conn, conn::session::Connection, endpoint, transport_params};
+use dope_quic::conn::{self, session::Connection};
+use dope_quic::endpoint::{self, Endpoint};
+use dope_quic::mux::Handler;
+use dope_quic::transport_params;
 use shin::crypto::sig::SigningKey;
 use shin::server::config::NoGuard;
 

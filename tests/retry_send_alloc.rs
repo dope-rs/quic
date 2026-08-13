@@ -7,8 +7,8 @@ use std::time::Instant;
 
 use dope_quic::conn;
 use dope_quic::conn::session::Connection;
+use dope_quic::mux::{Handler, Outgoing};
 use dope_quic::packet::{InitialHeader, QUIC_V1, RetryRef};
-use dope_quic::{Handler, mux::Outgoing};
 use shin::crypto::sig::SigningKey;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);

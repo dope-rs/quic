@@ -3,7 +3,9 @@ pub mod support;
 use std::time::Instant;
 
 use dope_quic::conn::server;
-use dope_quic::{SendFailure, conn, conn::session::Connection, transport_params};
+use dope_quic::conn::{self, session::Connection};
+use dope_quic::errors::SendFailure;
+use dope_quic::transport_params;
 
 const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
 

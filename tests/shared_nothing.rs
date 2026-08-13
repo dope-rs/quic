@@ -1,10 +1,10 @@
-use dope_quic::Handler;
-use dope_quic::client_auth::{ClientAuth, ClientCertVerifier, ClientIdentity};
 use dope_quic::conn::server;
 use dope_quic::early_data::ReplayCache;
+use dope_quic::mux::Handler;
 use shin::crypto::sig::SigningKey;
 use shin::crypto::ticket::Keys;
 use shin::server::config::NoGuard;
+use shin::server::config::{ClientAuth, ClientCertVerifier, ClientIdentity};
 
 struct Noop;
 

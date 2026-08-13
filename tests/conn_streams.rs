@@ -2,11 +2,11 @@ pub mod support;
 
 use std::time::{Duration, Instant};
 
-use dope_quic::SendBuffer;
 use dope_quic::conn::{
     self,
     stream::{Error, Event},
 };
+use dope_quic::stream::SendBuffer;
 use o3::buffer::{
     bytes::{Bytes, Retained},
     storage::Shared,

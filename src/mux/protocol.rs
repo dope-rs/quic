@@ -41,9 +41,9 @@ impl<
         client_config: conn::config::Options,
         initial_dcid: Vec<u8>,
         now: time::Instant,
-    ) -> Result<conn::Handle, crate::ConnectFailure> {
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure> {
         let initial_dcid = packet::ConnectionId::try_from(initial_dcid)
-            .map_err(|_| crate::ConnectFailure::InvalidConfig)?;
+            .map_err(|_| crate::errors::ConnectFailure::InvalidConfig)?;
         self.connect_id(peer_addr, server_pubkey, client_config, initial_dcid, now)
     }
 
@@ -54,24 +54,24 @@ impl<
         client_config: conn::config::Options,
         initial_dcid: packet::ConnectionId,
         now: time::Instant,
-    ) -> Result<conn::Handle, crate::ConnectFailure> {
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure> {
         self.mux.sync_dirty_connection();
         if self.mux.lifecycle.shutting_down {
-            return Err(crate::ConnectFailure::Closed);
+            return Err(crate::errors::ConnectFailure::Closed);
         }
         if self.mux.registry.active_conns >= self.mux.registry.max_conns {
-            return Err(crate::ConnectFailure::Capacity);
+            return Err(crate::errors::ConnectFailure::Capacity);
         }
         client_config.validate()?;
         let max_packet_bytes =
             super::setup::connection_ceiling(&client_config, self.mux.outgoing.bytes_capacity);
         if max_packet_bytes < pmtud::BASE_PMTU as usize {
-            return Err(crate::ConnectFailure::InvalidConfig);
+            return Err(crate::errors::ConnectFailure::InvalidConfig);
         }
         let local_cid = self
             .mux
             .gen_cid(client_config.cid_prefix)
-            .ok_or(crate::ConnectFailure::Capacity)?;
+            .ok_or(crate::errors::ConnectFailure::Capacity)?;
         let conn = conn::setup::Client::<DOMAIN>::connect_buffer::<B>(
             initial_dcid,
             local_cid,
@@ -81,19 +81,19 @@ impl<
         let handle = self
             .mux
             .insert_connection(conn, None, peer_addr, max_packet_bytes)
-            .ok_or(crate::ConnectFailure::Capacity)?;
+            .ok_or(crate::errors::ConnectFailure::Capacity)?;
         let index = self
             .mux
             .handle_index(handle)
-            .ok_or(crate::ConnectFailure::Capacity)?;
+            .ok_or(crate::errors::ConnectFailure::Capacity)?;
         let (key, local_cid) = self.mux.registry.entries[index]
             .slot_mut()
-            .ok_or(crate::ConnectFailure::Capacity)?
+            .ok_or(crate::errors::ConnectFailure::Capacity)?
             .conn
             .enable_cid_routing();
         if !self.mux.register_local_cid(handle, key, local_cid) {
             self.mux.remove_slot(handle);
-            return Err(crate::ConnectFailure::Capacity);
+            return Err(crate::errors::ConnectFailure::Capacity);
         }
         self.mux.schedule_flush(handle);
         self.mux.refresh_deadline(handle, now);
@@ -109,9 +109,9 @@ impl<
         client_config: conn::config::Options,
         initial_dcid: Vec<u8>,
         now: time::Instant,
-    ) -> Result<conn::Handle, crate::ConnectFailure> {
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure> {
         let initial_dcid = packet::ConnectionId::try_from(initial_dcid)
-            .map_err(|_| crate::ConnectFailure::InvalidConfig)?;
+            .map_err(|_| crate::errors::ConnectFailure::InvalidConfig)?;
         self.connect_pooled_id(peer_addr, pool, client_config, initial_dcid, now)
     }
 
@@ -122,24 +122,24 @@ impl<
         client_config: conn::config::Options,
         initial_dcid: packet::ConnectionId,
         now: time::Instant,
-    ) -> Result<conn::Handle, crate::ConnectFailure> {
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure> {
         self.mux.sync_dirty_connection();
         if self.mux.lifecycle.shutting_down {
-            return Err(crate::ConnectFailure::Closed);
+            return Err(crate::errors::ConnectFailure::Closed);
         }
         if self.mux.registry.active_conns >= self.mux.registry.max_conns {
-            return Err(crate::ConnectFailure::Capacity);
+            return Err(crate::errors::ConnectFailure::Capacity);
         }
         client_config.validate()?;
         let max_packet_bytes =
             super::setup::connection_ceiling(&client_config, self.mux.outgoing.bytes_capacity);
         if max_packet_bytes < pmtud::BASE_PMTU as usize {
-            return Err(crate::ConnectFailure::InvalidConfig);
+            return Err(crate::errors::ConnectFailure::InvalidConfig);
         }
         let local_cid = self
             .mux
             .gen_cid(client_config.cid_prefix)
-            .ok_or(crate::ConnectFailure::Capacity)?;
+            .ok_or(crate::errors::ConnectFailure::Capacity)?;
         let pooled = conn::setup::Client::<DOMAIN>::connect_pooled_buffer::<B>(
             initial_dcid,
             local_cid,
@@ -155,19 +155,19 @@ impl<
                 peer_addr,
                 max_packet_bytes,
             )
-            .ok_or(crate::ConnectFailure::Capacity)?;
+            .ok_or(crate::errors::ConnectFailure::Capacity)?;
         let index = self
             .mux
             .handle_index(handle)
-            .ok_or(crate::ConnectFailure::Capacity)?;
+            .ok_or(crate::errors::ConnectFailure::Capacity)?;
         let (key, local_cid) = self.mux.registry.entries[index]
             .slot_mut()
-            .ok_or(crate::ConnectFailure::Capacity)?
+            .ok_or(crate::errors::ConnectFailure::Capacity)?
             .conn
             .enable_cid_routing();
         if !self.mux.register_local_cid(handle, key, local_cid) {
             self.mux.remove_slot(handle);
-            return Err(crate::ConnectFailure::Capacity);
+            return Err(crate::errors::ConnectFailure::Capacity);
         }
         self.mux.schedule_flush(handle);
         self.mux.refresh_deadline(handle, now);
@@ -298,9 +298,9 @@ impl<
         handle: conn::Handle,
         data: Vec<u8>,
         now: time::Instant,
-    ) -> Result<(), crate::SendFailure<Vec<u8>>> {
+    ) -> Result<(), crate::errors::SendFailure<Vec<u8>>> {
         if self.mux.lifecycle.shutting_down {
-            return Err(crate::SendFailure::Closed(data));
+            return Err(crate::errors::SendFailure::Closed(data));
         }
         let result = match self
             .mux
@@ -309,7 +309,7 @@ impl<
             .and_then(crate::mux::Entry::slot_mut)
         {
             Some(slot) => slot.conn.datagrams().try_send(data),
-            None => Err(crate::SendFailure::Closed(data)),
+            None => Err(crate::errors::SendFailure::Closed(data)),
         };
         self.mux.schedule_flush(handle);
         self.mux.refresh_deadline(handle, now);

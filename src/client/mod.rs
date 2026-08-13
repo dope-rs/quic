@@ -76,7 +76,7 @@ pub trait EndpointAuthority<'tls>: Copy + authority::Authority {
         addr: net::SocketAddr,
         config: conn::config::Options,
         dcid: packet::ConnectionId,
-    ) -> Result<conn::Handle, crate::ConnectFailure>;
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure>;
 }
 
 impl authority::Authority for [u8; 32] {}
@@ -89,7 +89,7 @@ impl<'tls> EndpointAuthority<'tls> for [u8; 32] {
         addr: net::SocketAddr,
         config: conn::config::Options,
         dcid: packet::ConnectionId,
-    ) -> Result<conn::Handle, crate::ConnectFailure> {
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure> {
         endpoint.connect_with_config_id(addr, self, config, dcid)
     }
 }
@@ -104,7 +104,7 @@ impl<'tls> EndpointAuthority<'tls> for &'tls conn::tls::ClientPool {
         addr: net::SocketAddr,
         config: conn::config::Options,
         dcid: packet::ConnectionId,
-    ) -> Result<conn::Handle, crate::ConnectFailure> {
+    ) -> Result<conn::Handle, crate::errors::ConnectFailure> {
         endpoint.connect_pooled_with_config_id(addr, self, config, dcid)
     }
 }
@@ -306,7 +306,7 @@ where
         &mut self,
         slot: SlotId,
         data: Vec<u8>,
-    ) -> Result<(), crate::SendFailure<Vec<u8>>> {
+    ) -> Result<(), crate::errors::SendFailure<Vec<u8>>> {
         self.inner.as_mut().try_send_datagram(slot, data)
     }
 }
@@ -553,18 +553,18 @@ where
         self: pin::Pin<&mut Self>,
         slot: SlotId,
         data: Vec<u8>,
-    ) -> Result<(), crate::SendFailure<Vec<u8>>> {
+    ) -> Result<(), crate::errors::SendFailure<Vec<u8>>> {
         let mut this = self.project();
         let index = slot.index() as usize;
         let Some(ep) = this.endpoints.get_mut(index) else {
-            return Err(crate::SendFailure::Closed(data));
+            return Err(crate::errors::SendFailure::Closed(data));
         };
         let Some(handle) = ep.handle else {
-            return Err(crate::SendFailure::Closed(data));
+            return Err(crate::errors::SendFailure::Closed(data));
         };
         match this.inner.as_mut().try_send_datagram(handle, data) {
             Ok(()) => Ok(()),
-            Err(crate::SendFailure::Closed(data)) => {
+            Err(crate::errors::SendFailure::Closed(data)) => {
                 this.inner.as_mut().close(handle);
                 this.inner.as_mut().handler_mut().unbind(handle);
                 ep.handle = None;
@@ -572,7 +572,7 @@ where
                 let retry_at = this.backoff.next_retry_at(ep.attempt, time::Instant::now());
                 this.retries.remove(index);
                 let _ = this.retries.insert(index, retry_at);
-                Err(crate::SendFailure::Closed(data))
+                Err(crate::errors::SendFailure::Closed(data))
             }
             Err(error) => Err(error),
         }

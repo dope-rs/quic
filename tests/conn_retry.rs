@@ -4,8 +4,9 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use dope_quic::conn::Error;
+use dope_quic::conn::{self, session::Connection};
+use dope_quic::mux::{Handler, Mux};
 use dope_quic::packet::{ConnectionIdRef, InitialHeader, QUIC_V1, Retry, RetryRef, VerifiedRetry};
-use dope_quic::{Handler, Mux, conn, conn::session::Connection};
 
 #[test]
 fn rfc9001_a4_vector_round_trips() {

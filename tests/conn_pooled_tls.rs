@@ -1,9 +1,10 @@
 use std::time::Instant;
 
 use dope_quic::conn::{self, setup, tls};
+use dope_quic::errors::ConnectFailure;
 use dope_quic::packet::ConnectionId;
+use dope_quic::transport_params;
 use dope_quic::varint::VarInt;
-use dope_quic::{ConnectFailure, transport_params};
 use shin::crypto::sig::SigningKey;
 use shin::server::{
     Shard,

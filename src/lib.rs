@@ -23,18 +23,4 @@ pub mod stream;
 pub mod transport_params;
 pub mod varint;
 
-pub use client::{
-    BackoffPolicy, Client, EndpointSpec, PathStats, PooledDialer, PooledEndpointSpec, Protocol,
-    SlotId,
-};
-pub use endpoint::{
-    Endpoint, PooledControl, PooledRetainedControl, PooledRetainedSocket, PooledSocket,
-    RetainedControl, RetainedSocket,
-};
-pub use errors::{ConnectFailure, SendFailure};
-pub use mux::{Handler, Mux, PooledRouter};
 pub use o3::buffer::CapacityError;
-pub use stream::{INLINE_SEND_CAPACITY, ReceiveBuffer, RecvBuffer, SendBuffer};
-pub use transport_params::TransportParameterError;
-
-pub mod client_auth;
