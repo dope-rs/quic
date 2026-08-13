@@ -95,8 +95,32 @@ struct Ring {
     slots: index::Slots<Packet>,
     controls: arena::Stack<delivery::Handle<delivery::Control>>,
     streams: arena::Stack<delivery::Handle<delivery::Stream>>,
+    bounds: PacketBounds,
+}
+
+#[derive(Default)]
+struct PacketBounds {
     lowest: Option<u64>,
     highest: Option<u64>,
+}
+
+impl PacketBounds {
+    fn include(&mut self, pn: u64) {
+        self.lowest = Some(self.lowest.map_or(pn, |lowest| lowest.min(pn)));
+        self.highest = Some(self.highest.map_or(pn, |highest| highest.max(pn)));
+    }
+
+    fn clear(&mut self) {
+        self.lowest = None;
+        self.highest = None;
+    }
+
+    fn rebuild(&mut self, slots: &index::Slots<Packet>) {
+        self.clear();
+        for present in slots.values() {
+            self.include(present.pn);
+        }
+    }
 }
 
 impl Default for Ring {
@@ -116,8 +140,7 @@ impl Ring {
             slots: index::Slots::with_capacity(capacity),
             controls: arena::Stack::with_capacity(control_capacity, carrier_lanes),
             streams: arena::Stack::with_capacity(stream_capacity, carrier_lanes),
-            lowest: None,
-            highest: None,
+            bounds: PacketBounds::default(),
         }
     }
 
@@ -137,8 +160,7 @@ impl Ring {
         if self.slots.try_insert(slot, journal).is_err() {
             return None;
         }
-        self.lowest = Some(self.lowest.map_or(journal.pn, |pn| pn.min(journal.pn)));
-        self.highest = Some(self.highest.map_or(journal.pn, |pn| pn.max(journal.pn)));
+        self.bounds.include(journal.pn);
         Some(slot)
     }
 
@@ -185,15 +207,6 @@ impl Ring {
         );
     }
 
-    fn reindex(&mut self) {
-        self.lowest = None;
-        self.highest = None;
-        for present in self.slots.values() {
-            self.lowest = Some(self.lowest.map_or(present.pn, |low| low.min(present.pn)));
-            self.highest = Some(self.highest.map_or(present.pn, |high| high.max(present.pn)));
-        }
-    }
-
     /// First present packet number in `from..=to`, one slot probe per number.
     fn scan_up(&self, from: u64, to: u64) -> Option<u64> {
         (from..=to).find(|&pn| self.get(pn).is_some())
@@ -210,7 +223,7 @@ impl Ring {
         largest: u64,
         emit: &mut impl FnMut(Packet, ControlDrain<'_>, StreamDrain<'_>),
     ) {
-        let (Some(lowest), Some(highest)) = (self.lowest, self.highest) else {
+        let (Some(lowest), Some(highest)) = (self.bounds.lowest, self.bounds.highest) else {
             return;
         };
         let smallest = smallest.max(lowest);
@@ -229,19 +242,18 @@ impl Ring {
             return;
         }
         if self.slots.is_empty() {
-            self.lowest = None;
-            self.highest = None;
+            self.bounds.clear();
             return;
         }
         if smallest == lowest {
-            self.lowest = self.scan_up(largest + 1, highest);
+            self.bounds.lowest = self.scan_up(largest + 1, highest);
         }
         if largest == highest {
-            self.highest = self.scan_down(lowest, smallest - 1);
+            self.bounds.highest = self.scan_down(lowest, smallest - 1);
         }
-        if self.lowest.is_none() || self.highest.is_none() {
+        if self.bounds.lowest.is_none() || self.bounds.highest.is_none() {
             debug_assert!(false, "journal bounds lost with {} entries", self.len());
-            self.reindex();
+            self.bounds.rebuild(&self.slots);
         }
     }
 
@@ -268,7 +280,7 @@ impl Ring {
             },
         );
         if removed {
-            self.reindex();
+            self.bounds.rebuild(&self.slots);
         }
     }
 
@@ -380,10 +392,10 @@ impl Table {
         mut emit: impl FnMut(Packet, ControlDrain<'_>, StreamDrain<'_>),
     ) {
         let ring = self.ring_mut(epoch);
-        let Some(lowest) = ring.lowest else {
+        let Some(lowest) = ring.bounds.lowest else {
             return;
         };
-        let highest = ring.highest.unwrap_or(lowest).min(largest_acked);
+        let highest = ring.bounds.highest.unwrap_or(lowest).min(largest_acked);
         let mut removed = false;
         for pn in lowest..=highest {
             let Some(journal) = ring.get(pn).copied() else {
@@ -401,7 +413,7 @@ impl Table {
             }
         }
         if removed {
-            ring.reindex();
+            ring.bounds.rebuild(&ring.slots);
         }
         self.recount();
     }
