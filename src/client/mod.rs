@@ -82,7 +82,6 @@ pub trait EndpointAuthority<'tls>: Copy + authority::Authority {
 impl authority::Authority for [u8; 32] {}
 
 impl<'tls> EndpointAuthority<'tls> for [u8; 32] {
-    #[inline]
     fn connect<'d, const ID: u8, H: mux::Handler<ID>>(
         self,
         endpoint: pin::Pin<&mut endpoint::PooledSocket<'d, 'tls, ID, H>>,
@@ -97,7 +96,6 @@ impl<'tls> EndpointAuthority<'tls> for [u8; 32] {
 impl authority::Authority for &conn::tls::ClientPool {}
 
 impl<'tls> EndpointAuthority<'tls> for &'tls conn::tls::ClientPool {
-    #[inline]
     fn connect<'d, const ID: u8, H: mux::Handler<ID>>(
         self,
         endpoint: pin::Pin<&mut endpoint::PooledSocket<'d, 'tls, ID, H>>,

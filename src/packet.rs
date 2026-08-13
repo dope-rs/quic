@@ -42,7 +42,6 @@ impl ConnectionId {
         cid
     }
 
-    #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes[..usize::from(self.len)]
     }

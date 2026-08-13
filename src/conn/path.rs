@@ -346,17 +346,14 @@ impl Path {
         )
     }
 
-    #[inline(always)]
     pub(super) fn peer_cid(&self) -> &[u8] {
         self.active_peer_cid.id.as_slice()
     }
 
-    #[inline(always)]
     pub(super) fn local_cid(&self) -> &[u8] {
         self.initial_local_cid.as_slice()
     }
 
-    #[inline(always)]
     pub(super) const fn local_cid_id(&self) -> packet::ConnectionId {
         self.initial_local_cid
     }
