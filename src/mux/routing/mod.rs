@@ -8,7 +8,6 @@ use std::time;
 use crate::conn;
 use crate::conn::path;
 use crate::conn::session;
-use crate::conn::transmit::eligibility::Eligibility;
 use crate::packet;
 
 use crate::stream;
@@ -429,7 +428,10 @@ impl<
             return Some(now);
         }
         let mut deadline = slot.conn.status().next_timer();
-        if !flush_linked && let Some(send) = Eligibility::new(&slot.conn).send_deadline(now) {
+        if !flush_linked
+            && let Some(send) =
+                crate::conn::transmit::eligibility::Eligibility::new(&slot.conn).send_deadline(now)
+        {
             deadline = Some(deadline.map_or(send, |timer| timer.min(send)));
         }
         deadline

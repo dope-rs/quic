@@ -11,7 +11,6 @@ use builder::application::datagram::BuildDatagram as _;
 use builder::application::one_rtt::BuildOneRtt as _;
 use builder::application::terminal::BuildTerminal as _;
 use builder::application::zero_rtt::BuildZeroRtt as _;
-use eligibility::Eligibility;
 
 pub struct Emission<'a, const DOMAIN: u8, B: stream::ReceiveBuffer = Vec<u8>> {
     connection: &'a mut conn::session::Connection<DOMAIN, B>,
@@ -120,9 +119,9 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
             && !self.connection.egress.pending_datagrams.is_empty()
             && self.connection.egress.pto_probe_allowance == 0
             && self.connection.egress.pending_close.is_none()
-            && (!Eligibility::new(self.connection).has_initial_crypto()
+            && (!eligibility::Eligibility::new(self.connection).has_initial_crypto()
                 && !self.connection.received[conn::Epoch::Initial as usize].ack_pending)
-            && (!Eligibility::new(self.connection).has_handshake_crypto()
+            && (!eligibility::Eligibility::new(self.connection).has_handshake_crypto()
                 && !self.connection.received[conn::Epoch::Handshake as usize].ack_pending)
             && self.connection.control.is_empty()
             && !self.connection.path.controls_pending()
@@ -147,9 +146,9 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
             let validated = self.connection.egress.peer_address_validated;
             if (FAST
                 && !validated
-                && !Eligibility::new(self.connection).anti_amplification_allows())
+                && !eligibility::Eligibility::new(self.connection).anti_amplification_allows())
                 || (!FAST
-                    && !Eligibility::new(self.connection)
+                    && !eligibility::Eligibility::new(self.connection)
                         .allows_emit_for(conn::packet::Cargo::DatagramOnly, now))
             {
                 break;
@@ -158,7 +157,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
                 packet_bytes
             } else {
                 let Some(packet_ceiling) =
-                    Eligibility::new(self.connection).emission_ceiling(packet_bytes)
+                    eligibility::Eligibility::new(self.connection).emission_ceiling(packet_bytes)
                 else {
                     break;
                 };
@@ -237,8 +236,8 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
         self.snapshot_pending_streams(control_work);
 
         while remaining != 0 && self.connection.egress.pto_probe_allowance != 0 {
-            let Some(packet_ceiling) =
-                Eligibility::new(self.connection).emission_ceiling(normal_packet_bytes)
+            let Some(packet_ceiling) = eligibility::Eligibility::new(self.connection)
+                .emission_ceiling(normal_packet_bytes)
             else {
                 break;
             };
@@ -260,18 +259,19 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
             .is_some()
         {
             while remaining != 0 {
-                if !Eligibility::new(self.connection)
+                if !eligibility::Eligibility::new(self.connection)
                     .allows_emit_for(conn::packet::Cargo::CryptoOrAck, now)
                 {
                     break;
                 }
-                let has_crypto = Eligibility::new(self.connection).has_initial_crypto();
+                let has_crypto =
+                    eligibility::Eligibility::new(self.connection).has_initial_crypto();
                 let has_ack = self.connection.received[conn::Epoch::Initial as usize].ack_pending;
                 if !has_crypto && !has_ack {
                     break;
                 }
-                let Some(packet_ceiling) =
-                    Eligibility::new(self.connection).emission_ceiling(normal_packet_bytes)
+                let Some(packet_ceiling) = eligibility::Eligibility::new(self.connection)
+                    .emission_ceiling(normal_packet_bytes)
                 else {
                     break;
                 };
@@ -302,11 +302,11 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
                 .is_none()
         {
             while remaining != 0
-                && Eligibility::new(self.connection)
+                && eligibility::Eligibility::new(self.connection)
                     .allows_emit_for(conn::packet::Cargo::CryptoOrAck, now)
             {
-                let Some(packet_ceiling) =
-                    Eligibility::new(self.connection).emission_ceiling(normal_packet_bytes)
+                let Some(packet_ceiling) = eligibility::Eligibility::new(self.connection)
+                    .emission_ceiling(normal_packet_bytes)
                 else {
                     break;
                 };
@@ -333,18 +333,19 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
             .is_some()
         {
             while remaining != 0 {
-                if !Eligibility::new(self.connection)
+                if !eligibility::Eligibility::new(self.connection)
                     .allows_emit_for(conn::packet::Cargo::CryptoOrAck, now)
                 {
                     break;
                 }
-                let has_crypto = Eligibility::new(self.connection).has_handshake_crypto();
+                let has_crypto =
+                    eligibility::Eligibility::new(self.connection).has_handshake_crypto();
                 let has_ack = self.connection.received[conn::Epoch::Handshake as usize].ack_pending;
                 if !has_crypto && !has_ack {
                     break;
                 }
-                let Some(packet_ceiling) =
-                    Eligibility::new(self.connection).emission_ceiling(normal_packet_bytes)
+                let Some(packet_ceiling) = eligibility::Eligibility::new(self.connection)
+                    .emission_ceiling(normal_packet_bytes)
                 else {
                     break;
                 };
@@ -373,7 +374,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
             .is_some()
         {
             if remaining != 0 && self.connection.egress.pending_close.is_some() {
-                let commit = Eligibility::new(self.connection)
+                let commit = eligibility::Eligibility::new(self.connection)
                     .emission_ceiling(normal_packet_bytes)
                     .and_then(|packet_ceiling| {
                         sink.emit(packet_ceiling, |dst, packet_ceiling| {
@@ -408,14 +409,14 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
                     || has_lifecycle
                     || (has_app_ack && !has_datagrams);
                 if (!one_shot && !has_streams)
-                    || !Eligibility::new(self.connection)
+                    || !eligibility::Eligibility::new(self.connection)
                         .allows_emit_for(conn::packet::Cargo::CryptoOrAck, now)
                 {
                     break;
                 }
                 let before = self.connection.egress.cc.bytes_in_flight;
-                let Some(packet_ceiling) =
-                    Eligibility::new(self.connection).emission_ceiling(normal_packet_bytes)
+                let Some(packet_ceiling) = eligibility::Eligibility::new(self.connection)
+                    .emission_ceiling(normal_packet_bytes)
                 else {
                     break;
                 };
@@ -451,10 +452,10 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
             }
             if remaining != 0
                 && let Some(probe_size) = self.connection.egress.pmtud.next_probe()
-                && Eligibility::new(self.connection)
+                && eligibility::Eligibility::new(self.connection)
                     .allows_emit_for(conn::packet::Cargo::CryptoOrAck, now)
             {
-                let commit = Eligibility::new(self.connection)
+                let commit = eligibility::Eligibility::new(self.connection)
                     .emission_ceiling(max_packet_bytes)
                     .and_then(|packet_ceiling| {
                         sink.emit(packet_ceiling, |dst, packet_ceiling| {
