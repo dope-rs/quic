@@ -33,25 +33,26 @@ impl<'a, const DOMAIN: u8> Transition<'a, DOMAIN> {
     pub(in crate::conn) fn discard_initial(&mut self) {
         self.discard_packets(conn::Epoch::Initial);
         self.handshake.discard(conn::Epoch::Initial);
-        self.egress.spaces[conn::Epoch::Initial as usize] = pn_space::PnSpace::default();
+        self.egress.recovery.spaces[conn::Epoch::Initial as usize] = pn_space::PnSpace::default();
     }
 
     pub(in crate::conn) fn retry_initial(&mut self) {
         self.discard_packets(conn::Epoch::Initial);
         self.handshake.retry_initial_crypto();
-        self.egress.spaces[conn::Epoch::Initial as usize] = pn_space::PnSpace::default();
+        self.egress.recovery.spaces[conn::Epoch::Initial as usize] = pn_space::PnSpace::default();
     }
 
     pub(in crate::conn) fn discard_handshake(&mut self) {
         self.discard_packets(conn::Epoch::Handshake);
         self.handshake.discard(conn::Epoch::Handshake);
-        self.egress.spaces[conn::Epoch::Handshake as usize] = pn_space::PnSpace::default();
+        self.egress.recovery.spaces[conn::Epoch::Handshake as usize] = pn_space::PnSpace::default();
     }
 
     fn discard_packets(&mut self, epoch: conn::Epoch) {
-        let leaked = self.egress.packet_journals.in_flight_bytes(epoch);
-        self.egress.cc.discard(leaked);
+        let leaked = self.egress.recovery.packet_journals.in_flight_bytes(epoch);
+        self.egress.congestion.cc.discard(leaked);
         self.egress
+            .recovery
             .packet_journals
             .drain_where(|journal| journal.epoch == epoch, |_, _, _| {});
     }

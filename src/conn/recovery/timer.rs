@@ -44,7 +44,7 @@ impl<'a> Timer<'a> {
             (local, 0) => local,
             (local, peer) => local.min(peer),
         };
-        let peer_max_ack_delay = if self.egress.state == conn::State::Established {
+        let peer_max_ack_delay = if self.egress.lifecycle.state == conn::State::Established {
             self.peer_transport_params
                 .as_ref()
                 .map(|params| time::Duration::from_millis(params.max_ack_delay_ms))
@@ -54,14 +54,18 @@ impl<'a> Timer<'a> {
         };
         let minimum = self
             .egress
+            .recovery
             .rtt
             .pto_period(peer_max_ack_delay)
             .saturating_mul(3);
-        Some(self.egress.last_activity + time::Duration::from_millis(effective).max(minimum))
+        Some(
+            self.egress.activity.last_activity
+                + time::Duration::from_millis(effective).max(minimum),
+        )
     }
 
     pub(in crate::conn) fn next_deadline(&self) -> Option<time::Instant> {
-        match (self.egress.loss_timer, self.idle_deadline()) {
+        match (self.egress.recovery.loss_timer, self.idle_deadline()) {
             (Some(loss), Some(idle)) => Some(loss.min(idle)),
             (Some(loss), None) => Some(loss),
             (None, Some(idle)) => Some(idle),
@@ -70,14 +74,14 @@ impl<'a> Timer<'a> {
     }
 
     pub(in crate::conn) fn update(egress: &mut conn::egress::Egress) {
-        let loss_delay = egress.rtt.loss_delay();
+        let loss_delay = egress.recovery.rtt.loss_delay();
 
         let mut rack_candidate: Option<time::Instant> = None;
-        for (index, space) in egress.spaces.iter().enumerate() {
+        for (index, space) in egress.recovery.spaces.iter().enumerate() {
             let Some(largest_acked) = space.largest_acked else {
                 continue;
             };
-            if let Some(when) = egress.packet_journals.loss_candidate(
+            if let Some(when) = egress.recovery.packet_journals.loss_candidate(
                 conn::Epoch::from_index(index),
                 largest_acked,
                 loss_delay,
@@ -86,12 +90,12 @@ impl<'a> Timer<'a> {
             }
         }
         if let Some(instant) = rack_candidate {
-            egress.loss_timer = Some(instant);
+            egress.recovery.loss_timer = Some(instant);
             return;
         }
 
         let mut pto_base: Option<time::Instant> = None;
-        for space in &egress.spaces {
+        for space in &egress.recovery.spaces {
             if space.ack_eliciting_in_flight > 0
                 && let Some(instant) = space.time_of_last_ack_eliciting
             {
@@ -101,9 +105,9 @@ impl<'a> Timer<'a> {
                 });
             }
         }
-        egress.loss_timer = pto_base.map(|instant| {
-            let pto = egress.rtt.pto_period(time::Duration::ZERO);
-            instant + pto * (1u32 << egress.pto_count.min(16))
+        egress.recovery.loss_timer = pto_base.map(|instant| {
+            let pto = egress.recovery.rtt.pto_period(time::Duration::ZERO);
+            instant + pto * (1u32 << egress.recovery.pto_count.min(16))
         });
     }
 }

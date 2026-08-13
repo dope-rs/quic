@@ -23,9 +23,15 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildDatagram
         dst: &mut Vec<u8>,
         max_packet_bytes: usize,
     ) -> Option<(usize, commit::Datagram)> {
-        let pn =
-            self.packet.connection.egress.spaces[crate::conn::Epoch::Application as usize].next_pn;
-        let standard = self.packet.connection.egress.datagram_congestion_control
+        let pn = self.packet.connection.egress.recovery.spaces
+            [crate::conn::Epoch::Application as usize]
+            .next_pn;
+        let standard = self
+            .packet
+            .connection
+            .egress
+            .datagrams
+            .datagram_congestion_control
             == datagram::CongestionControl::Standard;
         if standard && !self.packet.can_track_packet() {
             return None;
@@ -47,7 +53,13 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildDatagram
             &mut frames,
             payload_limit,
         );
-        let data = self.packet.connection.egress.pending_datagrams.front()?;
+        let data = self
+            .packet
+            .connection
+            .egress
+            .datagrams
+            .pending_datagrams
+            .front()?;
         let datagram = if data.len().saturating_add(1) <= payload_limit.saturating_sub(frames.len())
         {
             frames.push(0x30);

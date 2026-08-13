@@ -306,7 +306,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Commit<DOMAIN, B>
                                             .complete()
                                             .is_err()
                                         {
-                                            egress.state = crate::conn::State::Closed;
+                                            egress.lifecycle.state = crate::conn::State::Closed;
                                         }
                                         Ok(())
                                     },
@@ -319,10 +319,10 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Commit<DOMAIN, B>
                                 additional_ranges,
                             } => {
                                 let largest = largest.get();
-                                if largest >= egress.spaces[epoch as usize].next_pn {
+                                if largest >= egress.recovery.spaces[epoch as usize].next_pn {
                                     return Err(conn::Error::ProtocolViolation);
                                 }
-                                let space = &mut egress.spaces[epoch as usize];
+                                let space = &mut egress.recovery.spaces[epoch as usize];
                                 space.largest_acked =
                                     Some(space.largest_acked.unwrap_or(0).max(largest));
                                 recovery::ack::Ack::new(
@@ -347,7 +347,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Commit<DOMAIN, B>
                             crate::frame::Frame::HandshakeDone
                                 if epoch == crate::conn::Epoch::Application && is_client =>
                             {
-                                egress.handshake_confirmed = true;
+                                egress.lifecycle.handshake_confirmed = true;
                                 recovery::epochs::Transition::new(egress, handshake)
                                     .discard_initial();
                                 discarded_received.record(crate::conn::Epoch::Initial);
@@ -358,7 +358,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Commit<DOMAIN, B>
                                 receive.crypto[crate::conn::Epoch::Handshake as usize].discard();
                             }
                             crate::frame::Frame::ConnectionClose { .. } => {
-                                egress.state = crate::conn::State::Closed;
+                                egress.lifecycle.state = crate::conn::State::Closed;
                             }
                             crate::frame::Frame::NewConnectionId {
                                 sequence_number,

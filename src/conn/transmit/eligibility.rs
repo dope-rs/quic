@@ -41,26 +41,27 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility<'_, DOMAIN, B> {
         }
         match cargo {
             packet::Cargo::CryptoOrAck => {
-                self.connection.egress.cc.allows_send()
-                    && self.connection.egress.pacer.allows_send(now)
+                self.connection.egress.congestion.cc.allows_send()
+                    && self.connection.egress.congestion.pacer.allows_send(now)
             }
-            packet::Cargo::DatagramOnly => match self.connection.egress.datagram_congestion_control
-            {
-                datagram::CongestionControl::Standard => {
-                    self.connection.egress.cc.allows_send()
-                        && self.connection.egress.pacer.allows_send(now)
+            packet::Cargo::DatagramOnly => {
+                match self.connection.egress.datagrams.datagram_congestion_control {
+                    datagram::CongestionControl::Standard => {
+                        self.connection.egress.congestion.cc.allows_send()
+                            && self.connection.egress.congestion.pacer.allows_send(now)
+                    }
+                    datagram::CongestionControl::Uncongested => true,
                 }
-                datagram::CongestionControl::Uncongested => true,
-            },
+            }
         }
     }
 
     pub(crate) fn has_pending_output(&self) -> bool {
         let connection = self.connection;
-        if connection.egress.state == crate::conn::State::Closed {
+        if connection.egress.lifecycle.state == crate::conn::State::Closed {
             return false;
         }
-        if connection.egress.pto_probe_allowance != 0 {
+        if connection.egress.recovery.pto_probe_allowance != 0 {
             return true;
         }
         if connection
@@ -94,10 +95,10 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility<'_, DOMAIN, B> {
             .handshake
             .write_key(conn::Epoch::Application)
             .is_some()
-            && (connection.egress.pending_close.is_some()
+            && (connection.egress.lifecycle.pending_close.is_some()
                 || connection.control.overflowed()
                 || connection.receive.packet_numbers[conn::Epoch::Application as usize].ack_pending
-                || !connection.egress.pending_datagrams.is_empty()
+                || !connection.egress.datagrams.pending_datagrams.is_empty()
                 || connection.egress.derived_controls.is_pending()
                 || connection.path.controls_pending()
                 || connection.streams.state.receive_controls_pending()
@@ -108,7 +109,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility<'_, DOMAIN, B> {
                     .has_sendable(conn::Epoch::Application)
                 || connection.streams.transmit.deliveries.has_retransmit()
                 || !connection.streams.transmit.schedule.is_empty()
-                || connection.egress.pmtud.next_probe().is_some())
+                || connection.egress.congestion.pmtud.next_probe().is_some())
     }
 
     fn has_sendable_stream(&self) -> bool {
@@ -158,7 +159,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility<'_, DOMAIN, B> {
 
     fn has_sendable_output(&self) -> bool {
         let connection = self.connection;
-        connection.egress.pto_probe_allowance != 0
+        connection.egress.recovery.pto_probe_allowance != 0
             || (connection
                 .handshake
                 .write_key(conn::Epoch::Initial)
@@ -183,11 +184,11 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility<'_, DOMAIN, B> {
                 .handshake
                 .write_key(conn::Epoch::Application)
                 .is_some()
-                && (connection.egress.pending_close.is_some()
+                && (connection.egress.lifecycle.pending_close.is_some()
                     || connection.control.overflowed()
                     || connection.receive.packet_numbers[conn::Epoch::Application as usize]
                         .ack_pending
-                    || !connection.egress.pending_datagrams.is_empty()
+                    || !connection.egress.datagrams.pending_datagrams.is_empty()
                     || connection
                         .egress
                         .derived_controls
@@ -203,7 +204,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility<'_, DOMAIN, B> {
                         .crypto()
                         .has_sendable(conn::Epoch::Application)
                     || self.has_sendable_stream()
-                    || connection.egress.pmtud.next_probe().is_some()))
+                    || connection.egress.congestion.pmtud.next_probe().is_some()))
     }
 
     pub(crate) fn send_deadline(&self, now: time::Instant) -> Option<time::Instant> {
@@ -211,38 +212,47 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Eligibility<'_, DOMAIN, B> {
         if !self.has_pending_output() {
             return None;
         }
-        if connection.egress.pto_probe_allowance != 0 {
+        if connection.egress.recovery.pto_probe_allowance != 0 {
             return self.anti_amplification_allows().then_some(now);
         }
         if !self.has_sendable_output() {
             return recovery::timer::Timer::new(connection).next_deadline();
         }
-        if !connection.egress.pending_datagrams.is_empty()
-            && connection.egress.datagram_congestion_control
+        if !connection.egress.datagrams.pending_datagrams.is_empty()
+            && connection.egress.datagrams.datagram_congestion_control
                 == datagram::CongestionControl::Uncongested
         {
             return Some(now);
         }
-        if !self.anti_amplification_allows() || !connection.egress.cc.allows_send() {
+        if !self.anti_amplification_allows() || !connection.egress.congestion.cc.allows_send() {
             return recovery::timer::Timer::new(connection).next_deadline();
         }
-        Some(connection.egress.pacer.next_release_time().max(now))
+        Some(
+            connection
+                .egress
+                .congestion
+                .pacer
+                .next_release_time()
+                .max(now),
+        )
     }
 
     pub(crate) fn anti_amplification_allows(&self) -> bool {
-        self.connection.egress.peer_address_validated || self.anti_amplification_remaining() != 0
+        self.connection.egress.activity.peer_address_validated
+            || self.anti_amplification_remaining() != 0
     }
 
     fn anti_amplification_remaining(&self) -> u64 {
         let connection = self.connection;
-        if connection.egress.peer_address_validated {
+        if connection.egress.activity.peer_address_validated {
             return u64::MAX;
         }
         connection
             .egress
+            .activity
             .amplification_received
             .saturating_mul(3)
-            .saturating_sub(connection.egress.amplification_sent)
+            .saturating_sub(connection.egress.activity.amplification_sent)
     }
 
     pub(crate) fn emission_ceiling(&self, requested: usize) -> Option<usize> {

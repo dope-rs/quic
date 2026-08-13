@@ -128,7 +128,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Establishment<'_, DOMAIN, B> {
             .path
             .issue_local_cids(peer_tp.active_connection_id_limit);
         *self.peer_transport_params = Some(peer_tp);
-        self.egress.state = crate::conn::State::Established;
+        self.egress.lifecycle.state = crate::conn::State::Established;
         self.egress
             .derived_controls
             .arm_established(!self.is_client, local_cids);

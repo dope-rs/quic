@@ -43,7 +43,7 @@ impl<'connection, const DOMAIN: u8, B: stream::ReceiveBuffer>
     }
 
     pub(super) fn close(&mut self) {
-        self.connection.egress.state = crate::conn::State::Closed;
+        self.connection.egress.lifecycle.state = crate::conn::State::Closed;
     }
 
     pub(super) fn commit(self, ack_eliciting: bool, now: time::Instant) {
@@ -55,7 +55,10 @@ impl<'connection, const DOMAIN: u8, B: stream::ReceiveBuffer>
         } = self;
         connection.receive.packet_numbers[epoch as usize].commit(fresh, ack_eliciting, now);
         discarded.apply(&mut connection.receive.packet_numbers);
-        connection.egress.last_activity = now;
-        connection.egress.ack_eliciting_sent_since_last_receive = false;
+        connection.egress.activity.last_activity = now;
+        connection
+            .egress
+            .activity
+            .ack_eliciting_sent_since_last_receive = false;
     }
 }

@@ -93,6 +93,14 @@ pub(super) struct Setup {
 
 pub(super) struct Egress {
     pub(super) derived_controls: DerivedControls,
+    pub(super) recovery: RecoveryState,
+    pub(super) congestion: CongestionState,
+    pub(super) datagrams: DatagramState,
+    pub(super) lifecycle: LifecycleState,
+    pub(super) activity: ActivityState,
+}
+
+pub(super) struct RecoveryState {
     pub(super) spaces: [pn_space::PnSpace; 3],
     pub(super) rtt: rtt::RttTracker,
     pub(super) pto_count: u32,
@@ -100,21 +108,33 @@ pub(super) struct Egress {
     pub(super) pto_probe_allowance: u8,
     pub(super) pto_probe_epoch: Option<conn::Epoch>,
     pub(super) packet_journals: journal::Table,
-    pub(super) pending_datagrams: collections::VecDeque<Vec<u8>>,
-    pub(super) pending_close: Option<PendingClose>,
+}
+
+pub(super) struct CongestionState {
     pub(super) cc: new_reno::NewReno,
     pub(super) pacer: pacer::Pacer,
     pub(super) pmtud: pmtud::Pmtud,
     pub(super) packet_ceiling: usize,
     pub(super) pmtud_probe_pn: Option<u64>,
+}
+
+pub(super) struct DatagramState {
+    pub(super) pending_datagrams: collections::VecDeque<Vec<u8>>,
     pub(super) datagram_congestion_control: datagram::CongestionControl,
     pub(super) pending_datagrams_capacity: usize,
-    pub(super) last_activity: time::Instant,
-    pub(super) amplification_received: u64,
-    pub(super) amplification_sent: u64,
+}
+
+pub(super) struct LifecycleState {
+    pub(super) pending_close: Option<PendingClose>,
     pub(super) state: conn::State,
     pub(super) sent_initial: bool,
     pub(super) handshake_confirmed: bool,
+}
+
+pub(super) struct ActivityState {
+    pub(super) last_activity: time::Instant,
+    pub(super) amplification_received: u64,
+    pub(super) amplification_sent: u64,
     pub(super) ack_eliciting_sent_since_last_receive: bool,
     pub(super) peer_address_validated: bool,
 }
@@ -126,34 +146,44 @@ impl Egress {
         };
         Self {
             derived_controls: DerivedControls::default(),
-            spaces: Default::default(),
-            rtt: rtt::RttTracker::default(),
-            pto_count: 0,
-            loss_timer: None,
-            pto_probe_allowance: 0,
-            pto_probe_epoch: None,
-            packet_journals: journal::Table::new(
-                setup.packet_journal_capacity,
-                setup.control_journal_capacity,
-                setup.stream_journal_capacity,
-            ),
-            pending_datagrams: collections::VecDeque::new(),
-            pending_close: None,
-            cc: new_reno::NewReno::default(),
-            pacer: pacer::Pacer::new(time::Instant::now()),
-            pmtud: pmtud::Pmtud::new(setup.max_pmtu),
-            packet_ceiling,
-            pmtud_probe_pn: None,
-            datagram_congestion_control: setup.datagram_congestion_control,
-            pending_datagrams_capacity: setup.pending_datagrams_capacity,
-            last_activity: time::Instant::now(),
-            amplification_received: 0,
-            amplification_sent: 0,
-            state: conn::State::Handshaking,
-            sent_initial: false,
-            handshake_confirmed: false,
-            ack_eliciting_sent_since_last_receive: false,
-            peer_address_validated: setup.peer_address_validated,
+            recovery: RecoveryState {
+                spaces: Default::default(),
+                rtt: rtt::RttTracker::default(),
+                pto_count: 0,
+                loss_timer: None,
+                pto_probe_allowance: 0,
+                pto_probe_epoch: None,
+                packet_journals: journal::Table::new(
+                    setup.packet_journal_capacity,
+                    setup.control_journal_capacity,
+                    setup.stream_journal_capacity,
+                ),
+            },
+            congestion: CongestionState {
+                cc: new_reno::NewReno::default(),
+                pacer: pacer::Pacer::new(time::Instant::now()),
+                pmtud: pmtud::Pmtud::new(setup.max_pmtu),
+                packet_ceiling,
+                pmtud_probe_pn: None,
+            },
+            datagrams: DatagramState {
+                pending_datagrams: collections::VecDeque::new(),
+                datagram_congestion_control: setup.datagram_congestion_control,
+                pending_datagrams_capacity: setup.pending_datagrams_capacity,
+            },
+            lifecycle: LifecycleState {
+                pending_close: None,
+                state: conn::State::Handshaking,
+                sent_initial: false,
+                handshake_confirmed: false,
+            },
+            activity: ActivityState {
+                last_activity: time::Instant::now(),
+                amplification_received: 0,
+                amplification_sent: 0,
+                ack_eliciting_sent_since_last_receive: false,
+                peer_address_validated: setup.peer_address_validated,
+            },
         }
     }
 }

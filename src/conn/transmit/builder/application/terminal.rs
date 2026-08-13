@@ -36,7 +36,8 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildTerminal
             return None;
         }
         let target_size = target_size.min(max_packet_bytes as u64);
-        let pn = self.packet.connection.egress.spaces[conn::Epoch::Application as usize].next_pn;
+        let pn = self.packet.connection.egress.recovery.spaces[conn::Epoch::Application as usize]
+            .next_pn;
 
         let mut frames = mem::take(&mut self.packet.connection.scratch.frames);
         frames.clear();
@@ -87,9 +88,16 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildTerminal
         dst: &mut Vec<u8>,
         max_packet_bytes: usize,
     ) -> Option<(usize, commit::Packet)> {
-        let close = self.packet.connection.egress.pending_close.as_ref()?;
+        let close = self
+            .packet
+            .connection
+            .egress
+            .lifecycle
+            .pending_close
+            .as_ref()?;
         let payload_limit = self.packet.short_payload_limit(max_packet_bytes);
-        let pn = self.packet.connection.egress.spaces[conn::Epoch::Application as usize].next_pn;
+        let pn = self.packet.connection.egress.recovery.spaces[conn::Epoch::Application as usize]
+            .next_pn;
 
         let fixed =
             1 + crate::conn::transmit::builder::Builder::<DOMAIN, B>::varint_len(

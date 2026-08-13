@@ -59,10 +59,12 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Connection<DOMAIN, B> {
         &mut self,
         token: conn::path::StatelessResetToken,
     ) -> bool {
-        if self.egress.state != conn::State::Established || !self.path.matches_reset(token) {
+        if self.egress.lifecycle.state != conn::State::Established
+            || !self.path.matches_reset(token)
+        {
             return false;
         }
-        self.egress.state = conn::State::Closed;
+        self.egress.lifecycle.state = conn::State::Closed;
         self.path.mark_stateless_reset();
         true
     }
@@ -74,7 +76,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Connection<DOMAIN, B> {
     }
 
     pub fn send_path_challenge(&mut self, data: [u8; 8]) {
-        if self.egress.state == conn::State::Established {
+        if self.egress.lifecycle.state == conn::State::Established {
             self.path.queue_challenge(data);
         }
     }
@@ -118,8 +120,10 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> Connection<DOMAIN, B> {
     }
 
     pub fn close(&mut self, error_code: u64, reason: Vec<u8>) {
-        if self.egress.state != conn::State::Closed && self.egress.pending_close.is_none() {
-            self.egress.pending_close = Some(conn::egress::PendingClose {
+        if self.egress.lifecycle.state != conn::State::Closed
+            && self.egress.lifecycle.pending_close.is_none()
+        {
+            self.egress.lifecycle.pending_close = Some(conn::egress::PendingClose {
                 is_application: true,
                 error_code,
                 frame_type: 0,
@@ -157,7 +161,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> conn::handshake::Transition
     }
 
     fn close(&mut self) {
-        self.egress.state = conn::State::Closed;
+        self.egress.lifecycle.state = conn::State::Closed;
     }
 }
 

@@ -109,9 +109,9 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> Streams<'conn, DOMAIN, B
     }
 
     fn operations_available(&self) -> bool {
-        self.connection.egress.state == conn::State::Established
+        self.connection.egress.lifecycle.state == conn::State::Established
             || self.connection.peer.is_client
-                && self.connection.egress.state == conn::State::Handshaking
+                && self.connection.egress.lifecycle.state == conn::State::Handshaking
                 && self.connection.handshake.zero_rtt_write_key().is_some()
                 && self.connection.peer.transport_params.is_some()
     }

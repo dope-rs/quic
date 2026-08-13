@@ -29,23 +29,37 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
             return self.packet(&packet, now);
         }
 
-        self.connection.egress.spaces[crate::conn::Epoch::Application as usize].next_pn =
+        self.connection.egress.recovery.spaces[crate::conn::Epoch::Application as usize].next_pn =
             commit.pn.saturating_add(1);
         if commit.ack_included {
             self.connection.receive.packet_numbers[crate::conn::Epoch::Application as usize]
                 .ack_pending = false;
         }
         if commit.datagram {
-            self.connection.egress.pending_datagrams.pop_front();
+            self.connection
+                .egress
+                .datagrams
+                .pending_datagrams
+                .pop_front();
         }
-        self.connection.egress.amplification_sent = self
+        self.connection.egress.activity.amplification_sent = self
             .connection
             .egress
+            .activity
             .amplification_sent
             .saturating_add(commit.bytes as u64);
-        if commit.datagram && !self.connection.egress.ack_eliciting_sent_since_last_receive {
-            self.connection.egress.last_activity = now;
-            self.connection.egress.ack_eliciting_sent_since_last_receive = true;
+        if commit.datagram
+            && !self
+                .connection
+                .egress
+                .activity
+                .ack_eliciting_sent_since_last_receive
+        {
+            self.connection.egress.activity.last_activity = now;
+            self.connection
+                .egress
+                .activity
+                .ack_eliciting_sent_since_last_receive = true;
         }
         true
     }
@@ -71,7 +85,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
             ),
             crypto: None,
         };
-        self.connection.egress.spaces[epoch as usize].next_pn = pn.saturating_add(1);
+        self.connection.egress.recovery.spaces[epoch as usize].next_pn = pn.saturating_add(1);
         if commit.properties.ack_included {
             self.connection.receive.packet_numbers[epoch as usize].ack_pending = false;
         }
@@ -81,14 +95,20 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
                 delivery.record,
                 delivery.tracked,
             ) else {
-                self.connection.egress.state = crate::conn::State::Closed;
+                self.connection.egress.lifecycle.state = crate::conn::State::Closed;
                 return false;
             };
             journal.crypto = Some(handle);
         }
         let journal_key = if tracked {
-            let Some(key) = self.connection.egress.packet_journals.insert(journal) else {
-                self.connection.egress.state = crate::conn::State::Closed;
+            let Some(key) = self
+                .connection
+                .egress
+                .recovery
+                .packet_journals
+                .insert(journal)
+            else {
+                self.connection.egress.lifecycle.state = crate::conn::State::Closed;
                 return false;
             };
             Some(key)
@@ -105,7 +125,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
                     .deliveries
                     .add_carrier(handle)
                 {
-                    self.connection.egress.state = crate::conn::State::Closed;
+                    self.connection.egress.lifecycle.state = crate::conn::State::Closed;
                     return false;
                 }
                 handle
@@ -129,7 +149,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
                     let streams::table::Entry::Occupied(mut occupied) =
                         streams_send.entry(send::Id::new(record.stream_id))
                     else {
-                        self.connection.egress.state = crate::conn::State::Closed;
+                        self.connection.egress.lifecycle.state = crate::conn::State::Closed;
                         return false;
                     };
                     let send_handle = occupied.handle();
@@ -143,7 +163,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
                     let Some(handle) =
                         stream_deliveries.insert(send_handle, &mut entry.delivery_group, record)
                     else {
-                        self.connection.egress.state = crate::conn::State::Closed;
+                        self.connection.egress.lifecycle.state = crate::conn::State::Closed;
                         return false;
                     };
                     (handle, send_handle, deactivate)
@@ -154,16 +174,17 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
                 handle
             };
             let Some(key) = journal_key else {
-                self.connection.egress.state = crate::conn::State::Closed;
+                self.connection.egress.lifecycle.state = crate::conn::State::Closed;
                 return false;
             };
             if !self
                 .connection
                 .egress
+                .recovery
                 .packet_journals
                 .push_stream(key, handle)
             {
-                self.connection.egress.state = crate::conn::State::Closed;
+                self.connection.egress.lifecycle.state = crate::conn::State::Closed;
                 return false;
             }
         }
@@ -175,7 +196,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
                 delivery.handle,
             );
             let Some(handle) = handle else {
-                self.connection.egress.state = crate::conn::State::Closed;
+                self.connection.egress.lifecycle.state = crate::conn::State::Closed;
                 return false;
             };
             if let delivery::Control::NewConnectionId(_) = record
@@ -187,70 +208,90 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
                 self.connection.path.challenge_sent(data);
             }
             let Some(key) = journal_key else {
-                self.connection.egress.state = crate::conn::State::Closed;
+                self.connection.egress.lifecycle.state = crate::conn::State::Closed;
                 return false;
             };
             if !self
                 .connection
                 .egress
+                .recovery
                 .packet_journals
                 .push_control(key, handle)
             {
-                self.connection.egress.state = crate::conn::State::Closed;
+                self.connection.egress.lifecycle.state = crate::conn::State::Closed;
                 return false;
             }
         }
         if tracked && commit.properties.ack_eliciting {
-            self.connection.egress.spaces[epoch as usize].time_of_last_ack_eliciting = Some(now);
-            self.connection.egress.spaces[epoch as usize].ack_eliciting_in_flight += 1;
+            self.connection.egress.recovery.spaces[epoch as usize].time_of_last_ack_eliciting =
+                Some(now);
+            self.connection.egress.recovery.spaces[epoch as usize].ack_eliciting_in_flight += 1;
         }
         if commit.properties.datagram {
-            self.connection.egress.pending_datagrams.pop_front();
+            self.connection
+                .egress
+                .datagrams
+                .pending_datagrams
+                .pop_front();
         }
-        self.connection.egress.amplification_sent = self
+        self.connection.egress.activity.amplification_sent = self
             .connection
             .egress
+            .activity
             .amplification_sent
             .saturating_add(commit.bytes as u64);
         let bytes = commit.bytes as u64;
         self.connection
             .egress
+            .congestion
             .cc
             .packet_sent(bytes, commit.properties.in_flight);
         if commit.properties.in_flight {
             let smoothed = self
                 .connection
                 .egress
+                .recovery
                 .rtt
                 .smoothed_rtt
                 .unwrap_or(crate::rtt::INITIAL_RTT);
-            self.connection.egress.pacer.packet_sent(
+            self.connection.egress.congestion.pacer.packet_sent(
                 bytes,
                 now,
-                self.connection.egress.cc.cwnd,
+                self.connection.egress.congestion.cc.cwnd,
                 smoothed,
             );
         }
         if let Some(size) = commit.pmtud_probe {
-            self.connection.egress.pmtud.arm_probe(size);
-            self.connection.egress.pmtud_probe_pn = Some(pn);
+            self.connection.egress.congestion.pmtud.arm_probe(size);
+            self.connection.egress.congestion.pmtud_probe_pn = Some(pn);
         }
         if commit.properties.pto_probe {
-            self.connection.egress.pto_probe_allowance =
-                self.connection.egress.pto_probe_allowance.saturating_sub(1);
-            if self.connection.egress.pto_probe_allowance == 0 {
-                self.connection.egress.pto_probe_epoch = None;
+            self.connection.egress.recovery.pto_probe_allowance = self
+                .connection
+                .egress
+                .recovery
+                .pto_probe_allowance
+                .saturating_sub(1);
+            if self.connection.egress.recovery.pto_probe_allowance == 0 {
+                self.connection.egress.recovery.pto_probe_epoch = None;
             }
         }
         if commit.properties.ack_eliciting
-            && !self.connection.egress.ack_eliciting_sent_since_last_receive
+            && !self
+                .connection
+                .egress
+                .activity
+                .ack_eliciting_sent_since_last_receive
         {
-            self.connection.egress.last_activity = now;
-            self.connection.egress.ack_eliciting_sent_since_last_receive = true;
+            self.connection.egress.activity.last_activity = now;
+            self.connection
+                .egress
+                .activity
+                .ack_eliciting_sent_since_last_receive = true;
         }
         if commit.properties.close {
-            self.connection.egress.pending_close = None;
-            self.connection.egress.state = crate::conn::State::Closed;
+            self.connection.egress.lifecycle.pending_close = None;
+            self.connection.egress.lifecycle.state = crate::conn::State::Closed;
         }
         true
     }

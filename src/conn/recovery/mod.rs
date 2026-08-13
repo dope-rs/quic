@@ -46,14 +46,14 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Loss<'a, DOMAIN, B> {
             self.local_max_idle_timeout,
         )
         .idle_deadline();
-        if self.deliveries.egress.state != conn::State::Closed
+        if self.deliveries.egress.lifecycle.state != conn::State::Closed
             && let Some(idle) = idle_deadline
             && now >= idle
         {
-            self.deliveries.egress.state = conn::State::Closed;
+            self.deliveries.egress.lifecycle.state = conn::State::Closed;
             return;
         }
-        let Some(deadline) = self.deliveries.egress.loss_timer else {
+        let Some(deadline) = self.deliveries.egress.recovery.loss_timer else {
             return;
         };
         if now < deadline {
@@ -62,7 +62,8 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Loss<'a, DOMAIN, B> {
 
         let packets_lost = losses::Detector::new(&mut self.deliveries).run(now);
         if packets_lost == 0 && self.arm_pto_probes() {
-            self.deliveries.egress.pto_count = self.deliveries.egress.pto_count.saturating_add(1);
+            self.deliveries.egress.recovery.pto_count =
+                self.deliveries.egress.recovery.pto_count.saturating_add(1);
         }
         timer::Timer::update(self.deliveries.egress);
     }
@@ -71,6 +72,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Loss<'a, DOMAIN, B> {
         let Some(epoch) = self
             .deliveries
             .egress
+            .recovery
             .spaces
             .iter()
             .position(|space| space.ack_eliciting_in_flight != 0)
@@ -78,12 +80,13 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Loss<'a, DOMAIN, B> {
         else {
             return false;
         };
-        self.deliveries.egress.pto_probe_epoch = Some(epoch);
-        self.deliveries.egress.pto_probe_allowance = 2;
+        self.deliveries.egress.recovery.pto_probe_epoch = Some(epoch);
+        self.deliveries.egress.recovery.pto_probe_allowance = 2;
         if epoch == conn::Epoch::Application {
             for journal in self
                 .deliveries
                 .egress
+                .recovery
                 .packet_journals
                 .iter_mut(conn::Epoch::Application)
             {

@@ -105,10 +105,11 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Ingress<'a, DOMAIN, B> {
     where
         R: handshake::Reader<DOMAIN>,
     {
-        if !self.connection.egress.peer_address_validated {
-            self.connection.egress.amplification_received = self
+        if !self.connection.egress.activity.peer_address_validated {
+            self.connection.egress.activity.amplification_received = self
                 .connection
                 .egress
+                .activity
                 .amplification_received
                 .saturating_add(wire.len() as u64);
         }
@@ -204,10 +205,16 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Ingress<'a, DOMAIN, B> {
         else {
             return Ok(());
         };
-        let Ok(pmtu_ceiling) = usize::try_from(self.connection.egress.pmtud.current()) else {
+        let Ok(pmtu_ceiling) = usize::try_from(self.connection.egress.congestion.pmtud.current())
+        else {
             unreachable!("validated PMTU remains representable as usize")
         };
-        let active_ceiling = self.connection.egress.packet_ceiling.min(pmtu_ceiling);
+        let active_ceiling = self
+            .connection
+            .egress
+            .congestion
+            .packet_ceiling
+            .min(pmtu_ceiling);
         let payload_limit = transmit::builder::Builder::<'_, DOMAIN, B>::initial_payload_limit_for(
             peer_cid.len(),
             local_cid.len(),
@@ -224,7 +231,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Ingress<'a, DOMAIN, B> {
             || client_hello_len == 0
             || transmit::builder::Builder::<'_, DOMAIN, B>::crypto_data_limit(0, payload_limit) == 0
         {
-            self.connection.egress.state = crate::conn::State::Closed;
+            self.connection.egress.lifecycle.state = crate::conn::State::Closed;
             return Err(conn::Error::PacketCeiling);
         }
         let new_secrets = crate::qkdf::InitialSecrets::from_dcid(peer_cid.as_slice())
@@ -243,7 +250,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Ingress<'a, DOMAIN, B> {
             .replace_initial_keys(initial_read, initial_write);
         self.connection.path.set_initial_peer_cid(peer_cid);
         self.connection.path.mark_retry_processed();
-        self.connection.egress.sent_initial = false;
+        self.connection.egress.lifecycle.sent_initial = false;
         Ok(())
     }
 
@@ -301,7 +308,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Ingress<'a, DOMAIN, B> {
         let packet = packet
             .decrypt(hr, expected)
             .map_err(|_| conn::Error::PacketDecrypt)?;
-        self.connection.egress.peer_address_validated = true;
+        self.connection.egress.activity.peer_address_validated = true;
         let mut source = frames::Copied::<B>::new();
         self.process_packet_body(
             frames::PacketMeta::new(conn::Epoch::Handshake, packet.packet_number(), now),

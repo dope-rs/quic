@@ -143,15 +143,21 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
     }
 
     fn can_track_packet(&self) -> bool {
-        let pn = self.connection.egress.spaces[conn::Epoch::Application as usize].next_pn;
+        let pn = self.connection.egress.recovery.spaces[conn::Epoch::Application as usize].next_pn;
         self.connection
             .egress
+            .recovery
             .packet_journals
             .has_room_for(conn::Epoch::Application, pn, 2)
-            && self.connection.egress.packet_journals.has_carrier_room(
-                conn::PACKET_CONTROL_CAPACITY * 2,
-                conn::PACKET_STREAM_CAPACITY * 2,
-            )
+            && self
+                .connection
+                .egress
+                .recovery
+                .packet_journals
+                .has_carrier_room(
+                    conn::PACKET_CONTROL_CAPACITY * 2,
+                    conn::PACKET_STREAM_CAPACITY * 2,
+                )
             && self.connection.handshake.crypto().has_room(2)
             && (self.connection.streams.transmit.deliveries.has_retransmit()
                 || self
@@ -163,15 +169,17 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
     }
 
     fn can_track_probe(&self, epoch: conn::Epoch) -> bool {
-        let pn = self.connection.egress.spaces[epoch as usize].next_pn;
+        let pn = self.connection.egress.recovery.spaces[epoch as usize].next_pn;
         self.connection
             .egress
+            .recovery
             .packet_journals
             .has_room_for(epoch, pn, 1)
             && (epoch != conn::Epoch::Application
                 || self
                     .connection
                     .egress
+                    .recovery
                     .packet_journals
                     .has_carrier_room(conn::PACKET_CONTROL_CAPACITY, conn::PACKET_STREAM_CAPACITY))
     }
@@ -229,7 +237,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
         dst: &mut Vec<u8>,
         max_packet_bytes: usize,
     ) -> Option<(usize, commit::Packet)> {
-        let epoch = self.connection.egress.pto_probe_epoch?;
+        let epoch = self.connection.egress.recovery.pto_probe_epoch?;
         if !self.can_track_probe(epoch) {
             return None;
         }
@@ -237,7 +245,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
             conn::Epoch::Initial | conn::Epoch::Handshake => self.build_crypto_packet(
                 dst,
                 max_packet_bytes,
-                self.connection.egress.pto_probe_epoch?,
+                self.connection.egress.recovery.pto_probe_epoch?,
                 packet::CryptoMode::PtoProbe,
             ),
             conn::Epoch::Application
@@ -323,7 +331,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
             conn::Epoch::Handshake => self.handshake_payload_limit(max_packet_bytes),
             conn::Epoch::Application => return None,
         };
-        let pn = self.connection.egress.spaces[epoch as usize].next_pn;
+        let pn = self.connection.egress.recovery.spaces[epoch as usize].next_pn;
 
         let mut frames = mem::take(&mut self.connection.scratch.frames);
         frames.clear();
@@ -335,6 +343,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
                 if self
                     .connection
                     .egress
+                    .recovery
                     .packet_journals
                     .has_room_for(epoch, pn, 2)
                     && self.connection.handshake.crypto().has_room(2)

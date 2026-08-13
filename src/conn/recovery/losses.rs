@@ -55,6 +55,7 @@ impl<'operation, 'state, const DOMAIN: u8, B: stream::ReceiveBuffer, C: conn::co
         if let Some(latest_sent) = lost.latest_sent {
             self.deliveries
                 .egress
+                .congestion
                 .cc
                 .packets_lost(lost.bytes, latest_sent);
         }
@@ -62,16 +63,17 @@ impl<'operation, 'state, const DOMAIN: u8, B: stream::ReceiveBuffer, C: conn::co
     }
 
     fn detect(&mut self, epoch: conn::Epoch, now: time::Instant) -> Lost {
-        let Some(largest_acked) = self.deliveries.egress.spaces[epoch as usize].largest_acked
+        let Some(largest_acked) =
+            self.deliveries.egress.recovery.spaces[epoch as usize].largest_acked
         else {
             return Lost::default();
         };
-        let loss_delay = self.deliveries.egress.rtt.loss_delay();
+        let loss_delay = self.deliveries.egress.recovery.rtt.loss_delay();
         let lost_send_time = match now.checked_sub(loss_delay) {
             Some(instant) => instant,
             None => now,
         };
-        let mut journals = mem::take(&mut self.deliveries.egress.packet_journals);
+        let mut journals = mem::take(&mut self.deliveries.egress.recovery.packet_journals);
         let mut lost = Lost::default();
         journals.drain_lost(
             epoch,
@@ -79,22 +81,23 @@ impl<'operation, 'state, const DOMAIN: u8, B: stream::ReceiveBuffer, C: conn::co
             lost_send_time,
             |journal, controls, streams| {
                 if journal.transmission.ack_eliciting() && journal.transmission.in_flight() {
-                    self.deliveries.egress.spaces[epoch as usize].ack_eliciting_in_flight =
-                        self.deliveries.egress.spaces[epoch as usize]
-                            .ack_eliciting_in_flight
-                            .saturating_sub(1);
+                    self.deliveries.egress.recovery.spaces[epoch as usize]
+                        .ack_eliciting_in_flight = self.deliveries.egress.recovery.spaces
+                        [epoch as usize]
+                        .ack_eliciting_in_flight
+                        .saturating_sub(1);
                 }
                 self.deliveries.lose(journal, controls, streams);
                 lost.record(journal.bytes_sent, journal.sent_time);
                 if epoch == conn::Epoch::Application
-                    && Some(journal.pn) == self.deliveries.egress.pmtud_probe_pn
+                    && Some(journal.pn) == self.deliveries.egress.congestion.pmtud_probe_pn
                 {
-                    self.deliveries.egress.pmtud.probe_lost();
-                    self.deliveries.egress.pmtud_probe_pn = None;
+                    self.deliveries.egress.congestion.pmtud.probe_lost();
+                    self.deliveries.egress.congestion.pmtud_probe_pn = None;
                 }
             },
         );
-        self.deliveries.egress.packet_journals = journals;
+        self.deliveries.egress.recovery.packet_journals = journals;
         lost
     }
 }

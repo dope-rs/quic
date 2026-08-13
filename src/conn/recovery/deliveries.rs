@@ -40,17 +40,20 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer, C: conn::control::Write>
         streams: conn::journal::StreamDrain<'_>,
     ) {
         self.egress
+            .congestion
             .cc
             .packet_acked(journal.bytes_sent as u64, journal.transmission.in_flight());
-        if epoch == conn::Epoch::Application && Some(journal.pn) == self.egress.pmtud_probe_pn {
-            self.egress.pmtud.probe_acked();
-            self.egress.pmtud_probe_pn = None;
+        if epoch == conn::Epoch::Application
+            && Some(journal.pn) == self.egress.congestion.pmtud_probe_pn
+        {
+            self.egress.congestion.pmtud.probe_acked();
+            self.egress.congestion.pmtud_probe_pn = None;
         }
         if journal.transmission.ack_eliciting() && journal.transmission.in_flight() {
-            self.egress.spaces[epoch as usize].ack_eliciting_in_flight = self.egress.spaces
-                [epoch as usize]
-                .ack_eliciting_in_flight
-                .saturating_sub(1);
+            self.egress.recovery.spaces[epoch as usize].ack_eliciting_in_flight =
+                self.egress.recovery.spaces[epoch as usize]
+                    .ack_eliciting_in_flight
+                    .saturating_sub(1);
         }
         self.acknowledge_deliveries(journal, controls, streams);
     }
@@ -128,7 +131,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer, C: conn::control::Write>
                 ),
                 Ok(None) => {}
                 Err(_) => {
-                    self.egress.state = conn::State::Closed;
+                    self.egress.lifecycle.state = conn::State::Closed;
                     return;
                 }
             }

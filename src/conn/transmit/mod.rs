@@ -25,6 +25,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
         let mut out = Vec::with_capacity(
             self.connection
                 .egress
+                .datagrams
                 .pending_datagrams
                 .len()
                 .min(conn::MAX_BATCH_PACKETS),
@@ -65,7 +66,8 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
         max_packets: usize,
         max_packet_bytes: usize,
     ) {
-        let packet_bytes = max_packet_bytes.min(self.connection.egress.pmtud.current() as usize);
+        let packet_bytes =
+            max_packet_bytes.min(self.connection.egress.congestion.pmtud.current() as usize);
         let packet_slots = max_packets.min(conn::MAX_BATCH_PACKETS);
         batch.reset(packet_slots, packet_bytes);
         let probe_aware_packet_ceiling = max_packet_bytes;
@@ -114,11 +116,16 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
             .handshake
             .write_key(conn::Epoch::Application)
             .is_some()
-            && self.connection.egress.datagram_congestion_control
+            && self.connection.egress.datagrams.datagram_congestion_control
                 == conn::datagram::CongestionControl::Uncongested
-            && !self.connection.egress.pending_datagrams.is_empty()
-            && self.connection.egress.pto_probe_allowance == 0
-            && self.connection.egress.pending_close.is_none()
+            && !self
+                .connection
+                .egress
+                .datagrams
+                .pending_datagrams
+                .is_empty()
+            && self.connection.egress.recovery.pto_probe_allowance == 0
+            && self.connection.egress.lifecycle.pending_close.is_none()
             && (!eligibility::Eligibility::new(self.connection).has_initial_crypto()
                 && !self.connection.receive.packet_numbers[conn::Epoch::Initial as usize]
                     .ack_pending)
@@ -134,7 +141,13 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
                 .has_sendable(conn::Epoch::Application)
             && !self.connection.streams.transmit.deliveries.has_retransmit()
             && self.connection.streams.transmit.schedule.is_empty()
-            && self.connection.egress.pmtud.next_probe().is_none()
+            && self
+                .connection
+                .egress
+                .congestion
+                .pmtud
+                .next_probe()
+                .is_none()
     }
 
     fn emit_pending_datagrams<const FAST: bool, S: conn::packet::Sink>(
@@ -144,8 +157,15 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
         remaining: &mut usize,
         packet_bytes: usize,
     ) -> bool {
-        while *remaining != 0 && !self.connection.egress.pending_datagrams.is_empty() {
-            let validated = self.connection.egress.peer_address_validated;
+        while *remaining != 0
+            && !self
+                .connection
+                .egress
+                .datagrams
+                .pending_datagrams
+                .is_empty()
+        {
+            let validated = self.connection.egress.activity.peer_address_validated;
             if (FAST
                 && !validated
                 && !eligibility::Eligibility::new(self.connection).anti_amplification_allows())
@@ -167,7 +187,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
             };
             let Some(commit) = sink.emit(packet_ceiling, |dst, packet_ceiling| {
                 if S::FRESH_PACKETS {
-                    let data = self.connection.egress.pending_datagrams.front()?;
+                    let data = self.connection.egress.datagrams.pending_datagrams.front()?;
                     dst.reserve(
                         1 + self.connection.path.peer_cid().len()
                             + conn::PN_LEN as usize
@@ -197,16 +217,16 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
         max_packet_bytes: usize,
     ) {
         if self.connection.control.take_overflowed()
-            && self.connection.egress.pending_close.is_none()
+            && self.connection.egress.lifecycle.pending_close.is_none()
         {
-            self.connection.egress.pending_close = Some(conn::egress::PendingClose {
+            self.connection.egress.lifecycle.pending_close = Some(conn::egress::PendingClose {
                 is_application: false,
                 error_code: conn::INTERNAL_ERROR,
                 frame_type: 0,
                 reason: conn::CONTROL_CAPACITY_REASON.to_vec(),
             });
         }
-        if self.connection.egress.state == conn::State::Closed {
+        if self.connection.egress.lifecycle.state == conn::State::Closed {
             return;
         }
         self.connection
@@ -226,7 +246,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
         )
         .drain();
         let normal_packet_bytes =
-            max_packet_bytes.min(self.connection.egress.pmtud.current() as usize);
+            max_packet_bytes.min(self.connection.egress.congestion.pmtud.current() as usize);
         let mut remaining = max_packets;
         if self.has_only_uncongested_datagrams() {
             self.emit_pending_datagrams::<true, S>(sink, now, &mut remaining, normal_packet_bytes);
@@ -237,7 +257,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
 
         self.snapshot_pending_streams(control_work);
 
-        while remaining != 0 && self.connection.egress.pto_probe_allowance != 0 {
+        while remaining != 0 && self.connection.egress.recovery.pto_probe_allowance != 0 {
             let Some(packet_ceiling) = eligibility::Eligibility::new(self.connection)
                 .emission_ceiling(normal_packet_bytes)
             else {
@@ -292,7 +312,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
                     return;
                 }
                 remaining -= 1;
-                self.connection.egress.sent_initial = true;
+                self.connection.egress.lifecycle.sent_initial = true;
             }
         }
 
@@ -378,7 +398,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
             .write_key(conn::Epoch::Application)
             .is_some()
         {
-            if remaining != 0 && self.connection.egress.pending_close.is_some() {
+            if remaining != 0 && self.connection.egress.lifecycle.pending_close.is_some() {
                 let commit = eligibility::Eligibility::new(self.connection)
                     .emission_ceiling(normal_packet_bytes)
                     .and_then(|packet_ceiling| {
@@ -402,7 +422,12 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
                 let has_app_ack = self.connection.receive.packet_numbers
                     [conn::Epoch::Application as usize]
                     .ack_pending;
-                let has_datagrams = !self.connection.egress.pending_datagrams.is_empty();
+                let has_datagrams = !self
+                    .connection
+                    .egress
+                    .datagrams
+                    .pending_datagrams
+                    .is_empty();
                 let has_streams = !self.connection.streams.transmit.scratch_pending.is_empty();
                 let has_lifecycle = self
                     .connection
@@ -420,7 +445,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
                 {
                     break;
                 }
-                let before = self.connection.egress.cc.bytes_in_flight;
+                let before = self.connection.egress.congestion.cc.bytes_in_flight;
                 let Some(packet_ceiling) = eligibility::Eligibility::new(self.connection)
                     .emission_ceiling(normal_packet_bytes)
                 else {
@@ -444,7 +469,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
                 if did_handshake_done {
                     sent_handshake_done = true;
                 }
-                if !one_shot && self.connection.egress.cc.bytes_in_flight == before {
+                if !one_shot && self.connection.egress.congestion.cc.bytes_in_flight == before {
                     break;
                 }
             }
@@ -457,7 +482,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Emission<'a, DOMAIN, B> {
                 return;
             }
             if remaining != 0
-                && let Some(probe_size) = self.connection.egress.pmtud.next_probe()
+                && let Some(probe_size) = self.connection.egress.congestion.pmtud.next_probe()
                 && eligibility::Eligibility::new(self.connection)
                     .allows_emit_for(conn::packet::Cargo::CryptoOrAck, now)
             {

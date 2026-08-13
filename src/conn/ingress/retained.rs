@@ -108,11 +108,22 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
     where
         R: handshake::Reader<DOMAIN>,
     {
-        if !self.ingress.connection.egress.peer_address_validated {
-            self.ingress.connection.egress.amplification_received = self
+        if !self
+            .ingress
+            .connection
+            .egress
+            .activity
+            .peer_address_validated
+        {
+            self.ingress
+                .connection
+                .egress
+                .activity
+                .amplification_received = self
                 .ingress
                 .connection
                 .egress
+                .activity
                 .amplification_received
                 .saturating_add(packet.len() as u64);
         }
@@ -253,7 +264,11 @@ impl<'a, 'd, const DOMAIN: u8> Retained<'a, 'd, DOMAIN> {
         let packet = packet
             .decrypt(hr, expected)
             .map_err(|_| conn::Error::PacketDecrypt)?;
-        self.ingress.connection.egress.peer_address_validated = true;
+        self.ingress
+            .connection
+            .egress
+            .activity
+            .peer_address_validated = true;
         let pn = packet.packet_number();
         let mut source = frames::Copied::<stream::RecvBuffer<'d>>::new();
         self.ingress.process_packet_body(

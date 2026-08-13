@@ -30,7 +30,7 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> View<'conn, DOMAIN, B> {
     }
 
     pub fn state(&self) -> conn::State {
-        self.connection.egress.state
+        self.connection.egress.lifecycle.state
     }
 
     pub fn is_handshaking(&self) -> bool {
@@ -54,7 +54,7 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> View<'conn, DOMAIN, B> {
     }
 
     pub fn path_mtu(&self) -> u64 {
-        self.connection.egress.pmtud.current()
+        self.connection.egress.congestion.pmtud.current()
     }
 
     pub fn next_timer(&self) -> Option<time::Instant> {
@@ -63,7 +63,7 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> View<'conn, DOMAIN, B> {
     }
 
     pub fn next_send_time(&self) -> time::Instant {
-        self.connection.egress.pacer.next_release_time()
+        self.connection.egress.congestion.pacer.next_release_time()
     }
 
     pub fn local_cids(&self) -> LocalCids<'conn> {
@@ -77,41 +77,42 @@ impl<'conn, const DOMAIN: u8, B: stream::ReceiveBuffer> View<'conn, DOMAIN, B> {
     }
 
     pub fn handshake_confirmed(&self) -> bool {
-        self.connection.egress.handshake_confirmed
+        self.connection.egress.lifecycle.handshake_confirmed
     }
 
     pub fn peer_address_validated(&self) -> bool {
-        self.connection.egress.peer_address_validated
+        self.connection.egress.activity.peer_address_validated
     }
 
     pub fn amplification_received(&self) -> u64 {
-        self.connection.egress.amplification_received
+        self.connection.egress.activity.amplification_received
     }
 
     pub fn congestion_window(&self) -> u64 {
-        self.connection.egress.cc.cwnd
+        self.connection.egress.congestion.cc.cwnd
     }
 
     pub fn bytes_in_flight(&self) -> u64 {
-        self.connection.egress.cc.bytes_in_flight
+        self.connection.egress.congestion.cc.bytes_in_flight
     }
 
     pub fn slow_start_threshold(&self) -> u64 {
-        self.connection.egress.cc.ssthresh
+        self.connection.egress.congestion.cc.ssthresh
     }
 
     pub fn unacked_count(&self, epoch_index: usize) -> usize {
         self.connection
             .egress
+            .recovery
             .packet_journals
             .count_epoch(conn::Epoch::from_index(epoch_index))
     }
 
     pub fn smoothed_rtt(&self) -> Option<time::Duration> {
-        self.connection.egress.rtt.smoothed_rtt
+        self.connection.egress.recovery.rtt.smoothed_rtt
     }
 
     pub fn min_rtt(&self) -> Option<time::Duration> {
-        self.connection.egress.rtt.min_rtt
+        self.connection.egress.recovery.rtt.min_rtt
     }
 }

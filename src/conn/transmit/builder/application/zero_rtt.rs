@@ -32,8 +32,9 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildZeroRtt
             return None;
         }
         let payload_limit = self.packet.handshake_payload_limit(max_packet_bytes);
-        let pn =
-            self.packet.connection.egress.spaces[crate::conn::Epoch::Application as usize].next_pn;
+        let pn = self.packet.connection.egress.recovery.spaces
+            [crate::conn::Epoch::Application as usize]
+            .next_pn;
         let mut frames = std::mem::take(&mut self.packet.connection.scratch.frames);
         frames.clear();
         let mut commit = commit::Packet::new(crate::conn::Epoch::Application, pn);

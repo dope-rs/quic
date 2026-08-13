@@ -25,8 +25,9 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
         dst: &mut Vec<u8>,
         max_packet_bytes: usize,
     ) -> Option<(usize, commit::Packet)> {
-        let pn =
-            self.packet.connection.egress.spaces[crate::conn::Epoch::Application as usize].next_pn;
+        let pn = self.packet.connection.egress.recovery.spaces
+            [crate::conn::Epoch::Application as usize]
+            .next_pn;
         let packet_start = dst.len();
         let pn_off = crate::packet::ShortHeaderRef {
             dcid: self.packet.connection.path.peer_cid(),

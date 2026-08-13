@@ -54,7 +54,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer, C: conn::control::Write>
         receipt: Receipt<'_>,
         now: time::Instant,
     ) {
-        let mut journals = mem::take(&mut self.deliveries.egress.packet_journals);
+        let mut journals = mem::take(&mut self.deliveries.egress.recovery.packet_journals);
         journals.drain_ack(
             epoch,
             receipt.largest,
@@ -68,15 +68,15 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer, C: conn::control::Write>
                     } else {
                         time::Duration::ZERO
                     };
-                    self.deliveries.egress.rtt.update(sample, delay);
+                    self.deliveries.egress.recovery.rtt.update(sample, delay);
                 }
                 if journal.transmission.ack_eliciting() {
-                    self.deliveries.egress.pto_count = 0;
+                    self.deliveries.egress.recovery.pto_count = 0;
                 }
                 self.deliveries
                     .acknowledge(epoch, journal, controls, streams);
             },
         );
-        self.deliveries.egress.packet_journals = journals;
+        self.deliveries.egress.recovery.packet_journals = journals;
     }
 }
