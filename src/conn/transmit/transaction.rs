@@ -22,10 +22,10 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
         if commit.in_flight {
             let mut packet = commit::Packet::new(crate::conn::Epoch::Application, commit.pn);
             packet.bytes = commit.bytes;
-            packet.ack_eliciting = commit.datagram;
-            packet.in_flight = true;
-            packet.ack_included = commit.ack_included;
-            packet.datagram = commit.datagram;
+            packet.properties.ack_eliciting = commit.datagram;
+            packet.properties.in_flight = true;
+            packet.properties.ack_included = commit.ack_included;
+            packet.properties.datagram = commit.datagram;
             return self.packet(&packet, now);
         }
 
@@ -52,10 +52,10 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
     pub(super) fn packet(&mut self, commit: &commit::Packet, now: time::Instant) -> bool {
         let epoch = commit.epoch;
         let pn = commit.pn;
-        let tracked = commit.in_flight
+        let tracked = commit.properties.in_flight
             || !commit.controls.is_empty()
             || !commit.streams.is_empty()
-            || commit.early_data
+            || commit.properties.early_data
             || commit.crypto.is_some()
             || commit.pmtud_probe.is_some();
         let mut journal = journal::Packet {
@@ -64,14 +64,14 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
             sent_time: now,
             bytes_sent: commit.bytes,
             transmission: journal::Transmission::new(
-                commit.early_data,
-                commit.ack_eliciting,
-                commit.in_flight,
+                commit.properties.early_data,
+                commit.properties.ack_eliciting,
+                commit.properties.in_flight,
             ),
             crypto: None,
         };
         self.connection.egress.spaces[epoch as usize].next_pn = pn.saturating_add(1);
-        if commit.ack_included {
+        if commit.properties.ack_included {
             self.connection.received[epoch as usize].ack_pending = false;
         }
         if let Some(delivery) = commit.crypto {
@@ -199,11 +199,11 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
                 return false;
             }
         }
-        if tracked && commit.ack_eliciting {
+        if tracked && commit.properties.ack_eliciting {
             self.connection.egress.spaces[epoch as usize].time_of_last_ack_eliciting = Some(now);
             self.connection.egress.spaces[epoch as usize].ack_eliciting_in_flight += 1;
         }
-        if commit.datagram {
+        if commit.properties.datagram {
             self.connection.egress.pending_datagrams.pop_front();
         }
         self.connection.egress.amplification_sent = self
@@ -215,8 +215,8 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
         self.connection
             .egress
             .cc
-            .packet_sent(bytes, commit.in_flight);
-        if commit.in_flight {
+            .packet_sent(bytes, commit.properties.in_flight);
+        if commit.properties.in_flight {
             let smoothed = self
                 .connection
                 .egress
@@ -234,18 +234,20 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Transaction<'a, DOMAIN, B> 
             self.connection.egress.pmtud.arm_probe(size);
             self.connection.egress.pmtud_probe_pn = Some(pn);
         }
-        if commit.pto_probe {
+        if commit.properties.pto_probe {
             self.connection.egress.pto_probe_allowance =
                 self.connection.egress.pto_probe_allowance.saturating_sub(1);
             if self.connection.egress.pto_probe_allowance == 0 {
                 self.connection.egress.pto_probe_epoch = None;
             }
         }
-        if commit.ack_eliciting && !self.connection.egress.ack_eliciting_sent_since_last_receive {
+        if commit.properties.ack_eliciting
+            && !self.connection.egress.ack_eliciting_sent_since_last_receive
+        {
             self.connection.egress.last_activity = now;
             self.connection.egress.ack_eliciting_sent_since_last_receive = true;
         }
-        if commit.close {
+        if commit.properties.close {
             self.connection.egress.pending_close = None;
             self.connection.egress.state = crate::conn::State::Closed;
         }

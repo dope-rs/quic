@@ -196,7 +196,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
                 break;
             }
             commit.push_control_delivery(record, handle);
-            commit.ack_eliciting = true;
+            commit.properties.ack_eliciting = true;
         }
     }
 
@@ -220,7 +220,7 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
                 break;
             }
             commit.push_control_delivery(record, handle);
-            commit.ack_eliciting = true;
+            commit.properties.ack_eliciting = true;
         }
     }
 
@@ -387,11 +387,11 @@ impl<'a, const DOMAIN: u8, B: stream::ReceiveBuffer> Builder<'a, DOMAIN, B> {
         let n = sealed?;
         let mut commit = commit::Packet::new(epoch, pn);
         commit.bytes = n;
-        commit.ack_eliciting = mode == packet::CryptoMode::PtoProbe || crypto.is_some();
-        commit.in_flight = commit.ack_eliciting;
-        commit.ack_included = ack_included;
+        commit.properties.ack_eliciting = mode == packet::CryptoMode::PtoProbe || crypto.is_some();
+        commit.properties.in_flight = commit.properties.ack_eliciting;
+        commit.properties.ack_included = ack_included;
         commit.crypto = crypto;
-        commit.pto_probe = mode == packet::CryptoMode::PtoProbe;
+        commit.properties.pto_probe = mode == packet::CryptoMode::PtoProbe;
         Some((n, commit))
     }
 }

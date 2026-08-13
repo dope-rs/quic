@@ -42,7 +42,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
         let mut commit = commit::Packet::new(crate::conn::Epoch::Application, pn);
         let track_delivery = self.packet.can_track_packet();
         if PTO_PROBE {
-            commit.ack_included = self.packet.append_ack_frame(
+            commit.properties.ack_included = self.packet.append_ack_frame(
                 crate::conn::Epoch::Application,
                 &mut frames,
                 payload_limit,
@@ -58,7 +58,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                 )
             {
                 commit.crypto = Some(delivery);
-                commit.ack_eliciting = true;
+                commit.properties.ack_eliciting = true;
             }
             while !commit.controls.is_full() {
                 let next = self.packet.connection.control.next_probe(
@@ -83,7 +83,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                     break;
                 }
                 commit.push_control_delivery(record, handle);
-                commit.ack_eliciting = true;
+                commit.properties.ack_eliciting = true;
             }
             while !commit.streams.is_full() {
                 let next = self
@@ -153,9 +153,9 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                     record,
                     tracked: Some(handle),
                 });
-                commit.ack_eliciting = true;
+                commit.properties.ack_eliciting = true;
             }
-            if !commit.ack_eliciting {
+            if !commit.properties.ack_eliciting {
                 if !crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_frame(
                     &mut frames,
                     payload_limit,
@@ -163,11 +163,11 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                 ) {
                     return None;
                 }
-                commit.ack_eliciting = true;
+                commit.properties.ack_eliciting = true;
             }
-            commit.pto_probe = true;
+            commit.properties.pto_probe = true;
         } else {
-            commit.ack_included = self.packet.append_ack_frame(
+            commit.properties.ack_included = self.packet.append_ack_frame(
                 crate::conn::Epoch::Application,
                 &mut frames,
                 payload_limit,
@@ -201,7 +201,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                 )
             {
                 commit.crypto = Some(crypto);
-                commit.ack_eliciting = true;
+                commit.properties.ack_eliciting = true;
             }
             if has_control
                 && let Some(records) = self.packet.connection.control.only_path_responses()
@@ -302,7 +302,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                     record,
                     tracked: Some(handle),
                 });
-                commit.ack_eliciting = true;
+                commit.properties.ack_eliciting = true;
             }
             let transmit = &mut self.packet.connection.streams.state.transmit;
             let mut idx = 0;
@@ -372,7 +372,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                             )
                         {
                             commit.push_control_delivery(record, handle);
-                            commit.ack_eliciting = true;
+                            commit.properties.ack_eliciting = true;
                         }
                     }
                     if stream_budget == 0
@@ -402,7 +402,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                             )
                         {
                             commit.push_control_delivery(record, handle);
-                            commit.ack_eliciting = true;
+                            commit.properties.ack_eliciting = true;
                         }
                     }
                     idx += 1;
@@ -445,7 +445,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
                     len: n as u64,
                     fin: fin_now,
                 });
-                commit.ack_eliciting = true;
+                commit.properties.ack_eliciting = true;
                 idx += 1;
             }
         }
@@ -470,7 +470,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildOneRtt
             .ok()?;
 
         commit.bytes = seg;
-        commit.in_flight = commit.ack_eliciting;
+        commit.properties.in_flight = commit.properties.ack_eliciting;
         Some((seg, commit))
     }
 }

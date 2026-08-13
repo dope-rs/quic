@@ -76,8 +76,8 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildTerminal
         self.packet.connection.scratch_frames = frames;
         let mut commit = commit::Packet::new(conn::Epoch::Application, pn);
         commit.bytes = n;
-        commit.ack_eliciting = true;
-        commit.in_flight = true;
+        commit.properties.ack_eliciting = true;
+        commit.properties.in_flight = true;
         commit.pmtud_probe = Some(target_size);
         Some((n, commit))
     }
@@ -148,7 +148,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildTerminal
         self.packet.connection.scratch_frames = frames;
         let mut commit = commit::Packet::new(conn::Epoch::Application, pn);
         commit.bytes = n;
-        commit.close = true;
+        commit.properties.close = true;
         Some((n, commit))
     }
 }

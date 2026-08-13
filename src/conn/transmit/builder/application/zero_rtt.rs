@@ -37,7 +37,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildZeroRtt
         let mut frames = std::mem::take(&mut self.packet.connection.scratch_frames);
         frames.clear();
         let mut commit = commit::Packet::new(crate::conn::Epoch::Application, pn);
-        commit.early_data = true;
+        commit.properties.early_data = true;
         if pto_probe {
             while !commit.streams.is_full() {
                 let next = self
@@ -107,9 +107,9 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildZeroRtt
                     record,
                     tracked: Some(handle),
                 });
-                commit.ack_eliciting = true;
+                commit.properties.ack_eliciting = true;
             }
-            if !commit.ack_eliciting {
+            if !commit.properties.ack_eliciting {
                 if !crate::conn::transmit::builder::Builder::<DOMAIN, B>::append_frame(
                     &mut frames,
                     payload_limit,
@@ -118,9 +118,9 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildZeroRtt
                     self.packet.connection.scratch_frames = frames;
                     return None;
                 }
-                commit.ack_eliciting = true;
+                commit.properties.ack_eliciting = true;
             }
-            commit.pto_probe = true;
+            commit.properties.pto_probe = true;
         }
         let mut packet_fresh_bytes = 0u64;
         for index in 0..if pto_probe {
@@ -212,7 +212,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildZeroRtt
                 fin: fin_now,
             });
             packet_fresh_bytes = packet_fresh_bytes.saturating_add(n as u64);
-            commit.ack_eliciting = true;
+            commit.properties.ack_eliciting = true;
             if payload_limit.saturating_sub(frames.len()) <= crate::conn::STREAM_FRAME_OVERHEAD {
                 break;
             }
@@ -254,7 +254,7 @@ impl<const DOMAIN: u8, B: stream::ReceiveBuffer> BuildZeroRtt
         frames.clear();
         self.packet.connection.scratch_frames = frames;
         commit.bytes = n;
-        commit.in_flight = true;
+        commit.properties.in_flight = true;
         Some((n, commit))
     }
 }

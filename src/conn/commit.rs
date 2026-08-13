@@ -15,22 +15,26 @@ pub(super) struct ControlDelivery {
     pub(super) handle: delivery::Handle<delivery::Control>,
 }
 
+pub(super) struct Properties {
+    pub(super) ack_eliciting: bool,
+    pub(super) in_flight: bool,
+    pub(super) ack_included: bool,
+    pub(super) early_data: bool,
+    pub(super) datagram: bool,
+    pub(super) close: bool,
+    pub(super) pto_probe: bool,
+}
+
 pub(super) struct Packet {
     pub(super) epoch: conn::Epoch,
     pub(super) pn: u64,
     pub(super) bytes: usize,
-    pub(super) ack_eliciting: bool,
-    pub(super) in_flight: bool,
-    pub(super) ack_included: bool,
+    pub(super) properties: Properties,
     pub(super) crypto: Option<Delivery<delivery::Crypto>>,
     pub(super) controls: array::CopyInline<ControlDelivery, { conn::PACKET_CONTROL_CAPACITY }>,
     pub(super) streams:
         array::CopyInline<Delivery<delivery::Stream>, { conn::PACKET_STREAM_CAPACITY }>,
-    pub(super) early_data: bool,
-    pub(super) datagram: bool,
-    pub(super) close: bool,
     pub(super) pmtud_probe: Option<u64>,
-    pub(super) pto_probe: bool,
 }
 
 pub(super) struct Datagram {
@@ -47,17 +51,19 @@ impl Packet {
             epoch,
             pn,
             bytes: 0,
-            ack_eliciting: false,
-            in_flight: false,
-            ack_included: false,
+            properties: Properties {
+                ack_eliciting: false,
+                in_flight: false,
+                ack_included: false,
+                early_data: false,
+                datagram: false,
+                close: false,
+                pto_probe: false,
+            },
             crypto: None,
             controls: array::CopyInline::new(),
             streams: array::CopyInline::new(),
-            early_data: false,
-            datagram: false,
-            close: false,
             pmtud_probe: None,
-            pto_probe: false,
         }
     }
 
