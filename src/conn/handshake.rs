@@ -22,18 +22,27 @@ const MAX_SESSION_TICKET_BYTES: usize = 256 * 1024;
 
 pub(crate) type Clock = fn() -> u64;
 
-pub(super) struct Handshake<const DOMAIN: u8> {
-    client: Option<Box<client::FramedClient<Clock>>>,
+struct Protections {
     read: [Option<packet_protection::PacketProtection>; 3],
     write: [Option<packet_protection::PacketProtection>; 3],
     zero_rtt_read: Option<packet_protection::PacketProtection>,
     zero_rtt_write: Option<packet_protection::PacketProtection>,
-    crypto: crypto_tx::Tx,
-    peer_transport_params: Option<transport_params::Params>,
-    received_tickets: collections::VecDeque<session::Ticket>,
-    received_ticket_bytes: usize,
 }
 
+struct TicketStore {
+    received: collections::VecDeque<session::Ticket>,
+    bytes: usize,
+}
+
+pub(super) struct Handshake<const DOMAIN: u8> {
+    client: Option<Box<client::FramedClient<Clock>>>,
+    protections: Protections,
+    crypto: crypto_tx::Tx,
+    peer_transport_params: Option<transport_params::Params>,
+    tickets: TicketStore,
+}
+
+#[derive(Default)]
 pub(super) struct Outcome {
     pub(super) done: bool,
     pub(super) reject_early_data: bool,
@@ -357,14 +366,18 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
     ) -> Self {
         Self {
             client,
-            read: [Some(initial_read), None, None],
-            write: [Some(initial_write), None, None],
-            zero_rtt_read: None,
-            zero_rtt_write: None,
+            protections: Protections {
+                read: [Some(initial_read), None, None],
+                write: [Some(initial_write), None, None],
+                zero_rtt_read: None,
+                zero_rtt_write: None,
+            },
             crypto: crypto_tx::Tx::new(crypto_capacity, outbound_layout),
             peer_transport_params: None,
-            received_tickets: collections::VecDeque::new(),
-            received_ticket_bytes: 0,
+            tickets: TicketStore {
+                received: collections::VecDeque::new(),
+                bytes: 0,
+            },
         }
     }
 
@@ -414,33 +427,21 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
     ) -> Result<Outcome, conn::Error> {
         let Self {
             client,
-            read,
-            write,
-            zero_rtt_read,
-            zero_rtt_write,
+            protections,
             crypto,
             peer_transport_params,
-            received_tickets,
-            received_ticket_bytes,
+            tickets,
         } = self;
         let mut events = Events {
-            read,
-            write,
-            zero_rtt_read,
-            zero_rtt_write,
+            protections,
             crypto,
             peer_transport_params,
-            received_tickets,
-            received_ticket_bytes,
+            tickets,
             is_client,
-            done: false,
-            reject_early_data: false,
+            outcome: Outcome::default(),
         };
         match run(client, &mut events) {
-            Ok(()) => Ok(Outcome {
-                done: events.done,
-                reject_early_data: events.reject_early_data,
-            }),
+            Ok(()) => Ok(events.outcome),
             Err(connection::DriveError::Protocol(_)) => Err(conn::Error::Tls),
             Err(connection::DriveError::Sink(error)) => Err(error),
         }
@@ -450,22 +451,22 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
         &self,
         epoch: conn::Epoch,
     ) -> Option<&packet_protection::PacketProtection> {
-        self.read[epoch as usize].as_ref()
+        self.protections.read[epoch as usize].as_ref()
     }
 
     pub(super) fn write_key(
         &self,
         epoch: conn::Epoch,
     ) -> Option<&packet_protection::PacketProtection> {
-        self.write[epoch as usize].as_ref()
+        self.protections.write[epoch as usize].as_ref()
     }
 
     pub(super) fn zero_rtt_read_key(&self) -> Option<&packet_protection::PacketProtection> {
-        self.zero_rtt_read.as_ref()
+        self.protections.zero_rtt_read.as_ref()
     }
 
     pub(super) fn zero_rtt_write_key(&self) -> Option<&packet_protection::PacketProtection> {
-        self.zero_rtt_write.as_ref()
+        self.protections.zero_rtt_write.as_ref()
     }
 
     pub(super) fn replace_initial_keys(
@@ -473,13 +474,13 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
         read: packet_protection::PacketProtection,
         write: packet_protection::PacketProtection,
     ) {
-        self.read[conn::Epoch::Initial as usize] = Some(read);
-        self.write[conn::Epoch::Initial as usize] = Some(write);
+        self.protections.read[conn::Epoch::Initial as usize] = Some(read);
+        self.protections.write[conn::Epoch::Initial as usize] = Some(write);
     }
 
     pub(super) fn discard(&mut self, epoch: conn::Epoch) {
-        self.read[epoch as usize] = None;
-        self.write[epoch as usize] = None;
+        self.protections.read[epoch as usize] = None;
+        self.protections.write[epoch as usize] = None;
         self.crypto.discard(epoch);
     }
 
@@ -500,23 +501,18 @@ impl<const DOMAIN: u8> Handshake<DOMAIN> {
     }
 
     pub(super) fn take_session_tickets(&mut self) -> Vec<session::Ticket> {
-        self.received_ticket_bytes = 0;
-        self.received_tickets.drain(..).collect()
+        self.tickets.bytes = 0;
+        self.tickets.received.drain(..).collect()
     }
 }
 
 struct Events<'a> {
-    read: &'a mut [Option<packet_protection::PacketProtection>; 3],
-    write: &'a mut [Option<packet_protection::PacketProtection>; 3],
-    zero_rtt_read: &'a mut Option<packet_protection::PacketProtection>,
-    zero_rtt_write: &'a mut Option<packet_protection::PacketProtection>,
+    protections: &'a mut Protections,
     crypto: &'a mut crypto_tx::Tx,
     peer_transport_params: &'a mut Option<transport_params::Params>,
-    received_tickets: &'a mut collections::VecDeque<session::Ticket>,
-    received_ticket_bytes: &'a mut usize,
+    tickets: &'a mut TicketStore,
     is_client: bool,
-    done: bool,
-    reject_early_data: bool,
+    outcome: Outcome,
 }
 
 impl connection::EventSink for Events<'_> {
@@ -573,8 +569,8 @@ impl connection::EventSink for Events<'_> {
                         return Err(conn::Error::Tls);
                     }
                 };
-                self.read[index] = Some(read);
-                self.write[index] = Some(write);
+                self.protections.read[index] = Some(read);
+                self.protections.write[index] = Some(write);
             }
             connection::Event::PeerExtension { ty, data } => {
                 if ty != shin::wire::extension::Type::QUIC_TRANSPORT_PARAMETERS.0
@@ -584,7 +580,7 @@ impl connection::EventSink for Events<'_> {
                 }
                 *self.peer_transport_params = Some(transport_params::Params::decode(data)?);
             }
-            connection::Event::Done => self.done = true,
+            connection::Event::Done => self.outcome.done = true,
             connection::Event::KeyUpdate { .. } => return Err(conn::Error::Tls),
             connection::Event::ZeroRttKeysReady { secret, .. } => {
                 let keys = crate::qkdf::PacketKeys::aes_128(secret.as_slice())
@@ -592,15 +588,15 @@ impl connection::EventSink for Events<'_> {
                 let protection = packet_protection::PacketProtection::aes_128(&keys)
                     .map_err(|_| conn::Error::Tls)?;
                 if self.is_client {
-                    *self.zero_rtt_write = Some(protection);
+                    self.protections.zero_rtt_write = Some(protection);
                 } else {
-                    *self.zero_rtt_read = Some(protection);
+                    self.protections.zero_rtt_read = Some(protection);
                 }
             }
             connection::Event::EarlyDataAccepted => {}
             connection::Event::EarlyDataRejected => {
-                *self.zero_rtt_write = None;
-                self.reject_early_data = true;
+                self.protections.zero_rtt_write = None;
+                self.outcome.reject_early_data = true;
             }
             connection::Event::NewSessionTicket(ticket) => {
                 let alpn = ticket.alpn().map(<[u8]>::to_vec);
@@ -611,19 +607,18 @@ impl connection::EventSink for Events<'_> {
                 if ticket_bytes > MAX_SESSION_TICKET_BYTES {
                     return Ok(());
                 }
-                while self.received_tickets.len() >= MAX_SESSION_TICKETS
-                    || self.received_ticket_bytes.saturating_add(ticket_bytes)
-                        > MAX_SESSION_TICKET_BYTES
+                while self.tickets.received.len() >= MAX_SESSION_TICKETS
+                    || self.tickets.bytes.saturating_add(ticket_bytes) > MAX_SESSION_TICKET_BYTES
                 {
-                    let Some(expired) = self.received_tickets.pop_front() else {
+                    let Some(expired) = self.tickets.received.pop_front() else {
                         break;
                     };
-                    *self.received_ticket_bytes = self.received_ticket_bytes.saturating_sub(
+                    self.tickets.bytes = self.tickets.bytes.saturating_sub(
                         expired.ticket.len() + expired.alpn.as_ref().map_or(0, Vec::len),
                     );
                 }
                 let psk = ticket.try_psk().map_err(|_| conn::Error::Tls)?;
-                self.received_tickets.push_back(session::Ticket {
+                self.tickets.received.push_back(session::Ticket {
                     ticket_lifetime: ticket.ticket_lifetime_secs(),
                     ticket_age_add: ticket.ticket_age_add(),
                     received_at_ms: ticket.received_at_ms(),
@@ -633,7 +628,7 @@ impl connection::EventSink for Events<'_> {
                     cipher_suite: ticket.cipher_suite(),
                     alpn,
                 });
-                *self.received_ticket_bytes += ticket_bytes;
+                self.tickets.bytes += ticket_bytes;
             }
         }
         Ok(())
