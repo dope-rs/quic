@@ -1,531 +1,277 @@
-pub mod support;
-
-use std::cell::RefCell;
-use std::net::SocketAddr;
+use crate::common::peer;
+pub mod common;
+use common::suite::mux::dispatch::{CID, CLIENT, Capture, Defer, SERVER};
+use dope_quic::conn::life::options::Options;
+use dope_quic::conn::stream::Event;
+use dope_quic::errors::Code;
+use dope_quic::proto::param;
+use dope_quic::runtime::mux::builder::{Builder, Plan};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use dope_quic::conn::{Handle, stream::Event};
-use dope_quic::{Handler, Mux, conn::session::Connection, transport_params};
-
-const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
-
-#[derive(Default)]
-struct Events {
-    established: Vec<Handle>,
-    datagrams: Vec<(Handle, Vec<u8>)>,
-    streams: Vec<(Handle, Event)>,
-    closed: Vec<Handle>,
-}
-
-#[derive(Clone, Default)]
-struct CapturingHandler {
-    events: Rc<RefCell<Events>>,
-}
-
-impl Handler<0> for CapturingHandler {
-    type Connection = Handle;
-
-    fn create_connection(&mut self, _conn: &mut Connection, handle: Handle) -> Handle {
-        handle
-    }
-
-    fn established(&mut self, connection: &mut Handle, _conn: &mut Connection, h: Handle) {
-        assert_eq!(*connection, h);
-        self.events.borrow_mut().established.push(h);
-    }
-    fn datagram(
-        &mut self,
-        connection: &mut Handle,
-        _conn: &mut Connection,
-        h: Handle,
-        data: Vec<u8>,
-    ) {
-        assert_eq!(*connection, h);
-        self.events.borrow_mut().datagrams.push((h, data.to_vec()));
-    }
-    fn stream_event(
-        &mut self,
-        connection: &mut Handle,
-        _conn: &mut Connection,
-        h: Handle,
-        event: Event,
-    ) {
-        assert_eq!(*connection, h);
-        self.events.borrow_mut().streams.push((h, event));
-    }
-    fn close(&mut self, connection: Handle, h: Handle) {
-        assert_eq!(connection, h);
-        self.events.borrow_mut().closed.push(h);
-    }
-}
-
-fn relay_once(
-    src: &mut Mux<CapturingHandler>,
-    dst: &mut Mux<CapturingHandler>,
-    src_addr: SocketAddr,
-) -> usize {
-    let now = Instant::now();
-    let pkts: Vec<_> = src.output().drain().collect();
-    let n = pkts.len();
-    for mut out in pkts {
-        dst.protocol()
-            .recv(src_addr, out.payload_mut(), now)
-            .expect("recv");
-    }
-    dst.output().drive_bounded(now);
-    n
-}
-
 #[test]
-fn quic_datagram_handshake_and_app_traffic() {
-    let signing = support::signing_key(0x39);
-    let server_pubkey = *signing.pubkey().unwrap();
+fn handshake() {
+    let (signing, key) = peer::raw(0x39).expect("raw identity");
+    let params = param::Set::builder()
+        .idle_ms(30_000)
+        .datagram(Some(65_535))
+        .initial_data(1 << 20)
+        .local_bidi(1 << 20)
+        .remote_bidi(1 << 20)
+        .stream_uni(1 << 20)
+        .bidi_count(8)
+        .uni_count(8)
+        .try_build()
+        .expect("fixture transport parameters");
 
-    let user_tp = transport_params::Params {
-        max_idle_timeout_ms: 30_000,
-        max_datagram_frame_size: Some(65535),
-        initial_max_data: 1 << 20,
-        initial_max_stream_data_bidi_local: 1 << 20,
-        initial_max_stream_data_bidi_remote: 1 << 20,
-        initial_max_stream_data_uni: 1 << 20,
-        initial_max_streams_bidi: 8,
-        initial_max_streams_uni: 8,
-        ..transport_params::Params::default()
-    };
-
-    let server_handler = CapturingHandler::default();
-    let server_events = server_handler.events.clone();
-    let mut server =
-        dope_quic::mux::setup::Server::accept(server_handler, signing, user_tp.clone().into())
-            .unwrap();
-
-    let client_handler = CapturingHandler::default();
-    let client_events = client_handler.events.clone();
-    let mut client = dope_quic::mux::setup::Client::new(client_handler)
+    let capture = Capture::default();
+    let srv_log = Rc::clone(&capture.events);
+    let mut server = Capture::server(
+        capture,
+        signing.server().expect("server TLS"),
+        Options::try_from(params.clone())
+            .expect("fixture configuration must satisfy its declared bounds"),
+        Plan::standard(),
+    )
+    .expect("fixture server");
+    let capture = Capture::default();
+    let cli_log = Rc::clone(&capture.events);
+    let mut client = Builder::client(capture)
         .build()
-        .unwrap();
-
-    let server_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
-    let client_addr: SocketAddr = "10.0.0.1:50000".parse().unwrap();
-
+        .expect("default client router resources must be valid");
     let now = Instant::now();
-    let client_handle = client
-        .protocol()
-        .connect(
-            server_addr,
-            server_pubkey,
-            user_tp.into(),
-            CID.to_vec(),
-            now,
-        )
-        .unwrap();
+    let cli_h = Capture::connect(
+        &mut client,
+        SERVER,
+        key,
+        Options::try_from(params).expect("fixture configuration must satisfy its declared bounds"),
+        CID.to_vec(),
+        now,
+    )
+    .expect("fixture connect");
 
-    relay_once(&mut client, &mut server, client_addr);
-    relay_once(&mut server, &mut client, server_addr);
-    relay_once(&mut client, &mut server, client_addr);
-    server.output().drive_bounded(now);
-    client.output().drive_bounded(now);
+    Capture::relay(&mut client, &mut server, CLIENT, now).expect("fixture relay");
+    Capture::relay(&mut server, &mut client, SERVER, now).expect("fixture relay");
+    Capture::relay(&mut client, &mut server, CLIENT, now).expect("fixture relay");
+    Capture::drive(&mut server, now).expect("fixture drive");
+    Capture::drive(&mut client, now).expect("fixture drive");
 
-    let server_handle = {
-        let evs = server_events.borrow();
-        assert_eq!(evs.established.len(), 1, "server got Established");
-        evs.established[0]
+    let srv_h = {
+        let events = srv_log.borrow();
+        assert_eq!(events.established.len(), 1, "server got Established");
+        events.established[0]
     };
     {
-        let evs = client_events.borrow();
-        assert_eq!(evs.established.len(), 1, "client got Established");
-        assert_eq!(evs.established[0], client_handle);
+        let events = cli_log.borrow();
+        assert_eq!(events.established.len(), 1, "client got Established");
+        assert!(events.established[0] == cli_h);
     }
 
-    client
-        .protocol()
-        .try_send_datagram(client_handle, b"hello server".to_vec(), now)
-        .unwrap();
-    relay_once(&mut client, &mut server, client_addr);
+    Capture::send(&mut client, cli_h, b"hello server".to_vec(), now).expect("fixture send");
+    let packets = Capture::output(&mut client, now).expect("fixture output");
+    assert!(!packets.is_empty());
+    for mut packet in packets {
+        for segment in packet.segments_mut() {
+            let mut copy = segment.to_vec();
+            Capture::recv(&mut server, CLIENT, segment, now).expect("fixture recv");
+            Capture::recv(&mut server, CLIENT, &mut copy, now).expect("fixture recv");
+        }
+    }
+    Capture::drive(&mut server, now).expect("fixture drive");
     {
-        let evs = server_events.borrow();
-        assert_eq!(evs.datagrams.len(), 1);
-        assert_eq!(evs.datagrams[0].0, server_handle);
-        assert_eq!(evs.datagrams[0].1, b"hello server");
+        let events = srv_log.borrow();
+        assert_eq!(events.datagrams.len(), 1);
+        assert!(events.datagrams[0].0 == srv_h);
+        assert_eq!(events.datagrams[0].1, b"hello server");
     }
 
-    server
-        .protocol()
-        .try_send_datagram(server_handle, b"hello client".to_vec(), now)
-        .unwrap();
-    relay_once(&mut server, &mut client, server_addr);
+    Capture::send(&mut server, srv_h, b"hello client".to_vec(), now).expect("fixture send");
+    Capture::relay(&mut server, &mut client, SERVER, now).expect("fixture relay");
     {
-        let evs = client_events.borrow();
-        assert_eq!(evs.datagrams.len(), 1);
-        assert_eq!(evs.datagrams[0].0, client_handle);
-        assert_eq!(evs.datagrams[0].1, b"hello client");
+        let events = cli_log.borrow();
+        assert_eq!(events.datagrams.len(), 1);
+        assert!(events.datagrams[0].0 == cli_h);
+        assert_eq!(events.datagrams[0].1, b"hello client");
     }
 
-    let stream_id = {
-        let mut conn = client
-            .protocol()
-            .conn_mut(client_handle)
-            .expect("client conn");
-        let stream_id = conn.streams().open_bidi().unwrap();
-        conn.streams().send(stream_id, b"hello stream").unwrap();
-        conn.streams().finish(stream_id).unwrap();
-        stream_id
-    };
-    let stream_now = Instant::now();
-    client.protocol().flush(client_handle, stream_now);
-    assert!(relay_once(&mut client, &mut server, client_addr) > 0);
+    let at = Instant::now();
+    let stream = Pin::new(&mut client)
+        .observe(at, |mut turn| {
+            turn.protocol().with_conn(cli_h, |mut conn| {
+                let mut streams = conn.streams();
+                let mut send = streams.send();
+                let stream = send
+                    .open_bidi()
+                    .expect("established connection must retain a bidi stream slot");
+                send.send(stream.send(), b"hello stream")
+                    .expect("fixture stream credit must admit its payload");
+                send.finish(stream.send())
+                    .expect("fixture send stream must finish once");
+                stream.id()
+            })
+        })
+        .expect("established client handle must expose its connection");
+    assert!(Capture::relay(&mut client, &mut server, CLIENT, at).expect("fixture relay") > 0);
+    let visible = Pin::new(&mut server)
+        .observe(at, |mut turn| {
+            turn.protocol().with_conn(srv_h, |mut conn| {
+                conn.streams().view().resolve_recv(stream).is_ok()
+            })
+        })
+        .expect("established server handle must expose its connection");
+    assert!(visible);
     {
-        let evs = server_events.borrow();
+        let events = srv_log.borrow();
         assert!(
-            evs.streams
-                .contains(&(server_handle, Event::Readable { stream_id })),
-            "streams={:?} expected handle={:?} stream_id={}",
-            evs.streams,
-            server_handle,
-            stream_id
+            events
+                .streams
+                .contains(&(srv_h, Event::Readable { id: stream })),
+            "the server handle must expose the readable stream",
         );
         assert_eq!(
-            evs.streams
+            events
+                .streams
                 .iter()
                 .filter(|(handle, event)| {
-                    *handle == server_handle && *event == Event::Readable { stream_id }
+                    *handle == srv_h && *event == Event::Readable { id: stream }
                 })
                 .count(),
             1,
         );
     }
 
-    client.protocol().close(client_handle);
-    assert_eq!(client_events.borrow().closed, vec![client_handle]);
-}
-
-#[test]
-fn accept_flood_is_bounded_by_max_conns() {
-    use dope_quic::frame::Frame;
-    use dope_quic::packet::{InitialHeader, QUIC_V1};
-    use dope_quic::packet_protection::PacketProtection;
-    use dope_quic::qkdf::{InitialSecrets, PacketKeys};
-    use dope_quic::varint::VarInt;
-
-    let signing = support::signing_key(0x39);
-    let user_tp = transport_params::Params {
-        max_idle_timeout_ms: 30_000,
-        initial_max_data: 1 << 20,
-        ..transport_params::Params::default()
-    };
-    let mut server =
-        dope_quic::mux::setup::Server::accept(CapturingHandler::default(), signing, user_tp.into())
-            .unwrap();
-    assert!(server.configuration().set_max_connections(4));
-
-    let now = Instant::now();
-    for i in 0u32..16 {
-        let dcid = [0xAA, 0xBB, 0xCC, 0xDD, (i >> 8) as u8, i as u8, 0x01, 0x02];
-        let scid = [0x10, 0x20, (i >> 8) as u8, i as u8];
-        let secrets = InitialSecrets::from_dcid(&dcid).unwrap();
-        let keys = PacketKeys::aes_128(&secrets.client).unwrap();
-        let prot = PacketProtection::aes_128(&keys).unwrap();
-        let mut frames = Vec::new();
-        Frame::Crypto {
-            offset: VarInt::ZERO,
-            data: vec![0u8; 16],
-        }
-        .encode(&mut frames)
-        .unwrap();
-        let pn_len = 4u8;
-        let mut payload = frames;
-        if payload.len() < 1162 {
-            payload.resize(1162, 0);
-        }
-        let h = InitialHeader {
-            version: QUIC_V1,
-            dcid: dcid.to_vec(),
-            scid: scid.to_vec(),
-            token: vec![],
-            packet_number: 0,
-            pn_len,
-        };
-        let (hdr, pn_off) = h.encode_with_pn(payload.len() + 16).unwrap();
-        let mut wire = prot
-            .encrypt_long(&hdr, &payload, 0, pn_off, pn_len as usize)
-            .unwrap();
-        let from: SocketAddr = format!("10.0.0.{}:5000", (i % 250) + 1).parse().unwrap();
-        let _ = server.protocol().recv(from, &mut wire, now);
+    let closed = Pin::new(&mut client).observe(at, |mut turn| turn.protocol().try_close(cli_h));
+    closed.expect("active client connection closes");
+    assert!(cli_log.borrow().closed == vec![cli_h]);
+    assert_eq!(cli_log.borrow().certificates, 0);
+    assert_eq!(srv_log.borrow().certificates, 0);
+    for events in [&cli_log, &srv_log] {
+        assert!(
+            events
+                .borrow()
+                .owners
+                .iter()
+                .all(|(owner, handle)| owner == handle)
+        );
     }
-
-    assert_eq!(server.active_conns(), 4, "accept-flood capped at max_conns");
 }
 
 #[test]
-fn client_egress_stops_at_fixed_capacity_without_dropping_conn_work() {
-    let handler = CapturingHandler::default();
-    let mut client = dope_quic::mux::setup::Client::new(handler)
-        .outgoing_capacity(2)
+fn deferred_reset() {
+    let (signing, key) = peer::raw(0x3a).expect("raw identity");
+    let params = param::Set::builder()
+        .idle_ms(30_000)
+        .initial_data(1 << 20)
+        .local_bidi(1 << 20)
+        .remote_bidi(1 << 20)
+        .bidi_count(2)
+        .try_build()
+        .expect("fixture transport parameters");
+
+    let defer = Defer::default();
+    let state = Rc::clone(&defer.state);
+    let mut server = Capture::server(
+        defer,
+        signing.server().expect("server TLS"),
+        Options::try_from(params.clone())
+            .expect("fixture configuration must satisfy its declared bounds"),
+        Plan::standard(),
+    )
+    .expect("fixture server");
+    let mut client = Builder::client(Capture::default())
         .build()
-        .unwrap();
-    let addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
-    let handles = (0..4)
-        .map(|index| {
-            client
-                .protocol()
-                .connect(
-                    addr,
-                    [7; 32],
-                    dope_quic::conn::config::Options::default(),
-                    vec![index as u8; 8],
-                    Instant::now(),
-                )
-                .unwrap()
+        .expect("default client router resources must be valid");
+    let now = Instant::now();
+    let cli_h = Capture::connect(
+        &mut client,
+        SERVER,
+        key,
+        Options::try_from(params).expect("fixture configuration must satisfy its declared bounds"),
+        CID.to_vec(),
+        now,
+    )
+    .expect("fixture connect");
+
+    Capture::relay(&mut client, &mut server, CLIENT, now).expect("fixture relay");
+    Capture::relay(&mut server, &mut client, SERVER, now).expect("fixture relay");
+    Capture::relay(&mut client, &mut server, CLIENT, now).expect("fixture relay");
+    let ready = state.established.take();
+    let srv_h = ready[0];
+    state.established.set(ready);
+
+    let at = Instant::now() + Duration::from_secs(1);
+    let stream = Pin::new(&mut client)
+        .observe(at, |mut turn| {
+            turn.protocol().with_conn(cli_h, |mut conn| {
+                let mut streams = conn.streams();
+                let mut send = streams.send();
+                let stream = send
+                    .open_bidi()
+                    .expect("established connection must retain a bidi stream slot");
+                let id = stream.id();
+                send.send(stream.send(), b"leased")
+                    .expect("fixture stream credit must admit its payload");
+                id
+            })
+        })
+        .expect("established client handle must expose its connection");
+    Capture::drive(&mut client, at).expect("fixture drive");
+    assert!(Capture::relay(&mut client, &mut server, CLIENT, at).expect("fixture relay") > 0);
+    let history = state.attempts.take();
+    let key = history
+        .iter()
+        .copied()
+        .find(|(handle, event, _)| *handle == srv_h && *event == Event::Readable { id: stream })
+        .and_then(|entry| entry.2)
+        .expect("first STREAM flight must own a resident identity");
+    state.attempts.set(history);
+
+    let reset_at = at + Duration::from_millis(1);
+    Pin::new(&mut client)
+        .observe(reset_at, |mut turn| {
+            turn.protocol().with_conn(cli_h, |mut conn| {
+                let mut streams = conn.streams();
+                let stream = streams
+                    .view()
+                    .resolve_send(stream)
+                    .expect("live stream ID must resolve to send state");
+                streams
+                    .send()
+                    .reset(stream, Code::from_u8(0x5a))
+                    .expect("live send stream must reset once");
+            })
+        })
+        .expect("established client handle must expose its connection");
+    Capture::drive(&mut client, reset_at).expect("fixture drive");
+    assert!(Capture::relay(&mut client, &mut server, CLIENT, reset_at).expect("fixture relay") > 0);
+    Capture::drive(&mut server, reset_at).expect("fixture drive");
+
+    let history = state.attempts.take();
+    let attempts = history
+        .iter()
+        .copied()
+        .filter(|(handle, event, _)| {
+            *handle == srv_h
+                && *event
+                    == (Event::Reset {
+                        id: stream,
+                        error_code: Code::from_u8(0x5a),
+                    })
         })
         .collect::<Vec<_>>();
-    client.output().drive_bounded(Instant::now());
-    assert_eq!(client.output().capacity(), 2);
-    assert_eq!(client.output().len(), 2);
-    let mut sent = client.output().drain().count();
-    for handle in handles {
-        client.protocol().flush(handle, Instant::now());
-        assert!(client.output().len() <= client.output().capacity());
-        sent += client.output().drain().count();
-    }
-    assert!(sent >= 4);
-}
-
-#[test]
-fn client_egress_byte_budget_uses_encoded_packet_sizes() {
-    let addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
-    let mut tight = dope_quic::mux::setup::Client::new(CapturingHandler::default())
-        .outgoing_limits(4, 4 * 1200)
-        .build()
-        .unwrap();
-    for index in 0..4 {
-        tight
-            .protocol()
-            .connect(
-                addr,
-                [7; 32],
-                dope_quic::conn::config::Options::default(),
-                vec![index; 8],
-                Instant::now(),
-            )
-            .unwrap();
-    }
-    tight.output().drive_bounded(Instant::now());
-    assert_eq!(tight.output().len(), 4);
-    assert_eq!(tight.output().bytes(), 4 * 1200);
-
-    let mut defaults = dope_quic::mux::setup::Client::new(CapturingHandler::default())
-        .build()
-        .unwrap();
-    for index in 0..300u16 {
-        defaults
-            .protocol()
-            .connect(
-                addr,
-                [7; 32],
-                dope_quic::conn::config::Options::default(),
-                index.to_be_bytes().repeat(4),
-                Instant::now(),
-            )
-            .unwrap();
-    }
-    while defaults.output().drive_bounded(Instant::now()) != 0 {}
-    assert_eq!(defaults.output().capacity(), 4096);
-    assert_eq!(defaults.output().len(), 300);
-    assert_eq!(defaults.output().bytes(), 300 * 1200);
-}
-
-#[test]
-fn packet_larger_than_total_byte_capacity_is_rejected() {
-    let handler = CapturingHandler::default();
-    let events = handler.events.clone();
-    let mut client = dope_quic::mux::setup::Client::new(handler)
-        .outgoing_limits(4, 1199)
-        .build()
-        .unwrap();
-    let error = client.protocol().connect(
-        "10.0.0.2:443".parse().unwrap(),
-        [7; 32],
-        dope_quic::conn::config::Options::default(),
-        CID.to_vec(),
-        Instant::now(),
+    assert_eq!(attempts.len(), 2, "one defer followed by one acceptance");
+    assert!(attempts[0].2 == Some(key));
+    assert!(attempts[0].2 == attempts[1].2);
+    assert!(!state.certificates.get());
+    assert_eq!(client.handler().events.borrow().certificates, 0);
+    assert!(
+        client
+            .handler()
+            .events
+            .borrow()
+            .owners
+            .iter()
+            .all(|(owner, handle)| owner == handle)
     );
-    assert_eq!(error, Err(dope_quic::ConnectError::InvalidConfig));
-    assert_eq!(client.output().len(), 0);
-    assert_eq!(client.output().bytes(), 0);
-    assert_eq!(client.active_conns(), 0);
-    assert!(events.borrow().closed.is_empty());
-}
-
-#[test]
-fn thirteen_hundred_byte_cap_round_robins_two_connections() {
-    let mut client = dope_quic::mux::setup::Client::new(CapturingHandler::default())
-        .outgoing_limits(2, 1300)
-        .build()
-        .unwrap();
-    let addr = "10.0.0.2:443".parse().unwrap();
-    client
-        .protocol()
-        .connect(
-            addr,
-            [7; 32],
-            dope_quic::conn::config::Options::default(),
-            vec![1; 8],
-            Instant::now(),
-        )
-        .unwrap();
-    client
-        .protocol()
-        .connect(
-            addr,
-            [7; 32],
-            dope_quic::conn::config::Options::default(),
-            vec![2; 8],
-            Instant::now(),
-        )
-        .unwrap();
-    client.output().drive_bounded(Instant::now());
-    assert_eq!(client.active_conns(), 2);
-    assert_eq!(client.output().len(), 1);
-    assert_eq!(client.output().bytes(), 1200);
-    let packets = client.output().drain().collect::<Vec<_>>();
-    assert_eq!(packets.len(), 2);
-    assert!(packets.iter().all(|packet| packet.payload().len() == 1200));
-    assert_eq!(client.output().len(), 0);
-    assert_eq!(client.output().bytes(), 0);
-    assert_eq!(client.active_conns(), 2);
-}
-
-#[test]
-fn client_connection_capacity_is_fallible() {
-    let mut client = dope_quic::mux::setup::Client::new(CapturingHandler::default())
-        .limits(1, 8, 16 << 10)
-        .build()
-        .unwrap();
-    let addr = "10.0.0.2:443".parse().unwrap();
-    client
-        .protocol()
-        .connect(
-            addr,
-            [7; 32],
-            dope_quic::conn::config::Options::default(),
-            vec![1; 8],
-            Instant::now(),
-        )
-        .unwrap();
-    let second = client.protocol().connect(
-        addr,
-        [7; 32],
-        dope_quic::conn::config::Options::default(),
-        vec![2; 8],
-        Instant::now(),
-    );
-    assert_eq!(second, Err(dope_quic::ConnectError::Capacity));
-}
-
-#[test]
-fn reap_shares_global_packet_budget_between_connections() {
-    let signing = support::signing_key(9);
-    let server_pubkey = *signing.pubkey().unwrap();
-    let params = transport_params::Params {
-        max_idle_timeout_ms: 30_000,
-        initial_max_data: 1 << 20,
-        initial_max_stream_data_uni: 1 << 20,
-        initial_max_streams_uni: 4,
-        ..transport_params::Params::default()
-    };
-    let server_handler = CapturingHandler::default();
-    let server_events = server_handler.events.clone();
-    let mut server = dope_quic::mux::setup::Server::with_outgoing_capacity(
-        server_handler,
-        signing,
-        params.clone().into(),
-        10,
-    )
-    .unwrap();
-    let first_handler = CapturingHandler::default();
-    let first_events = first_handler.events.clone();
-    let second_handler = CapturingHandler::default();
-    let second_events = second_handler.events.clone();
-    let mut first = dope_quic::mux::setup::Client::new(first_handler)
-        .build()
-        .unwrap();
-    let mut second = dope_quic::mux::setup::Client::new(second_handler)
-        .build()
-        .unwrap();
-    let server_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
-    let first_addr: SocketAddr = "10.0.0.1:50001".parse().unwrap();
-    let second_addr: SocketAddr = "10.0.0.1:50002".parse().unwrap();
-    let mut now = Instant::now();
-    first
-        .protocol()
-        .connect(
-            server_addr,
-            server_pubkey,
-            params.clone().into(),
-            vec![1; 8],
-            now,
-        )
-        .unwrap();
-    second
-        .protocol()
-        .connect(server_addr, server_pubkey, params.into(), vec![2; 8], now)
-        .unwrap();
-    for _ in 0..12 {
-        for mut outgoing in first.output().drain().collect::<Vec<_>>() {
-            server
-                .protocol()
-                .recv(first_addr, outgoing.payload_mut(), now)
-                .unwrap();
-        }
-        for mut outgoing in second.output().drain().collect::<Vec<_>>() {
-            server
-                .protocol()
-                .recv(second_addr, outgoing.payload_mut(), now)
-                .unwrap();
-        }
-        for mut outgoing in server.output().drain().collect::<Vec<_>>() {
-            if outgoing.addr() == first_addr {
-                first
-                    .protocol()
-                    .recv(server_addr, outgoing.payload_mut(), now)
-                    .unwrap();
-            } else {
-                second
-                    .protocol()
-                    .recv(server_addr, outgoing.payload_mut(), now)
-                    .unwrap();
-            }
-        }
-        now += Duration::from_millis(10);
-        if server_events.borrow().established.len() == 2
-            && first_events.borrow().established.len() == 1
-            && second_events.borrow().established.len() == 1
-        {
-            break;
-        }
-    }
-    let handles = server_events.borrow().established.clone();
-    assert_eq!(handles.len(), 2);
-    for handle in handles {
-        let mut conn = server.protocol().conn_mut(handle).unwrap();
-        let stream = conn.streams().open_uni().unwrap();
-        conn.streams().send(stream, &[7; 128 * 1024]).unwrap();
-        conn.streams().finish(stream).unwrap();
-    }
-    now += Duration::from_millis(100);
-    server.output().drive_bounded(now);
-    let destinations = server
-        .output()
-        .drain()
-        .map(|outgoing| outgoing.addr())
-        .collect::<Vec<_>>();
-    assert!(destinations.len() >= 2);
-    assert!(destinations.contains(&first_addr));
-    assert!(destinations.contains(&second_addr));
-    let first_run = destinations
-        .iter()
-        .take_while(|&&addr| addr == destinations[0])
-        .count();
-    assert!(first_run < destinations.len());
 }

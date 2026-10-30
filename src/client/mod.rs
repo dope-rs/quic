@@ -1,28 +1,33 @@
-mod sealed;
+use std::{mem, net, num, time};
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::time::{Duration, Instant};
+pub use bridge::Bridge;
+pub use dialer::Dialer;
+use dope::core::driver::schedule::clock;
+use o3::{base::num::bounded, mem::rc};
 
-use dope::core::driver::Context;
-use o3::collections::{heap::Min, queue::slot::Fifo};
-use pin_project::pin_project;
-use ring::rand::{SecureRandom, SystemRandom};
+use crate::{
+    conn::life::{options, tls::clients},
+    runtime::brand,
+};
 
-use crate::TrySendError;
-use crate::conn::session::Connection;
-use crate::conn::{self, Handle};
-use crate::endpoint::{self, PooledEndpoint};
-use crate::mux::Handler;
-use crate::packet::ConnectionId;
-use std::io::Error;
-use std::io::ErrorKind;
+pub mod auth;
+mod bridge;
+pub mod build;
+pub mod control;
+mod dialer;
+mod life;
+pub mod protocol;
+mod raw;
 
+/// Stable identity of one configured remote endpoint.
+///
+/// The value may cross asynchronous boundaries. Scoped auth may not.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[repr(transparent)]
 pub struct SlotId(u32);
 
 impl SlotId {
+    /// Identifies the endpoint at `index` in the construction-order table.
     pub fn from_index(index: u32) -> Self {
         Self(index)
     }
@@ -32,620 +37,340 @@ impl SlotId {
     }
 }
 
-pub trait BackoffPolicy: 'static {
-    fn next_retry_at(&self, attempt: u32, now: Instant) -> Instant;
-}
+/// Generative auth for one exact client attempt.
+/// Packed [`AttemptId`] distinguishes reconnects; the zero-sized brand is lexical.
+/// Its private constructor prevents forging auth from a copyable identity.
+#[repr(transparent)]
+pub struct SlotScope<'scope>(brand::Branded<'scope, AttemptId>);
 
-pub trait Protocol: 'static {
-    fn connect(&mut self, slot: SlotId);
-    fn datagram(&mut self, slot: SlotId, data: Vec<u8>);
-    fn close(&mut self, slot: SlotId);
-}
+impl<'scope> SlotScope<'scope> {
+    pub(in crate::client) fn new(brand: brand::Token<'scope>, attempt: AttemptId) -> Self {
+        Self(brand::Branded::new(brand, attempt))
+    }
 
-pub trait ConfigProvider: 'static {
-    fn config(&mut self, slot: SlotId) -> Option<conn::config::Options>;
-}
+    pub fn id(&self) -> SlotId {
+        self.attempt_id().slot()
+    }
 
-pub struct StaticConfig(conn::config::Options);
+    pub fn attempt_id(&self) -> AttemptId {
+        *self.0.value()
+    }
 
-impl ConfigProvider for StaticConfig {
-    fn config(&mut self, _slot: SlotId) -> Option<conn::config::Options> {
-        self.0.duplicate_connection().ok()
+    pub fn generation(&self) -> u32 {
+        self.attempt_id().generation()
     }
 }
 
-#[derive(Clone)]
-pub struct EndpointSpec {
-    pub addr: SocketAddr,
-    pub pubkey: [u8; 32],
+/// Generation-checked identity of one attempt at a configured remote.
+/// Its generation never resets, so stale identities cannot alias later attempts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[repr(C)]
+pub struct AttemptId {
+    slot: SlotId,
+    generation: num::NonZero<u32>,
+}
+
+impl AttemptId {
+    pub fn slot(self) -> SlotId {
+        self.slot
+    }
+
+    pub fn generation(self) -> u32 {
+        self.generation.get()
+    }
 }
 
 #[derive(Clone, Copy)]
-/// One remote endpoint backed by externally owned, exactly reserved TLS state.
-pub struct PooledEndpointSpec<'tls> {
-    pub addr: SocketAddr,
-    pub pool: &'tls conn::tls::ClientPool,
+#[repr(C)]
+struct Start<'d> {
+    id: AttemptId,
+    ordinal: num::NonZero<u32>,
+    started_at: clock::Moment<'d>,
 }
 
-mod authority {
-    pub trait Sealed {}
-}
+/// Exact connection-attempt context issued from one resident attempt state.
+/// The generative proof is lexical; [`AttemptId`] is the stable value that
+/// preserves causal identity across asynchronous proto boundaries.
+#[repr(transparent)]
+pub struct AttemptScope<'scope, 'd>(brand::Branded<'scope, Start<'d>>);
 
-#[doc(hidden)]
-pub trait EndpointAuthority<'tls>: Copy + authority::Sealed {
-    fn connect<'d, const ID: u8, H: Handler<ID>>(
-        self,
-        endpoint: Pin<&mut PooledEndpoint<'d, 'tls, ID, H>>,
-        addr: SocketAddr,
-        config: conn::config::Options,
-        dcid: ConnectionId,
-    ) -> Result<Handle, crate::ConnectError>;
-}
+impl<'scope, 'd> AttemptScope<'scope, 'd> {
+    pub fn id(&self) -> AttemptId {
+        self.0.value().id
+    }
 
-impl authority::Sealed for [u8; 32] {}
+    pub fn slot(&self) -> SlotId {
+        self.id().slot()
+    }
 
-impl<'tls> EndpointAuthority<'tls> for [u8; 32] {
-    #[inline]
-    fn connect<'d, const ID: u8, H: Handler<ID>>(
-        self,
-        endpoint: Pin<&mut PooledEndpoint<'d, 'tls, ID, H>>,
-        addr: SocketAddr,
-        config: conn::config::Options,
-        dcid: ConnectionId,
-    ) -> Result<Handle, crate::ConnectError> {
-        endpoint.connect_with_config_id(addr, self, config, dcid)
+    pub fn attempt(&self) -> u32 {
+        self.0.value().ordinal.get()
+    }
+
+    pub fn started_at(&self) -> clock::Moment<'d> {
+        self.0.value().started_at
     }
 }
 
-impl authority::Sealed for &conn::tls::ClientPool {}
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum RetryCause {
+    AttemptFailed,
+    ConnectionClosed,
+}
 
-impl<'tls> EndpointAuthority<'tls> for &'tls conn::tls::ClientPool {
-    #[inline]
-    fn connect<'d, const ID: u8, H: Handler<ID>>(
-        self,
-        endpoint: Pin<&mut PooledEndpoint<'d, 'tls, ID, H>>,
-        addr: SocketAddr,
-        config: conn::config::Options,
-        dcid: ConnectionId,
-    ) -> Result<Handle, crate::ConnectError> {
-        endpoint.connect_pooled_with_config_id(addr, self, config, dcid)
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Retry {
+    slot: SlotId,
+    prior: bounded::NonZeroU32<1, { u32::MAX - 1 }>,
+    previous_ordinal: num::NonZero<u32>,
+    next_ordinal: num::NonZero<u32>,
+    observed_at: time::Instant,
+}
+
+/// Causal edge from one completed attempt or connection to its exact next
+/// scheduled attempt. Backoff observes the proto event time, not a later
+/// client notification-drain time.
+#[repr(transparent)]
+pub struct RetryScope<'scope>(brand::Branded<'scope, Retry>);
+
+impl<'scope> RetryScope<'scope> {
+    pub fn previous_id(&self) -> AttemptId {
+        let retry = self.0.value();
+        AttemptId {
+            slot: retry.slot,
+            generation: retry.prior.nonzero(),
+        }
+    }
+
+    pub fn previous(&self) -> u32 {
+        self.0.value().previous_ordinal.get()
+    }
+
+    pub fn next_id(&self) -> AttemptId {
+        let retry = self.0.value();
+        AttemptId {
+            slot: retry.slot,
+            generation: num::NonZero::<u32>::MIN.saturating_add(retry.prior.get()),
+        }
+    }
+
+    pub fn next_attempt(&self) -> u32 {
+        self.0.value().next_ordinal.get()
+    }
+
+    pub fn cause(&self) -> RetryCause {
+        if self.next_attempt() == 1 {
+            RetryCause::ConnectionClosed
+        } else {
+            RetryCause::AttemptFailed
+        }
+    }
+
+    pub fn failures(&self) -> u32 {
+        match self.cause() {
+            RetryCause::AttemptFailed => self.previous(),
+            RetryCause::ConnectionClosed => 1,
+        }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+/// Packed resident attempt generation and retry ordinal. Both retain their
+/// complete `u32` domains without adding another allocation or side table.
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[repr(C, align(8))]
+pub(in crate::client) struct AttemptState {
+    generation: num::NonZero<u32>,
+    ordinal: num::NonZero<u32>,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::client) struct Successor {
+    next: AttemptState,
+    prior: bounded::NonZeroU32<1, { u32::MAX - 1 }>,
+    ordinal: num::NonZero<u32>,
+}
+
+impl Successor {
+    pub(in crate::client) const fn state(self) -> AttemptState {
+        self.next
+    }
+
+    pub(in crate::client) fn retry_scope<'scope>(
+        self,
+        brand: brand::Token<'scope>,
+        slot: SlotId,
+        seen: time::Instant,
+    ) -> RetryScope<'scope> {
+        RetryScope(brand::Branded::new(
+            brand,
+            Retry {
+                slot,
+                prior: self.prior,
+                previous_ordinal: self.ordinal,
+                next_ordinal: self.next.ordinal_raw(),
+                observed_at: seen,
+            },
+        ))
+    }
+}
+
+impl AttemptState {
+    pub(in crate::client) fn initial() -> Self {
+        Self::from_parts(num::NonZero::<u32>::MIN, num::NonZero::<u32>::MIN)
+    }
+
+    fn from_parts(epoch: num::NonZero<u32>, ordinal: num::NonZero<u32>) -> Self {
+        Self {
+            generation: epoch,
+            ordinal,
+        }
+    }
+
+    fn generation(self) -> num::NonZero<u32> {
+        self.generation
+    }
+
+    fn ordinal_raw(self) -> num::NonZero<u32> {
+        self.ordinal
+    }
+
+    pub(in crate::client) fn id(self, slot: SlotId) -> AttemptId {
+        AttemptId {
+            slot,
+            generation: self.generation(),
+        }
+    }
+
+    pub(in crate::client) fn successor(self, restart: bool) -> Option<Successor> {
+        let prior = bounded::NonZeroU32::new(self.generation().get())?;
+        let epoch = num::NonZero::<u32>::MIN.saturating_add(prior.get());
+        let ordinal = if restart {
+            num::NonZero::<u32>::MIN
+        } else {
+            self.ordinal_raw().checked_add(1)?
+        };
+        Some(Successor {
+            next: Self::from_parts(epoch, ordinal),
+            prior,
+            ordinal: self.ordinal_raw(),
+        })
+    }
+
+    pub(in crate::client) fn scope<'scope, 'd>(
+        self,
+        brand: brand::Token<'scope>,
+        slot: SlotId,
+        started: clock::Moment<'d>,
+    ) -> AttemptScope<'scope, 'd> {
+        AttemptScope(brand::Branded::new(
+            brand,
+            Start {
+                id: self.id(slot),
+                ordinal: self.ordinal_raw(),
+                started_at: started,
+            },
+        ))
+    }
+}
+
+/// Retry delay policy owned by a [`Dialer`]; concrete types may borrow lexical state.
+///
+/// The policy lifetime remains part of the dialer and cannot be widened away:
+pub trait Backoff {
+    /// Selects only the relative delay. The lifecycle that owns the causal
+    /// observation is the sole auth allowed to mint an absolute retry
+    /// deadline.
+    fn retry_after<'scope>(&'scope self, retry: RetryScope<'scope>) -> time::Duration;
+}
+
+/// Per-attempt configuration source owned directly by a [`Dialer`].
+///
+/// The provider may borrow lexical owner state. Returned options remain owned
+/// so no provider borrow or callback proof can cross the connection boundary.
+pub trait ConfigSource {
+    fn config<'scope, 'd>(
+        &'scope mut self,
+        attempt: AttemptScope<'scope, 'd>,
+    ) -> Option<options::Options>;
+}
+
+pub struct StaticConfig(options::Options);
+
+impl ConfigSource for StaticConfig {
+    fn config<'scope, 'd>(
+        &'scope mut self,
+        _: AttemptScope<'scope, 'd>,
+    ) -> Option<options::Options> {
+        Some(self.0.copy())
+    }
+}
+
+pub struct EndpointSpec {
+    pub addr: net::SocketAddr,
+    pub authority: clients::Authority,
+}
+
+impl EndpointSpec {
+    pub fn try_clone(&self) -> Result<Self, rc::Error> {
+        Ok(Self {
+            addr: self.addr,
+            authority: self.authority.try_clone()?,
+        })
+    }
+}
+
+/// One remote endpoint using borrowed TLS auth and handshake admission.
+#[derive(Clone, Copy)]
+pub struct PooledSpec<'tls> {
+    pub addr: net::SocketAddr,
+    pub pool: &'tls clients::Pool,
+}
+
+#[derive(Clone, Copy)]
 pub struct Config {
-    pub endpoint: endpoint::Config,
     pub event_budget: usize,
     pub retry_budget: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct PathStats {
-    pub srtt: Option<Duration>,
-    pub min_rtt: Option<Duration>,
+    pub srtt: Option<time::Duration>,
+    pub min_rtt: Option<time::Duration>,
     pub cwnd: u64,
     pub bytes_in_flight: u64,
 }
 
-struct EndpointSlot<A> {
-    addr: SocketAddr,
-    authority: A,
-    handle: Option<Handle>,
-    attempt: u32,
-}
-
-#[derive(Clone, Copy)]
-struct Binding {
-    handle: Handle,
-    slot: SlotId,
-}
-
-struct Bridge<P: Protocol> {
-    protocol: P,
-    handle_to_slot: Box<[Option<Binding>]>,
-    pending_close: Fifo<Binding>,
-    pending_established: Fifo<Binding>,
-}
-
-impl<P: Protocol> Bridge<P> {
-    fn lookup_slot(&self, handle: Handle) -> Option<SlotId> {
-        self.handle_to_slot
-            .get(handle.index() as usize)
-            .copied()
-            .flatten()
-            .filter(|binding| binding.handle == handle)
-            .map(|binding| binding.slot)
-    }
-
-    fn bind(&mut self, handle: Handle, slot: SlotId) -> bool {
-        let Some(binding) = self.handle_to_slot.get_mut(handle.index() as usize) else {
-            return false;
-        };
-        if binding.is_some() {
-            return false;
-        }
-        *binding = Some(Binding { handle, slot });
-        true
-    }
-
-    fn unbind(&mut self, handle: Handle) -> Option<SlotId> {
-        let binding = self.handle_to_slot.get_mut(handle.index() as usize)?;
-        if !binding.is_some_and(|binding| binding.handle == handle) {
-            return None;
-        }
-        binding.take().map(|binding| binding.slot)
-    }
-}
-
-impl<const DOMAIN: u8, P: Protocol> Handler<DOMAIN> for Bridge<P> {
-    type Connection = ();
-
-    fn create_connection(&mut self, _conn: &mut Connection<DOMAIN>, _handle: Handle) {}
-
-    fn established(
-        &mut self,
-        _connection: &mut (),
-        _conn: &mut Connection<DOMAIN>,
-        handle: Handle,
-    ) {
-        if let Some(slot) = self.lookup_slot(handle) {
-            let binding = Binding { handle, slot };
-            if let Some(entry) = self.pending_established.vacant_entry(slot.index() as usize) {
-                entry.push_back(binding);
-            }
-        }
-    }
-
-    fn datagram(
-        &mut self,
-        _connection: &mut (),
-        _conn: &mut Connection<DOMAIN>,
-        handle: Handle,
-        data: Vec<u8>,
-    ) {
-        if let Some(slot) = self.lookup_slot(handle) {
-            self.protocol.datagram(slot, data);
-        }
-    }
-
-    fn close(&mut self, _connection: (), handle: Handle) {
-        if let Some(slot) = self.unbind(handle) {
-            self.protocol.close(slot);
-            let binding = Binding { handle, slot };
-            if let Some(entry) = self.pending_close.vacant_entry(slot.index() as usize) {
-                entry.push_back(binding);
-            }
-        }
-    }
-}
-
-#[pin_project]
-pub struct ClientInner<
-    'd,
-    'tls,
-    const ID: u8,
-    P: Protocol,
-    B: BackoffPolicy,
-    A: EndpointAuthority<'tls>,
-    C: ConfigProvider = StaticConfig,
-> {
-    #[pin]
-    inner: PooledEndpoint<'d, 'tls, ID, Bridge<P>>,
-    endpoints: Vec<EndpointSlot<A>>,
-    retries: Min<Instant>,
-    backoff: B,
-    config_provider: C,
-    event_budget: usize,
-    retry_budget: usize,
-    dcid_seed: u64,
-}
-
-pub type Client<'d, const ID: u8, P, B, C = StaticConfig> =
-    ClientInner<'d, 'static, ID, P, B, [u8; 32], C>;
-
-/// High-level client whose active TLS handshakes cannot outlive their pools.
-///
-/// ```compile_fail
-/// use dope_quic::client::{BackoffPolicy, ConfigProvider, PooledClient, Protocol};
-///
-/// fn erase_pool_lifetime<'d, 'tls, const ID: u8, P, B, C>(
-///     client: PooledClient<'d, 'tls, ID, P, B, C>,
-/// ) -> PooledClient<'d, 'static, ID, P, B, C>
-/// where
-///     P: Protocol,
-///     B: BackoffPolicy,
-///     C: ConfigProvider,
-/// {
-///     client
-/// }
-/// ```
-pub type PooledClient<'d, 'tls, const ID: u8, P, B, C = StaticConfig> =
-    ClientInner<'d, 'tls, ID, P, B, &'tls conn::tls::ClientPool, C>;
-
-/// Lifecycle-preserving client operations for one application step.
-pub struct ControlInner<'step, 'd, 'tls, const ID: u8, P, B, A, C = StaticConfig>
-where
-    'd: 'step,
-    P: Protocol,
-    B: BackoffPolicy,
-    A: EndpointAuthority<'tls>,
-    C: ConfigProvider,
-{
-    inner: Pin<&'step mut ClientInner<'d, 'tls, ID, P, B, A, C>>,
-}
-
-pub type Control<'step, 'd, const ID: u8, P, B, C = StaticConfig> =
-    ControlInner<'step, 'd, 'static, ID, P, B, [u8; 32], C>;
-
-pub type PooledControl<'step, 'd, 'tls, const ID: u8, P, B, C = StaticConfig> =
-    ControlInner<'step, 'd, 'tls, ID, P, B, &'tls conn::tls::ClientPool, C>;
-
-impl<'step, 'd, 'tls, const ID: u8, P, B, A, C> ControlInner<'step, 'd, 'tls, ID, P, B, A, C>
-where
-    'd: 'step,
-    P: Protocol,
-    B: BackoffPolicy,
-    A: EndpointAuthority<'tls>,
-    C: ConfigProvider,
-{
-    pub fn protocol(&self) -> &P {
-        self.inner.as_ref().get_ref().protocol()
-    }
-
-    pub fn protocol_control(&mut self) -> <P as ControlProtocol>::Control<'_>
-    where
-        P: ControlProtocol,
-    {
-        let protocol = self.inner.as_mut().protocol_mut();
-        // SAFETY: this is the exact protocol installed beneath the client and
-        // the returned control cannot outlive this exclusive step borrow.
-        unsafe { P::control(protocol) }
-    }
-
-    pub fn smoothed_rtt(&self, slot: SlotId) -> Option<Duration> {
-        self.inner.as_ref().get_ref().smoothed_rtt(slot)
-    }
-
-    pub fn path_stats(&self, slot: SlotId) -> Option<PathStats> {
-        self.inner.as_ref().get_ref().path_stats(slot)
-    }
-
-    pub fn try_send_datagram(
-        &mut self,
-        slot: SlotId,
-        data: Vec<u8>,
-    ) -> Result<(), TrySendError<Vec<u8>>> {
-        self.inner.as_mut().try_send_datagram(slot, data)
-    }
-}
-
-/// Restricted coordinate view supplied by a client protocol.
-///
-/// # Safety
-/// `Control` must not expose an operation that moves, replaces, or drops
-/// driver-branded retained storage owned by the protocol.
-pub unsafe trait ControlProtocol: Protocol {
-    type Control<'step>
-    where
-        Self: 'step;
-
-    /// # Safety
-    /// `protocol` must be the protocol installed beneath its live client and
-    /// no client lifecycle phase may overlap the returned control.
-    unsafe fn control<'step>(protocol: &'step mut Self) -> Self::Control<'step>;
-}
-
-impl<'d, const ID: u8, P: Protocol, B: BackoffPolicy>
-    ClientInner<'d, 'static, ID, P, B, [u8; 32], StaticConfig>
-{
-    pub fn build(
-        bind: SocketAddr,
-        endpoints: Vec<EndpointSpec>,
-        client_config: conn::config::Options,
-        protocol: P,
-        backoff: B,
-        config: Config,
-        driver: &mut Context<'_, 'd>,
-    ) -> io::Result<Self> {
-        client_config
-            .validate()
-            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
-        client_config
-            .duplicate_connection()
-            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
-        Self::build_with_config_provider(
-            bind,
-            endpoints,
-            StaticConfig(client_config),
-            protocol,
-            backoff,
-            config,
-            driver,
-        )
-    }
-}
-
-impl<'d, const ID: u8, P, B, C> ClientInner<'d, 'static, ID, P, B, [u8; 32], C>
-where
-    P: Protocol,
-    B: BackoffPolicy,
-    C: ConfigProvider,
-{
-    pub fn build_with_config_provider(
-        bind: SocketAddr,
-        endpoints: Vec<EndpointSpec>,
-        config_provider: C,
-        protocol: P,
-        backoff: B,
-        config: Config,
-        driver: &mut Context<'_, 'd>,
-    ) -> io::Result<Self> {
-        let endpoints = endpoints
-            .into_iter()
-            .map(|endpoint| EndpointSlot {
-                addr: endpoint.addr,
-                authority: endpoint.pubkey,
-                handle: None,
-                attempt: 0,
-            })
-            .collect();
-        Self::build_inner(
-            bind,
-            endpoints,
-            config_provider,
-            protocol,
-            backoff,
-            config,
-            driver,
-        )
-    }
-}
-
-impl<'d, 'tls, const ID: u8, P: Protocol, B: BackoffPolicy>
-    ClientInner<'d, 'tls, ID, P, B, &'tls conn::tls::ClientPool, StaticConfig>
-{
-    pub fn build_pooled(
-        bind: SocketAddr,
-        endpoints: Vec<PooledEndpointSpec<'tls>>,
-        client_config: conn::config::Options,
-        protocol: P,
-        backoff: B,
-        config: Config,
-        driver: &mut Context<'_, 'd>,
-    ) -> io::Result<Self> {
-        client_config
-            .validate_pooled_client()
-            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
-        client_config
-            .duplicate_connection()
-            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
-        Self::build_pooled_with_config_provider(
-            bind,
-            endpoints,
-            StaticConfig(client_config),
-            protocol,
-            backoff,
-            config,
-            driver,
-        )
-    }
-}
-
-impl<'d, 'tls, const ID: u8, P, B, C>
-    ClientInner<'d, 'tls, ID, P, B, &'tls conn::tls::ClientPool, C>
-where
-    P: Protocol,
-    B: BackoffPolicy,
-    C: ConfigProvider,
-{
-    pub fn build_pooled_with_config_provider(
-        bind: SocketAddr,
-        endpoints: Vec<PooledEndpointSpec<'tls>>,
-        config_provider: C,
-        protocol: P,
-        backoff: B,
-        config: Config,
-        driver: &mut Context<'_, 'd>,
-    ) -> io::Result<Self> {
-        let endpoints = endpoints
-            .into_iter()
-            .map(|endpoint| EndpointSlot {
-                addr: endpoint.addr,
-                authority: endpoint.pool,
-                handle: None,
-                attempt: 0,
-            })
-            .collect();
-        Self::build_inner(
-            bind,
-            endpoints,
-            config_provider,
-            protocol,
-            backoff,
-            config,
-            driver,
-        )
-    }
-}
-
-impl<'d, 'tls, const ID: u8, P, B, A, C> ClientInner<'d, 'tls, ID, P, B, A, C>
-where
-    P: Protocol,
-    B: BackoffPolicy,
-    A: EndpointAuthority<'tls>,
-    C: ConfigProvider,
-{
-    fn build_inner(
-        bind: SocketAddr,
-        endpoints: Vec<EndpointSlot<A>>,
-        config_provider: C,
-        protocol: P,
-        backoff: B,
-        config: Config,
-        driver: &mut Context<'_, 'd>,
-    ) -> io::Result<Self> {
-        let endpoint_config = config.endpoint.validate()?;
-        if config.event_budget == 0
-            || config.event_budget > crate::mux::MAX_OUTGOING_CAPACITY
-            || config.retry_budget == 0
-            || config.retry_budget > crate::mux::MAX_OUTGOING_CAPACITY
-        {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "invalid QUIC client work budget",
-            ));
-        }
-        let capacity = endpoints.len();
-        if endpoint_config.max_conns != capacity {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "QUIC endpoint capacity mismatch",
-            ));
-        }
-        let mut seed = [0; 8];
-        SystemRandom::new()
-            .fill(&mut seed)
-            .map_err(|_| Error::other("QUIC DCID entropy unavailable"))?;
-        let bridge = Bridge {
-            protocol,
-            handle_to_slot: vec![None; capacity].into_boxed_slice(),
-            pending_close: Fifo::with_capacity(capacity),
-            pending_established: Fifo::with_capacity(capacity),
-        };
-        let inner = PooledEndpoint::build_client_pooled(bind, bridge, endpoint_config, driver)?;
-        let now = Instant::now();
-        let mut retries = Min::with_capacity(capacity);
-        for index in 0..capacity {
-            retries
-                .insert(index, now)
-                .map_err(|_| Error::other("QUIC retry scheduler capacity mismatch"))?;
-        }
-        Ok(Self {
-            inner,
-            endpoints,
-            retries,
-            backoff,
-            config_provider,
-            event_budget: config.event_budget,
-            retry_budget: config.retry_budget,
-            dcid_seed: u64::from_ne_bytes(seed),
-        })
-    }
-
-    pub fn protocol(&self) -> &P {
-        &self.inner.handler().protocol
-    }
-
-    pub(crate) fn protocol_mut(self: Pin<&mut Self>) -> &mut P {
-        &mut self.project().inner.handler_mut().protocol
-    }
-
-    pub fn local_addr(&self) -> SocketAddr {
-        self.inner.local_addr()
-    }
-
-    pub fn endpoint_count(&self) -> usize {
-        self.endpoints.len()
-    }
-
-    pub fn is_connected(&self, slot: SlotId) -> bool {
-        self.endpoints
-            .get(slot.index() as usize)
-            .map(|ep| ep.handle.is_some())
-            .unwrap_or(false)
-    }
-
-    /// Smoothed RTT of the QUIC connection on `slot`, if connected.
-    pub fn smoothed_rtt(&self, slot: SlotId) -> Option<Duration> {
-        let handle = self.endpoints.get(slot.index() as usize)?.handle?;
-        self.inner.conn(handle)?.status().smoothed_rtt()
-    }
-
-    /// Current path statistics for the QUIC connection on `slot`, if connected.
-    pub fn path_stats(&self, slot: SlotId) -> Option<PathStats> {
-        let handle = self.endpoints.get(slot.index() as usize)?.handle?;
-        let conn = self.inner.conn(handle)?;
-        Some(PathStats {
-            srtt: conn.status().smoothed_rtt(),
-            min_rtt: conn.status().min_rtt(),
-            cwnd: conn.status().congestion_window(),
-            bytes_in_flight: conn.status().bytes_in_flight(),
-        })
-    }
-
-    pub fn try_send_datagram(
-        self: Pin<&mut Self>,
-        slot: SlotId,
-        data: Vec<u8>,
-    ) -> Result<(), TrySendError<Vec<u8>>> {
-        let mut this = self.project();
-        let index = slot.index() as usize;
-        let Some(ep) = this.endpoints.get_mut(index) else {
-            return Err(TrySendError::Closed(data));
-        };
-        let Some(handle) = ep.handle else {
-            return Err(TrySendError::Closed(data));
-        };
-        match this.inner.as_mut().try_send_datagram(handle, data) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Closed(data)) => {
-                this.inner.as_mut().close(handle);
-                this.inner.as_mut().handler_mut().unbind(handle);
-                ep.handle = None;
-                ep.attempt = ep.attempt.saturating_add(1);
-                let retry_at = this.backoff.next_retry_at(ep.attempt, Instant::now());
-                this.retries.remove(index);
-                let _ = this.retries.insert(index, retry_at);
-                Err(TrySendError::Closed(data))
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn try_connect(self: Pin<&mut Self>, slot: SlotId) -> bool {
-        let mut this = self.project();
-        let index = slot.index() as usize;
-        let (addr, authority) = match this.endpoints.get(index) {
-            Some(endpoint) if endpoint.handle.is_none() => (endpoint.addr, endpoint.authority),
-            None => return false,
-            Some(_) => return false,
-        };
-        *this.dcid_seed = this.dcid_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let Ok(dcid) = ConnectionId::try_from(this.dcid_seed.to_be_bytes()) else {
-            return false;
-        };
-        let Some(config) = this.config_provider.config(slot) else {
-            if let Some(endpoint) = this.endpoints.get_mut(index) {
-                endpoint.attempt = endpoint.attempt.saturating_add(1);
-                let retry_at = this.backoff.next_retry_at(endpoint.attempt, Instant::now());
-                this.retries.remove(index);
-                let _ = this.retries.insert(index, retry_at);
-            }
-            return false;
-        };
-        let connection = authority.connect(this.inner.as_mut(), addr, config, dcid);
-        let Ok(handle) = connection else {
-            if let Some(endpoint) = this.endpoints.get_mut(index) {
-                endpoint.attempt = endpoint.attempt.saturating_add(1);
-                let retry_at = this.backoff.next_retry_at(endpoint.attempt, Instant::now());
-                this.retries.remove(index);
-                let _ = this.retries.insert(index, retry_at);
-            }
-            return false;
-        };
-        if this.inner.as_mut().handler_mut().bind(handle, slot) {
-            if let Some(endpoint) = this.endpoints.get_mut(index) {
-                endpoint.handle = Some(handle);
-            }
-            return true;
-        }
-        this.inner.as_mut().close(handle);
-        if let Some(endpoint) = this.endpoints.get_mut(index) {
-            endpoint.attempt = endpoint.attempt.saturating_add(1);
-            let retry_at = this.backoff.next_retry_at(endpoint.attempt, Instant::now());
-            this.retries.remove(index);
-            let _ = this.retries.insert(index, retry_at);
-        }
-        false
-    }
-}
+const _: () = {
+    assert!(mem::size_of::<SlotScope<'static>>() == mem::size_of::<u64>());
+    assert!(!mem::needs_drop::<SlotScope<'static>>());
+};
+const _: () = {
+    assert!(std::mem::size_of::<SlotScope<'static>>() == std::mem::size_of::<AttemptId>());
+    assert!(std::mem::align_of::<SlotScope<'static>>() == std::mem::align_of::<AttemptId>());
+    assert!(!std::mem::needs_drop::<SlotScope<'static>>());
+    assert!(std::mem::size_of::<AttemptId>() == 2 * std::mem::size_of::<u32>());
+    assert!(std::mem::size_of::<AttemptState>() == std::mem::size_of::<u64>());
+    assert!(std::mem::align_of::<AttemptState>() == std::mem::align_of::<u64>());
+    assert!(std::mem::size_of::<Option<AttemptState>>() == std::mem::size_of::<u64>());
+    assert!(std::mem::size_of::<Successor>() == 2 * std::mem::size_of::<u64>());
+    assert!(!std::mem::needs_drop::<Successor>());
+    assert!(
+        std::mem::size_of::<AttemptScope<'static, 'static>>()
+            == std::mem::size_of::<(SlotId, u32, u32, time::Instant)>()
+    );
+    assert!(
+        std::mem::align_of::<AttemptScope<'static, 'static>>()
+            == std::mem::align_of::<(SlotId, u32, u32, time::Instant)>()
+    );
+    assert!(!std::mem::needs_drop::<AttemptScope<'static, 'static>>());
+    assert!(
+        std::mem::size_of::<RetryScope<'static>>()
+            == std::mem::size_of::<AttemptScope<'static, 'static>>()
+    );
+    assert!(
+        std::mem::align_of::<RetryScope<'static>>()
+            == std::mem::align_of::<AttemptScope<'static, 'static>>()
+    );
+    assert!(!std::mem::needs_drop::<RetryScope<'static>>());
+};

@@ -1,282 +1,152 @@
-pub mod support;
-
-use std::cell::RefCell;
-use std::net::SocketAddr;
-use std::rc::Rc;
-use std::time::{Duration, Instant};
-
-use dope::core::driver::settings;
-use dope::manifold::timing;
-use dope::runtime::{executor::Executor, shutdown};
-use dope_quic::conn::{self, Handle, server, session::Connection};
-use dope_quic::{Handler, RecvBuffer, RetainedEndpoint, endpoint, transport_params};
-use shin::server::config::NoGuard;
-
-const CID: [u8; 8] = [0x31; 8];
-const SERVER_ROUTE: u8 = 0;
-const CLIENT_ROUTE: u8 = 1;
-
-const ENDPOINT: endpoint::Config = endpoint::Config {
-    max_conns: 1,
-    outgoing_capacity: 16,
-    outgoing_bytes_capacity: 1 << 16,
-    packet_buffer_slots: 16,
-    packet_buffer_bytes: 2048,
+pub mod common;
+use common::receive::retained::{
+    Proof,
+    run::{CLIENT_ROUTE, ENDPOINT, Error, SERVER_ROUTE, mode, pooled},
 };
+use common::recovery;
+use dope::core::driver::life::recovery::Recovery;
+use dope::core::{driver::route::Id, io::Reclaimed};
+use dope_quic::stream::Capacity;
+use dope_test::alloc::Tracker;
+use o3::alloc;
+use std::{array, convert::Infallible, rc::Rc};
 
-struct Timeout(Instant);
+#[global_allocator]
+static ALLOCATOR: Tracker = Tracker::new();
 
-impl timing::Schedule for Timeout {
-    fn deadline(&self) -> Option<Instant> {
-        Some(self.0)
-    }
+fn recover(failure: Recovery<'_, '_>) -> Infallible {
+    panic!("native recovery: {:?}", failure.cause())
 }
 
-#[derive(Default)]
-struct Proof {
-    client: Option<Handle>,
-    server_ready: bool,
-    payload: Option<Vec<u8>>,
-    received: Option<(Vec<u8>, usize)>,
-    timed_out: bool,
-    stop: Option<shutdown::Trigger>,
-}
-
-struct Capture {
-    client: bool,
-    proof: Rc<RefCell<Proof>>,
-    connect: Option<Connect>,
-}
-
-struct Connect {
-    peer: SocketAddr,
-    public_key: [u8; 32],
-    parameters: transport_params::Params,
-}
-
-impl<'d, const ID: u8> Handler<ID, RecvBuffer<'d>> for Capture {
-    type Connection = ();
-
-    fn create_connection(
-        &mut self,
-        _connection: &mut Connection<ID, RecvBuffer<'d>>,
-        _handle: Handle,
-    ) {
-    }
-
-    fn established(
-        &mut self,
-        _connection: &mut (),
-        _conn: &mut Connection<ID, RecvBuffer<'d>>,
-        handle: Handle,
-    ) {
-        if self.client {
-            self.proof.borrow_mut().client = Some(handle);
-        } else {
-            self.proof.borrow_mut().server_ready = true;
+fn complete<T>(result: Result<T, Error<'_, '_>>) -> T {
+    assert!(
+        result.is_ok(),
+        "{}",
+        match &result {
+            Err(Error::Create(cause)) => format!("executor creation: {:?}", cause.kind()),
+            Err(Error::Domain(cause)) => format!("domain finalization: {:?}", cause.cause()),
+            Err(Error::Stage(cause)) => format!("session: {cause:?}"),
+            Err(Error::Setup(cause)) => format!("pooled reuse: {cause:?}"),
+            Err(Error::Observers(proof)) => format!(
+                "fixture observers still retained: {}",
+                Rc::strong_count(proof)
+            ),
+            Ok(_) => String::new(),
         }
-    }
-
-    fn datagram(
-        &mut self,
-        _connection: &mut (),
-        _conn: &mut Connection<ID, RecvBuffer<'d>>,
-        _handle: Handle,
-        data: RecvBuffer<'d>,
-    ) {
-        if self.client {
-            return;
-        }
-        let mut proof = self.proof.borrow_mut();
-        proof.received = Some((data.as_slice().to_vec(), data.resident_bytes()));
-        proof
-            .stop
-            .take()
-            .expect("retained receive stop capability")
-            .fire()
-            .expect("stop retained receive loopback");
-    }
+    );
+    result.ok().expect("fixture completion")
 }
 
-struct CaptureControl<'step>(&'step mut Capture);
-
-impl CaptureControl<'_> {
-    fn take_connect(&mut self) -> Option<Connect> {
-        self.0.connect.take()
-    }
-
-    fn take_send(&mut self) -> Option<(Handle, Vec<u8>)> {
-        let mut proof = self.0.proof.borrow_mut();
-        if !proof.server_ready {
-            return None;
-        }
-        let handle = proof.client?;
-        let payload = proof.payload.take()?;
-        Some((handle, payload))
-    }
-
-    fn timeout(&mut self) {
-        let mut proof = self.0.proof.borrow_mut();
-        proof.timed_out = true;
-        proof
-            .stop
-            .take()
-            .expect("retained receive timeout stop capability")
-            .fire()
-            .expect("stop timed-out retained receive loopback");
-    }
-}
-
-// SAFETY: the control exposes only test-owned command state and cannot move
-// or replace retained endpoint storage.
-unsafe impl<'d, const ID: u8> endpoint::ControlHandler<'d, ID, RecvBuffer<'d>> for Capture {
-    type Control<'step>
-        = CaptureControl<'step>
-    where
-        Self: 'step,
-        'd: 'step;
-
-    unsafe fn control<'step>(handler: &'step mut Self) -> Self::Control<'step>
-    where
-        'd: 'step,
-    {
-        CaptureControl(handler)
-    }
-}
-
-#[pin_project::pin_project]
-#[derive(dope_gen::Application)]
-#[coordinate]
-struct App<'d> {
-    #[dispatcher(marker)]
-    marker: ::core::marker::PhantomData<fn(&'d ()) -> &'d ()>,
-    #[pin]
-    #[manifold]
-    server: RetainedEndpoint<'d, SERVER_ROUTE, Capture>,
-    #[pin]
-    #[manifold(control)]
-    client: RetainedEndpoint<'d, CLIENT_ROUTE, Capture>,
-    #[dispatcher(schedule)]
-    timeout: Timeout,
-}
-
-impl<'d> App<'d> {
-    fn coordinate(mut this: AppCoordinate<'_, '_, 'd>) -> dope::runtime::coordinate::Flow {
-        if this.timeout.0 <= this.step.now() {
-            this.client.handler_control().timeout();
-            return dope::runtime::coordinate::Flow::Idle;
-        }
-        if let Some(connect) = this.client.handler_control().take_connect() {
-            this.client
-                .connect(
-                    connect.peer,
-                    connect.public_key,
-                    connect.parameters,
-                    CID.to_vec(),
-                )
-                .expect("connect retained receive loopback");
-        }
-        if let Some((handle, payload)) = this.client.handler_control().take_send() {
-            this.client
-                .try_send_datagram(handle, payload)
-                .expect("queue retained receive proof datagram");
-        }
-        dope::runtime::coordinate::Flow::Idle
-    }
-}
-
-fn receive(payload: Vec<u8>) -> (Vec<u8>, usize) {
-    let signing = support::signing_key(0x52);
-    let server_pubkey = *signing.pubkey().unwrap();
-    let parameters = transport_params::Params {
-        max_idle_timeout_ms: 30_000,
-        max_datagram_frame_size: Some(2048),
-        ..transport_params::Params::default()
-    };
-    let (source, stop) = shutdown::Pair::new().unwrap().split();
-    let proof = Rc::new(RefCell::new(Proof {
-        payload: Some(payload),
-        stop: Some(stop),
-        ..Proof::default()
-    }));
-    let executor = Executor::new(
-        settings::Config::for_quic_udp(64, ENDPOINT.packet_buffer_bytes)
-            .expect("valid retained receive driver config"),
-    )
-    .unwrap()
-    .with_shutdown(source)
-    .unwrap();
-
-    executor.enter(|mut session| {
-        let timeout = Timeout(Instant::now() + Duration::from_secs(2));
-        let (server, client) = {
-            let mut driver = session.driver_access();
-            let server = RetainedEndpoint::<'_, SERVER_ROUTE, Capture, server::Standard>::build_server_with_policy(
-                "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-                signing,
-                conn::config::Options::from(parameters.clone()),
-                NoGuard,
-                Capture {
-                    client: false,
-                    proof: Rc::clone(&proof),
-                    connect: None,
-                },
-                ENDPOINT,
-                &mut driver,
-            )
-            .unwrap();
-            let server_addr = server.local_addr();
-            let client = RetainedEndpoint::<'_, CLIENT_ROUTE, Capture>::build_client(
-                "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-                Capture {
-                    client: true,
-                    proof: Rc::clone(&proof),
-                    connect: Some(Connect {
-                        peer: server_addr,
-                        public_key: server_pubkey,
-                        parameters,
-                    }),
-                },
-                ENDPOINT,
-                &mut driver,
-            )
-            .unwrap();
-            (server, client)
-        };
-
-        drop(
-            session
-                .with_app(
-                    App {
-                        marker: core::marker::PhantomData,
-                        server,
-                        client,
-                        timeout,
-                    },
-                    |mut app| app.run(),
-                )
-                .expect("retained receive teardown")
-                .expect("retained receive runtime"),
+fn verify((proof, reports): (Proof, Vec<Reclaimed>), fail: bool) -> (Vec<u8>, usize) {
+    recovery::Teardown::new([Id::fixed::<SERVER_ROUTE>(), Id::fixed::<CLIENT_ROUTE>()])
+        .verify(reports)
+        .expect("both endpoint receive operations must retire exactly once");
+    assert!(proof.failures.packet.is_none(), "{:?}", proof.failures);
+    assert!(proof.failures.detail.is_none(), "{:?}", proof.failures);
+    assert!(proof.failures.fixture.is_none(), "{:?}", proof.failures);
+    assert!(proof.failures.shutdown.is_none(), "{:?}", proof.failures);
+    assert_eq!(proof.certificates, 0);
+    assert!(!proof.timed_out, "retained receive deadline elapsed");
+    assert_eq!(proof.read.failed, fail);
+    if fail {
+        let read = proof
+            .read
+            .observed
+            .expect("failed and resumed read observations");
+        assert!(!read.before);
+        assert_eq!(
+            read.failed.result,
+            Err(Capacity::Allocation {
+                error: alloc::Error::Exhausted,
+                requested: read.expected,
+            })
         );
-
-        let proof = proof.borrow();
-        assert!(!proof.timed_out, "retained receive deadline elapsed");
-        proof.received.clone().expect("server datagram")
-    })
+        assert_eq!(read.failed.activity.allocations, 0);
+        assert_eq!(read.failed.activity.deallocations, 0);
+        assert!(read.failed.fin);
+        assert!(!read.failed.eof);
+        assert_eq!(read.resumed.length, read.expected);
+        assert_eq!(read.resumed.activity.allocations, 1);
+        assert_eq!(read.resumed.activity.allocated_bytes, read.expected);
+        assert!(read.resumed.eof);
+        assert_eq!(read.drained, Ok(None));
+    } else if proof.read.stream {
+        assert_eq!(
+            proof
+                .read
+                .barrier
+                .as_ref()
+                .and_then(|value| value.as_deref()),
+            Some(&b"retained stream lifetime barrier"[..])
+        );
+    }
+    proof
+        .received
+        .expect("the retained server must capture the first payload")
 }
 
 #[test]
-fn small_payload_falls_back_to_one_exact_lifetime_safe_owner() {
+fn owns_small_exactly() {
     let payload = b"compact";
-    let (bytes, resident) = receive(payload.to_vec());
+    let (bytes, resident) = verify(
+        mode(payload.to_vec(), false, false, recover, complete).expect("retained fixture"),
+        false,
+    );
     assert_eq!(bytes, payload);
     assert_eq!(resident, payload.len());
 }
 
 #[test]
-fn large_payload_keeps_the_driver_owner_without_copying() {
-    let payload = vec![0xa5; 1000];
-    let (bytes, resident) = receive(payload.clone());
+fn retains_large_owner() {
+    let payload = [0xa5; 1000];
+    let (bytes, resident) = verify(
+        mode(payload.to_vec(), false, false, recover, complete).expect("retained fixture"),
+        false,
+    );
     assert_eq!(bytes, payload);
     assert!(resident >= ENDPOINT.packet_buffer_bytes as usize);
+}
+
+#[test]
+fn retains_stream_owner() {
+    let payload = [0xd8; 1000];
+    let (bytes, resident) = verify(
+        mode(payload.to_vec(), true, false, recover, complete).expect("retained fixture"),
+        false,
+    );
+    assert_eq!(bytes, payload);
+    assert!(resident >= ENDPOINT.packet_buffer_bytes as usize);
+}
+
+#[test]
+fn reuses_pooled_tls() {
+    let payload = [0x7c; 1000];
+    let (proof, reports, opening) =
+        pooled(payload.to_vec(), recover, complete).expect("pooled fixture");
+    assert_eq!(opening, [true, true]);
+    let (bytes, resident) = verify((proof, reports), false);
+    assert_eq!(bytes, payload);
+    assert!(resident >= ENDPOINT.packet_buffer_bytes as usize);
+}
+
+#[test]
+fn compact_read_recovers() {
+    let payload = b"retained";
+    let (bytes, resident) = verify(
+        mode(payload.to_vec(), true, true, recover, complete).expect("retained fixture"),
+        true,
+    );
+    assert_eq!(bytes, payload);
+    assert_eq!(resident, payload.len());
+}
+
+#[test]
+fn plural_read_recovers() {
+    let payload: [u8; 2048] = array::from_fn(|index| index as u8);
+    let (bytes, resident) = verify(
+        mode(payload.to_vec(), true, true, recover, complete).expect("retained fixture"),
+        true,
+    );
+    assert_eq!(bytes, payload);
+    assert_eq!(resident, payload.len());
 }

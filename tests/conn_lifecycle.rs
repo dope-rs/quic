@@ -1,177 +1,183 @@
-pub mod support;
+pub mod common;
 
+use common::peer::Receiver as _;
+use common::suite::peers::life;
+use dope_quic::conn::Epoch;
+use dope_quic::errors::Code;
 use std::time::{Duration, Instant};
 
-use dope_quic::conn::server;
-use dope_quic::{conn, conn::session::Connection, transport_params};
-
-const CID: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
-
-fn user_tp(idle_ms: u64) -> dope_quic::conn::config::Options {
-    transport_params::Params {
-        max_idle_timeout_ms: idle_ms,
-        max_datagram_frame_size: Some(65535),
-        ..transport_params::Params::default()
-    }
-    .into()
-}
-
-fn build_pair(idle_ms: u64) -> (server::Connection, Connection, conn::ReceiveWorkspace) {
-    let signing = support::signing_key(0x39);
-    let server_pubkey = *signing.pubkey().unwrap();
-    let server = dope_quic::conn::setup::Server::<0>::accept(
-        CID.to_vec(),
-        CID.to_vec(),
-        CID.to_vec(),
-        signing,
-        user_tp(idle_ms),
-    )
-    .unwrap();
-    let client = dope_quic::conn::setup::Client::<0>::connect(
-        CID.to_vec(),
-        CID.to_vec(),
-        server_pubkey,
-        user_tp(idle_ms),
-    )
-    .unwrap();
-    (server, client, conn::ReceiveWorkspace::new())
-}
-
-fn drain<R: support::Receiver>(
-    workspace: &mut conn::ReceiveWorkspace,
-    from: &mut Connection,
-    into: &mut R,
-    now: Instant,
-) {
-    for mut pkt in from.transmit().send(now) {
-        into.receive(workspace, &mut pkt, now);
-    }
-}
-
-fn complete_handshake(
-    workspace: &mut conn::ReceiveWorkspace,
-    server: &mut server::Connection,
-    client: &mut Connection,
-    now: Instant,
-) {
-    drain(workspace, client, server, now);
-    drain(workspace, server, client, now);
-    drain(workspace, client, server, now);
-    drain(workspace, server, client, now);
-}
-
 #[test]
-fn handshake_done_confirms_client_and_discards_handshake_keys() {
-    let (mut server, mut client, mut workspace) = build_pair(30_000);
+fn handshake_confirms() {
+    let pair = life::try_pair(30_000).expect("lifecycle fixture must open");
     let t0 = Instant::now();
+    let (mut server, mut client, mut work) = pair.into_parts();
 
-    drain(&mut workspace, &mut client, &mut server, t0);
-    drain(&mut workspace, &mut server, &mut client, t0);
-    drain(&mut workspace, &mut client, &mut server, t0);
-    assert!(client.status().is_established());
-    assert!(server.status().is_established());
+    server
+        .receive_from(&mut work, &mut client, t0)
+        .expect("peer packet accepted");
+    client
+        .receive_from(&mut work, &mut server, t0)
+        .expect("peer packet accepted");
+    server
+        .receive_from(&mut work, &mut client, t0)
+        .expect("peer packet accepted");
+    assert!(client.view().lifecycle().is_ready());
+    assert!(server.view().lifecycle().is_ready());
     assert!(
-        !client.status().handshake_confirmed(),
+        !client.view().lifecycle().is_confirmed(),
         "client not yet confirmed"
     );
 
-    drain(&mut workspace, &mut server, &mut client, t0);
+    client
+        .receive_from(&mut work, &mut server, t0)
+        .expect("peer packet accepted");
     assert!(
-        client.status().handshake_confirmed(),
+        client.view().lifecycle().is_confirmed(),
         "HANDSHAKE_DONE received"
     );
-    assert_eq!(client.status().unacked_count(0), 0);
-    assert_eq!(client.status().unacked_count(1), 0);
+    assert_eq!(client.view().recovery().unacked(Epoch::Initial), 0);
+    assert_eq!(client.view().recovery().unacked(Epoch::Handshake), 0);
 }
 
 #[test]
-fn close_emits_connection_close_and_peer_transitions_to_closed() {
-    let (mut server, mut client, mut workspace) = build_pair(30_000);
+fn close_closes_peer() {
+    let mut pair = life::try_pair(30_000).expect("lifecycle fixture must open");
     let t0 = Instant::now();
-    complete_handshake(&mut workspace, &mut server, &mut client, t0);
-    assert!(client.status().is_established());
-    assert!(server.status().is_established());
+    pair.exchange(t0, 2).expect("fixture handshake flights");
+    let (mut server, mut client, mut work) = pair.into_parts();
+    assert!(client.view().lifecycle().is_ready());
+    assert!(server.view().lifecycle().is_ready());
 
-    client.close(7, b"goodbye".to_vec());
-    drain(&mut workspace, &mut client, &mut server, t0);
+    client.with_scope(|mut scope| {
+        scope
+            .lifecycle()
+            .close(Code::from_u8(7), b"goodbye".to_vec())
+    });
+    assert!(client.view().lifecycle().is_closing());
+    assert!(!client.view().lifecycle().is_closed());
+    server
+        .receive_from(&mut work, &mut client, t0)
+        .expect("peer packet accepted");
 
     assert!(
-        client.status().is_closed(),
+        client.view().lifecycle().is_closed(),
         "client closed after sending CLOSE"
     );
     assert!(
-        server.status().is_closed(),
+        server.view().lifecycle().is_closed(),
         "server closed after receiving CLOSE"
     );
 }
 
 #[test]
-fn idle_timeout_silently_closes_after_inactivity() {
-    let (mut server, mut client, mut workspace) = build_pair(50);
+fn idle_timeout_closes() {
+    let mut pair = life::try_pair(50).expect("lifecycle fixture must open");
     let t0 = Instant::now();
-    complete_handshake(&mut workspace, &mut server, &mut client, t0);
+    pair.exchange(t0, 2).expect("fixture handshake flights");
+    let (mut server, mut client, _) = pair.into_parts();
 
     let t1 = t0 + Duration::from_millis(100);
-    conn::recovery::Loss::new(&mut client).check_loss(t1);
-    conn::recovery::Loss::new(&mut server).check_loss(t1);
-    assert!(client.status().is_closed(), "client idle-closed");
-    assert!(server.status().is_closed(), "server idle-closed");
+    assert_eq!(
+        client.with_scope(|mut scope| scope.recovery().try_loss(t1)),
+        Ok(())
+    );
+    assert_eq!(
+        server.with_scope(|mut scope| scope.recovery().try_loss(t1)),
+        Ok(())
+    );
+    assert!(client.view().lifecycle().is_closed(), "client idle-closed");
+    assert!(server.view().lifecycle().is_closed(), "server idle-closed");
 }
 
 #[test]
-fn activity_resets_idle_timer() {
-    let (mut server, mut client, mut workspace) = build_pair(100);
+fn activity_resets_idle() {
+    let mut pair = life::try_pair(100).expect("lifecycle fixture must open");
     let t0 = Instant::now();
-    complete_handshake(&mut workspace, &mut server, &mut client, t0);
+    pair.exchange(t0, 2).expect("fixture handshake flights");
+    let (mut server, mut client, mut work) = pair.into_parts();
 
     let t1 = t0 + Duration::from_millis(80);
-    client.datagrams().try_send(b"keepalive".to_vec()).unwrap();
-    drain(&mut workspace, &mut client, &mut server, t1);
-    assert!(!client.status().is_closed());
-    assert!(!server.status().is_closed());
+    client
+        .with_scope(|mut scope| scope.datagrams().try_send(b"keepalive".to_vec()))
+        .expect("established test client must accept a keepalive DATAGRAM");
+    server
+        .receive_from(&mut work, &mut client, t1)
+        .expect("peer packet accepted");
+    assert!(!client.view().lifecycle().is_closed());
+    assert!(!server.view().lifecycle().is_closed());
 
     let t2 = t1 + Duration::from_millis(50);
-    conn::recovery::Loss::new(&mut client).check_loss(t2);
-    conn::recovery::Loss::new(&mut server).check_loss(t2);
+    assert_eq!(
+        client.with_scope(|mut scope| scope.recovery().try_loss(t2)),
+        Ok(())
+    );
+    assert_eq!(
+        server.with_scope(|mut scope| scope.recovery().try_loss(t2)),
+        Ok(())
+    );
     assert!(
-        !client.status().is_closed(),
+        !client.view().lifecycle().is_closed(),
         "datagram refreshed client idle"
     );
     assert!(
-        !server.status().is_closed(),
+        !server.view().lifecycle().is_closed(),
         "datagram refreshed server idle"
     );
 }
 
 #[test]
-fn repeated_sends_without_receive_do_not_defer_idle_timeout() {
-    let (mut server, mut client, mut workspace) = build_pair(100);
+fn sends_do_not_defer_idle() {
+    let mut pair = life::try_pair(100).expect("lifecycle fixture must open");
     let t0 = Instant::now();
-    complete_handshake(&mut workspace, &mut server, &mut client, t0);
+    pair.exchange(t0, 2).expect("fixture handshake flights");
+    let mut client = pair.client;
 
-    let first_send = t0 + Duration::from_millis(80);
-    client.datagrams().try_send(b"first".to_vec()).unwrap();
-    assert!(!client.transmit().send(first_send).is_empty());
-
-    let later_send = t0 + Duration::from_millis(150);
-    client.datagrams().try_send(b"second".to_vec()).unwrap();
-    assert!(!client.transmit().send(later_send).is_empty());
-
-    conn::recovery::Loss::new(&mut client).check_loss(first_send + Duration::from_millis(101));
+    let first = t0 + Duration::from_millis(80);
+    client
+        .with_scope(|mut scope| scope.datagrams().try_send(b"first".to_vec()))
+        .expect("established test client must accept the first DATAGRAM");
     assert!(
-        client.status().is_closed(),
+        !{
+            let (emitted_packets, send_result) =
+                client.with_scope(|mut scope| scope.output().send(first));
+            send_result.expect("warmed client journals must admit the first datagram");
+            emitted_packets
+        }
+        .is_empty()
+    );
+
+    let later = t0 + Duration::from_millis(150);
+    client
+        .with_scope(|mut scope| scope.datagrams().try_send(b"second".to_vec()))
+        .expect("established test client must accept the second DATAGRAM");
+    assert!(
+        !{
+            let (emitted_packets, send_result) =
+                client.with_scope(|mut scope| scope.output().send(later));
+            send_result.expect("warmed client journals must admit the second datagram");
+            emitted_packets
+        }
+        .is_empty()
+    );
+
+    client.with_scope(|mut scope| {
+        assert_eq!(
+            scope
+                .recovery()
+                .try_loss(first + Duration::from_millis(101)),
+            Ok(())
+        );
+    });
+    assert!(
+        client.view().lifecycle().is_closed(),
         "only the first ack-eliciting send after a receive may restart idle timeout",
     );
 }
 
 #[test]
-fn server_discards_handshake_keys_after_handshake_done_send() {
-    let (mut server, mut client, mut workspace) = build_pair(30_000);
+fn server_discards_keys() {
+    let mut pair = life::try_pair(30_000).expect("lifecycle fixture must open");
     let t0 = Instant::now();
-    complete_handshake(&mut workspace, &mut server, &mut client, t0);
-    assert_eq!(server.status().unacked_count(1), 0);
-
-    let _ = server.transmit().send(t0);
-    let datagram = client.transmit().send(t0);
-    let _ = datagram;
+    pair.exchange(t0, 2).expect("fixture handshake flights");
+    assert_eq!(pair.server.view().recovery().unacked(Epoch::Handshake), 0);
 }

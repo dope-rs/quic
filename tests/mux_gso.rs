@@ -1,162 +1,381 @@
-use std::cell::RefCell;
-use std::net::SocketAddr;
-use std::rc::Rc;
-use std::time::{Duration, Instant};
+use crate::common::peer;
+use dope_quic::conn::life::options::Options;
+use dope_quic::conn::stream;
+use dope_quic::runtime::mux::builder::{Builder, Plan};
+pub mod common;
+use common::runtime::gso::{self, Capture};
+use dope_quic::{conn::stream::Event, proto::param, runtime::mux::output};
+use std::{
+    pin::Pin,
+    time::{Duration, Instant},
+};
+#[test]
+fn retry_requires_train() {
+    for lost in [1usize, 4] {
+        let (signing, key) = peer::raw(0x60 + lost as u8).expect("raw identity");
+        let params = param::Set::builder()
+            .idle_ms(30_000)
+            .initial_data(1 << 20)
+            .stream_uni(1 << 20)
+            .uni_count(4)
+            .try_build()
+            .expect("fixture transport parameters");
+        let options = || {
+            Options::builder()
+                .transport(|net| net.params(params.clone()).max_pmtu(1_200))
+                .try_build()
+                .expect("fixture connection options must be valid")
+        };
+        let source = signing.server().expect("server TLS");
+        let mut server = Capture::server(gso::Capture::default(), source, options())
+            .expect("fixture server must initialize");
+        let capture = gso::Capture::default();
+        let events = capture.events.clone();
+        let limits = Plan::try_new(1, 64, 1 << 20).expect("retry fixture limits are valid");
+        let mut client = Builder::client(capture)
+            .limits(limits)
+            .build()
+            .expect("fixture client router has valid limits");
+        assert!(
+            Pin::new(&mut client).config().enable_gso().is_ok(),
+            "fixture client supports GSO configuration"
+        );
 
-use dope_quic::conn::{Handle, stream::Event};
-use dope_quic::mux::Outgoing;
-use dope_quic::{Handler, Mux, conn::session::Connection, transport_params};
-use shin::crypto::sig::SigningKey;
+        let mut now = Instant::now();
+        let handle = Capture::connect(
+            &mut client,
+            gso::SERVER,
+            key,
+            options(),
+            gso::CID.to_vec(),
+            now,
+        )
+        .expect("fixture connection must initialize");
+        for _ in 0..16 {
+            now += Duration::from_millis(1);
+            let flights = Capture::output(&mut client, now).expect("fixture output");
+            Capture::deliver_at(&mut server, gso::CLIENT, flights, now)
+                .expect("fixture packet delivery");
+            let flights = Capture::output(&mut server, now).expect("fixture output");
+            Capture::deliver_at(&mut client, gso::SERVER, flights, now)
+                .expect("fixture packet delivery");
+        }
+        let ready = events.established.take();
+        assert!(ready == [handle]);
+        events.established.set(ready);
 
-const CID: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        Capture::settle_pair(&mut client, &mut server, gso::CLIENT, gso::SERVER, &mut now)
+            .expect("fixture pair settlement");
 
-#[derive(Default)]
-struct Events {
-    established: Vec<Handle>,
-    streams: Vec<(Handle, Event)>,
-}
+        let body = vec![0x80 | lost as u8; (lost + 4) * 1_150];
+        assert!(
+            Capture::access(&mut client, handle, now, |mut conn| {
+                let mut streams = conn.streams();
+                let mut send = streams.send();
+                let stream = send
+                    .open_uni()
+                    .expect("established fixture connection has stream credit");
+                assert!(
+                    send.send(stream, &body).is_ok(),
+                    "open fixture stream accepts the retry body"
+                );
+                assert!(
+                    send.finish(stream).is_ok(),
+                    "open fixture stream accepts FIN"
+                );
+            })
+            .is_ok(),
+            "fixture connection must remain installed"
+        );
 
-#[derive(Clone, Default)]
-struct CapturingHandler {
-    events: Rc<RefCell<Events>>,
-}
+        let mut packets: Vec<Vec<u8>> = Vec::new();
+        let burst = Capture::output(&mut client, now).expect("fixture output");
+        for mut outgoing in burst {
+            packets.extend(outgoing.segments_mut().map(|segment| segment.to_vec()));
+            Pin::new(&mut client).output().recycle(outgoing);
+        }
+        assert!(
+            packets.len() >= lost + 3,
+            "later ACKs must cross the packet-loss threshold"
+        );
+        for packet in &mut packets[lost..] {
+            Capture::receive(&mut server, gso::CLIENT, packet, now).expect("fixture ingress");
+        }
 
-impl Handler<0> for CapturingHandler {
-    type Connection = ();
-
-    fn create_connection(&mut self, _conn: &mut Connection, _handle: Handle) {}
-
-    fn established(&mut self, _connection: &mut (), _conn: &mut Connection, h: Handle) {
-        self.events.borrow_mut().established.push(h);
-    }
-    fn stream_event(
-        &mut self,
-        _connection: &mut (),
-        _conn: &mut Connection,
-        h: Handle,
-        event: Event,
-    ) {
-        self.events.borrow_mut().streams.push((h, event));
-    }
-}
-
-fn deliver(dst: &mut Mux<CapturingHandler>, src_addr: SocketAddr, burst: Vec<Outgoing>) -> usize {
-    let now = Instant::now();
-    let mut gso_runs = 0;
-    for out in burst {
-        match out {
-            Outgoing::Plain(_, mut payload) => {
-                dst.protocol()
-                    .recv(src_addr, &mut payload, now)
-                    .expect("recv");
-            }
-            Outgoing::Suffix(_, mut payload) => {
-                dst.protocol()
-                    .recv(src_addr, payload.as_mut_slice(), now)
-                    .expect("recv");
-            }
-            Outgoing::Batch(_, mut payload, segment_size) => {
-                for segment in payload.chunks_mut(usize::from(segment_size.get())) {
-                    dst.protocol().recv(src_addr, segment, now).unwrap();
-                }
-                gso_runs += 1;
-            }
+        let ack_at = now + Duration::from_millis(50);
+        let acks = Capture::output(&mut server, ack_at).expect("fixture output");
+        Capture::deliver_at(&mut client, gso::SERVER, acks, ack_at)
+            .expect("fixture packet delivery");
+        let retries = Capture::output(&mut client, ack_at).expect("fixture output");
+        let shapes: Vec<_> = retries
+            .iter()
+            .map(|outgoing| {
+                (
+                    outgoing.packet_count(),
+                    outgoing.is_segmented(),
+                    outgoing.payload().len(),
+                )
+            })
+            .collect();
+        if lost == 1 {
+            assert!(
+                retries.iter().any(|outgoing| {
+                    !outgoing.is_segmented() && outgoing.payload().len() > 1_000
+                }),
+                "one retry must stay on the plain path: {shapes:?}"
+            );
+            assert!(
+                retries.iter().all(|outgoing| !outgoing.is_segmented()),
+                "one retry plus any ACK-only output cannot create a GSO train: {shapes:?}"
+            );
+        } else {
+            assert!(
+                retries
+                    .iter()
+                    .any(|outgoing| outgoing.is_segmented() && outgoing.packet_count().get() >= 2),
+                "proven retry work must produce a useful GSO train: {shapes:?}"
+            );
         }
     }
-    gso_runs
 }
 
 #[test]
-fn gso_burst_reassembles_to_full_stream() {
-    let signing = SigningKey::from_seed(&[7u8; 32]).unwrap();
-    let server_pubkey = *signing.pubkey().unwrap();
+fn destinations_split() {
+    const PER_DEST: usize = 4;
+    const TOTAL: usize = PER_DEST * 2;
 
-    let tp = transport_params::Params {
-        max_idle_timeout_ms: 30_000,
-        initial_max_data: 1 << 20,
-        initial_max_stream_data_uni: 1 << 20,
-        initial_max_streams_uni: 8,
-        ..transport_params::Params::default()
+    let (sign_a, key_a) = peer::raw(0x51).expect("first raw identity");
+    let (sign_b, key_b) = peer::raw(0x52).expect("second raw identity");
+    let params = param::Set::builder()
+        .idle_ms(30_000)
+        .datagram(Some(65_535))
+        .try_build()
+        .expect("fixture transport parameters");
+    let options = || {
+        Options::builder()
+            .transport(|net| net.params(params.clone()).max_pmtu(1_200))
+            .try_build()
+            .expect("fixture connection options must be valid")
     };
-
-    let server_handler = CapturingHandler::default();
-    let server_events = server_handler.events.clone();
-    let mut server = dope_quic::mux::setup::Server::with_outgoing_capacity(
-        server_handler,
-        signing,
-        tp.clone().into(),
-        64,
-    )
-    .unwrap();
-    server.configuration().enable_gso().unwrap();
-
-    let client_handler = CapturingHandler::default();
-    let client_events = client_handler.events.clone();
-    let mut client = dope_quic::mux::setup::Client::new(client_handler)
+    let source_a = sign_a.server().expect("server TLS");
+    let source_b = sign_b.server().expect("server TLS");
+    let mut server_a = Capture::server(gso::Capture::default(), source_a, options())
+        .expect("first server must initialize");
+    let mut server_b = Capture::server(gso::Capture::default(), source_b, options())
+        .expect("second server must initialize");
+    let limits = Plan::try_new(TOTAL, 64, 1 << 20).expect("multi-route fixture limits are valid");
+    let mut client = Builder::client(gso::Capture::default())
+        .limits(limits)
         .build()
-        .unwrap();
+        .expect("fixture client router has valid limits");
+    let mut now = Instant::now();
+    let mut handles = Vec::with_capacity(TOTAL);
+    for ordinal in 0..TOTAL {
+        let (addr, key) = if ordinal % 2 == 0 {
+            (gso::SERVER, key_a)
+        } else {
+            (gso::SERVER_B, key_b)
+        };
+        let handle = Capture::connect(
+            &mut client,
+            addr,
+            key,
+            options(),
+            (ordinal as u64 + 1).to_be_bytes().to_vec(),
+            now,
+        )
+        .expect("fixture connection must initialize");
+        handles.push(handle);
+    }
+    for _ in 0..16 {
+        now += Duration::from_millis(1);
+        Capture::route(&mut client, &mut server_a, &mut server_b, now).expect("fixture route");
+        Capture::deliver(
+            &mut client,
+            gso::SERVER,
+            Capture::output(&mut server_a, now).expect("fixture output"),
+        )
+        .expect("fixture packet delivery");
+        Capture::deliver(
+            &mut client,
+            gso::SERVER_B,
+            Capture::output(&mut server_b, now).expect("fixture output"),
+        )
+        .expect("fixture packet delivery");
+    }
 
-    let server_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
-    let client_addr: SocketAddr = "10.0.0.1:50000".parse().unwrap();
+    for _ in 0..4 {
+        now += Duration::from_millis(30);
+        Capture::route(&mut client, &mut server_a, &mut server_b, now).expect("fixture route");
+        now += Duration::from_millis(30);
+        let flights = Capture::output(&mut server_a, now).expect("fixture output");
+        Capture::deliver_at(&mut client, gso::SERVER, flights, now)
+            .expect("fixture packet delivery");
+        let flights = Capture::output(&mut server_b, now).expect("fixture output");
+        Capture::deliver_at(&mut client, gso::SERVER_B, flights, now)
+            .expect("fixture packet delivery");
+    }
+    now += Duration::from_millis(30);
+    Capture::route(&mut client, &mut server_a, &mut server_b, now).expect("fixture route");
+
+    assert!(
+        Pin::new(&mut client).config().enable_gso().is_ok(),
+        "fixture client supports GSO configuration"
+    );
+    for (ordinal, handle) in handles.iter().copied().enumerate() {
+        Capture::send(&mut client, handle, vec![ordinal as u8; 1_150], now)
+            .expect("fixture datagram admission");
+    }
+    now = Capture::release_at(&client, &handles, now).expect("active fixture handle");
+    let flights = Capture::output(&mut client, now).expect("fixture output");
+    assert_eq!(flights.len(), 2);
+    assert!(flights.iter().all(output::Flight::is_segmented));
+    assert!(
+        flights
+            .iter()
+            .all(|flight| flight.packet_count().get() == PER_DEST)
+    );
+    assert!(flights.iter().any(|flight| flight.addr() == gso::SERVER));
+    assert!(flights.iter().any(|flight| flight.addr() == gso::SERVER_B));
+}
+
+#[test]
+fn burst_reassembles() {
+    let (signing, key) = peer::raw(7).expect("raw identity");
+
+    let params = param::Set::builder()
+        .idle_ms(30_000)
+        .initial_data(1 << 20)
+        .stream_uni(1 << 20)
+        .uni_count(8)
+        .try_build()
+        .expect("fixture transport parameters");
+    let [srv_opts, cli_opts] = [params.clone(), params]
+        .map(|params| Options::try_from(params).expect("fixture connection options must be valid"));
+
+    let capture = gso::Capture::default();
+    let remote = capture.events.clone();
+    let mut server = Capture::server(capture, signing.server().expect("server TLS"), srv_opts)
+        .expect("fixture server must initialize");
+    assert!(
+        Pin::new(&mut server).config().enable_gso().is_ok(),
+        "fixture server supports GSO configuration"
+    );
+
+    let capture = gso::Capture::default();
+    let local = capture.events.clone();
+    let mut client = Builder::client(capture)
+        .build()
+        .expect("default fixture client router is valid");
 
     let mut now = Instant::now();
-    let client_handle = client
-        .protocol()
-        .connect(server_addr, server_pubkey, tp.into(), CID.to_vec(), now)
-        .unwrap();
-    deliver(&mut server, client_addr, client.output().drain().collect());
-    deliver(&mut client, server_addr, server.output().drain().collect());
-    deliver(&mut server, client_addr, client.output().drain().collect());
-    server.output().drive_bounded(now);
-    client.output().drive_bounded(now);
+    let dialed = Capture::connect(
+        &mut client,
+        gso::SERVER,
+        key,
+        cli_opts,
+        gso::CID.to_vec(),
+        now,
+    )
+    .expect("fixture connection must initialize");
+    Capture::deliver(
+        &mut server,
+        gso::CLIENT,
+        Capture::output(&mut client, now).expect("fixture output"),
+    )
+    .expect("fixture packet delivery");
+    Capture::deliver(
+        &mut client,
+        gso::SERVER,
+        Capture::output(&mut server, now).expect("fixture output"),
+    )
+    .expect("fixture packet delivery");
+    Capture::deliver(
+        &mut server,
+        gso::CLIENT,
+        Capture::output(&mut client, now).expect("fixture output"),
+    )
+    .expect("fixture packet delivery");
+    for (mux, peer) in [(&mut server, "server"), (&mut client, "client")] {
+        Pin::new(mux).observe(now, |mut turn| {
+            assert!(
+                turn.output().drive().is_ok(),
+                "fixture {peer} connections must admit settled stream output"
+            )
+        });
+    }
 
-    let server_handle = server_events.borrow().established[0];
+    let ready = remote.established.take();
+    let accepted = ready
+        .first()
+        .copied()
+        .expect("server observes the fixture connection as established");
+    remote.established.set(ready);
 
-    let body: Vec<u8> = (0..8192u32).map(|i| (i * 31) as u8).collect();
-    let stream_id = {
-        let mut conn = server
-            .protocol()
-            .conn_mut(server_handle)
-            .expect("server conn");
-        let sid = conn.streams().open_uni().expect("uni stream");
-        conn.streams().send(sid, &body).unwrap();
-        conn.streams().finish(sid).unwrap();
-        sid
-    };
+    let body: Vec<u8> = (0..8192u32).map(|index| (index * 31) as u8).collect();
+    let id = Capture::access(&mut server, accepted, now, |mut conn| {
+        let mut streams = conn.streams();
+        let mut send = streams.send();
+        let stream = send.open_uni()?;
+        send.send(stream, &body)?;
+        send.finish(stream)?;
+        Ok::<_, stream::Error>(stream.id())
+    })
+    .expect("fixture connection access must succeed")
+    .expect("established server must enqueue the complete stream and FIN");
 
     let mut gso_runs = 0;
     for _ in 0..16 {
         now += Duration::from_millis(20);
-        server.protocol().flush(server_handle, now);
-        assert!(server.output().len() <= server.output().capacity());
-        assert!(server.output().bytes() <= server.output().bytes_capacity());
-        gso_runs += deliver(&mut client, server_addr, server.output().drain().collect());
-        client.protocol().flush(client_handle, now);
-        deliver(&mut server, client_addr, client.output().drain().collect());
-        if client
-            .protocol()
-            .conn_mut(client_handle)
-            .is_some_and(|c| c.stream_state().recv_eof(stream_id))
-        {
+        assert!(Pin::new(&mut server).output().len() <= Pin::new(&mut server).output().capacity());
+        assert!(
+            Pin::new(&mut server).output().bytes() <= Pin::new(&mut server).output().byte_limit()
+        );
+        gso_runs += Capture::deliver(
+            &mut client,
+            gso::SERVER,
+            Capture::output(&mut server, now).expect("fixture output"),
+        )
+        .expect("fixture packet delivery");
+        Capture::deliver(
+            &mut server,
+            gso::CLIENT,
+            Capture::output(&mut client, now).expect("fixture output"),
+        )
+        .expect("fixture packet delivery");
+        let eof = Capture::access(&mut client, dialed, now, |mut conn| {
+            let streams = conn.streams();
+            let receive = streams.view().resolve_recv(id)?;
+            Ok::<_, stream::Error>(streams.view().is_recv_eof(receive))
+        })
+        .expect("fixture connection access must succeed")
+        .expect("delivered stream remains installed until EOF");
+        if eof {
             break;
         }
     }
 
     assert!(gso_runs >= 1, "the paced 8 KiB blast coalesces ≥1 GSO run");
+    let streams = local.streams.take();
     assert!(
-        client_events
-            .borrow()
-            .streams
-            .contains(&(client_handle, Event::Readable { stream_id })),
+        streams.contains(&(dialed, Event::Readable { id })),
         "client saw stream data"
     );
+    local.streams.set(streams);
 
     let mut recv = Vec::new();
-    let mut conn = client
-        .protocol()
-        .conn_mut(client_handle)
-        .expect("client conn");
-    conn.streams().recv(stream_id, &mut recv);
+    let eof = Capture::access(&mut client, dialed, now, |mut conn| {
+        let mut streams = conn.streams();
+        let receive = streams.view().resolve_recv(id)?;
+        assert!(
+            streams.receive().recv(receive, &mut recv).is_ok(),
+            "fixture receive capacity must admit the coalesced burst"
+        );
+        let receive = streams.view().resolve_recv(id)?;
+        Ok::<_, stream::Error>(streams.view().is_recv_eof(receive))
+    })
+    .expect("fixture connection access must succeed")
+    .expect("consumed stream remains installed through EOF observation");
     assert_eq!(recv, body, "GSO-coalesced burst reassembles byte-exact");
-    assert!(conn.stream_state().recv_eof(stream_id), "fin delivered");
+    assert!(eof, "fin delivered");
 }
