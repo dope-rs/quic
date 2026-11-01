@@ -1,6 +1,6 @@
 [package]
 name = "dope-quic"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2024"
 rust-version.workspace = true
 description = "QUIC x dope"
@@ -15,7 +15,6 @@ test = false
 members = [
     ".",
 ]
-default-members = ["."]
 resolver = "3"
 
 [workspace.package]
@@ -25,28 +24,15 @@ rust-version = "1.98"
 panic = "abort"
 
 [dependencies]
-o3 = "=0.20.0"
+o3 = "0.20"
 rustls = { version = "=0.23.46", default-features = false, features = ["std", "aws_lc_rs"] }
 aws-lc-rs = { version = "=1.18.1", default-features = false, features = ["aws-lc-sys"] }
-dope = "0.20.0"
-dope-tls = "0.20.0"
-dope-sys = "0.20.0"
+dope = "0.21"
+dope-tls = "0.21"
+dope-sys = "0.21"
 subtle = "2.6"
 pin-project = "1"
 zeroize = { version = "1", default-features = false }
 
 [dev-dependencies]
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
-dope-test = "0.20.0"
-
-[[bench]]
-name = "journal"
-path = "tests/common/journal.rs"
-harness = false
-test = false
-
-[[bench]]
-name = "path"
-path = "tests/common/path.rs"
-harness = false
-test = false
+dope-test = "0.21"

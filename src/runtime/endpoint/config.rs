@@ -1,4 +1,3 @@
-use dope::core::driver::settings::errors;
 use dope::core::driver::settings::errors::Claim;
 use std::num;
 
@@ -29,7 +28,6 @@ pub enum Error {
     Capacity(builder::Error),
     OutgoingBytes { got: usize, min: usize },
     Receive(Claim),
-    Buffer(errors::Config),
     PacketBytes { got: u32 },
     Datagram(manifold::ConfigError),
 }
@@ -86,8 +84,7 @@ impl Config {
             });
         };
         let bytes = num::NonZero::<u16>::from(packet);
-        let receive =
-            settings::Datagram::try_new(ring, payload::Len::from(bytes)).map_err(Error::Buffer)?;
+        let receive = settings::Datagram::new(ring, payload::Len::from(bytes));
         let datagram =
             plan::Config::new(capacity.outgoing(), capacity.bytes(), capacity.outgoing())
                 .map_err(Error::Datagram)?;

@@ -2,7 +2,7 @@ use o3::buffer;
 use std::time;
 
 use crate::conn;
-use crate::conn::output::transmit::permit::{self, fit};
+use crate::conn::output::transmit::permit::{self, earliest, fit};
 use crate::stream;
 
 /// Canonical scheduler projection for one connection.
@@ -31,12 +31,4 @@ pub(crate) fn deadline_with_retry<const DOMAIN: u8, B: stream::Recv, D: buffer::
     let output = if send { permit.deadline(now) } else { None };
     let next = earliest(earliest(recovery, path), earliest(output, retry));
     earliest(next, conn.deadline())
-}
-
-fn earliest(first: Option<time::Instant>, second: Option<time::Instant>) -> Option<time::Instant> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(first.min(second)),
-        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-        (None, None) => None,
-    }
 }

@@ -65,13 +65,10 @@ fn retains_scalar_failure() {
     let claims = (server.as_ref(), client.as_ref());
     let config = Needs::from_tree(&claims)
         .expect("endpoint claims")
-        .apply_to(Config::driver(
-            settings::Datagram::try_new(
-                settings::Ring::try_round(128).expect("receive ring"),
-                Len::try_from(2048).expect("packet size"),
-            )
-            .expect("receive layout"),
-        ))
+        .apply_to(Config::driver(settings::Datagram::new(
+            settings::Ring::try_round(128).expect("receive ring"),
+            Len::try_from(2048).expect("packet size"),
+        )))
         .expect("driver configuration");
     let (source, stop) = shutdown::Pair::new().expect("shutdown pair").split();
     let stop = Rc::new(Cell::new(Some(stop)));

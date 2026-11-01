@@ -183,20 +183,7 @@ where
             .handler_mut()
             .life_mut()
             .seal();
-        let capacity = self.as_ref().get_ref().endpoint.handler().lifecycle().len();
-        for index in 0..capacity {
-            let handle = self
-                .as_ref()
-                .get_ref()
-                .endpoint
-                .handler()
-                .lifecycle()
-                .handle_at(index);
-            if let Some(handle) = handle {
-                actions::close(self.as_mut().project().endpoint, handle, now);
-            }
-        }
-        self.as_mut().drain_events(usize::MAX);
+        self.restart_at(now);
     }
 
     pub(super) fn restart_at(mut self: pin::Pin<&mut Self>, now: time::Instant) {

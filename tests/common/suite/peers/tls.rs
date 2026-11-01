@@ -239,7 +239,7 @@ impl Kind {
     pub fn configs(
         self,
         base: &Path,
-        cleanup: impl FnOnce(Result<(), file::Remove>),
+        cleanup: impl FnOnce(std::io::Result<()>),
     ) -> Result<(rustls::ClientConfig, rustls::ServerConfig), Init> {
         match self {
             Self::Raw => {

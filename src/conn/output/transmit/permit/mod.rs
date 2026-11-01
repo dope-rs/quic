@@ -15,7 +15,11 @@ use builder::app::terminal;
 
 pub(in crate::conn) mod fit;
 
-fn earliest(first: Option<time::Instant>, second: Option<time::Instant>) -> Option<time::Instant> {
+#[inline]
+pub(in crate::conn) fn earliest(
+    first: Option<time::Instant>,
+    second: Option<time::Instant>,
+) -> Option<time::Instant> {
     match (first, second) {
         (Some(first), Some(second)) => Some(first.min(second)),
         (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),

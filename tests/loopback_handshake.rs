@@ -75,13 +75,10 @@ fn saturated_progress() {
             )
             .expect("loopback client resources must form an endpoint plan");
             let claims = (srv_plan.as_ref(), cli_plan.as_ref());
-            let base = Config::driver(
-                settings::Datagram::try_new(
-                    settings::Ring::try_round(128).expect("fixture receive ring"),
-                    Len::try_from(2048).expect("fixture packet size"),
-                )
-                .expect("fixture datagram receive layout"),
-            );
+            let base = Config::driver(settings::Datagram::new(
+                settings::Ring::try_round(128).expect("fixture receive ring"),
+                Len::try_from(2048).expect("fixture packet size"),
+            ));
             let config = Needs::from_tree(&claims)
                 .expect("server and client resource claims must compose")
                 .apply_to(base)

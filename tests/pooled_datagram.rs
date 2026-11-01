@@ -49,13 +49,10 @@ fn slot_returns() {
     )
     .expect("client plan");
     let claims = (srv_plan.as_ref(), cli_plan.as_ref());
-    let baseline = Config::driver(
-        settings::Datagram::try_new(
-            settings::Ring::try_round(32).expect("fixture receive ring"),
-            Len::try_from(2048).expect("fixture packet size"),
-        )
-        .expect("fixture datagram receive layout"),
-    );
+    let baseline = Config::driver(settings::Datagram::new(
+        settings::Ring::try_round(32).expect("fixture receive ring"),
+        Len::try_from(2048).expect("fixture packet size"),
+    ));
     let config = Needs::from_tree(&claims)
         .expect("compose endpoint claims")
         .apply_to(baseline)

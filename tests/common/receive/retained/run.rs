@@ -90,14 +90,10 @@ pub enum Error<'owner, 'report> {
 fn driver_config(res: impl settings::Resource) -> Result<settings::Config, Setup> {
     Needs::from_tree(&res)
         .map_err(Setup::Claim)?
-        .apply_exact(Config::driver(
-            settings::Datagram::try_new(
-                settings::Ring::try_round(64).map_err(Setup::Claim)?,
-                Len::try_from(ENDPOINT.packet_buffer_bytes).map_err(Setup::Payload)?,
-            )
-            .map_err(Claim::from)
-            .map_err(Setup::Claim)?,
-        ))
+        .apply_exact(Config::driver(settings::Datagram::new(
+            settings::Ring::try_round(64).map_err(Setup::Claim)?,
+            Len::try_from(ENDPOINT.packet_buffer_bytes).map_err(Setup::Payload)?,
+        )))
         .map_err(Setup::Claim)
 }
 
